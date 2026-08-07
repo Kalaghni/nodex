@@ -22,7 +22,10 @@ Architecture diagramming on a hexagonal grid. Nodex is a single-page React app f
   - **Route**: direct or angled (right-angle elbow)
   - **Pointer per end**: none / arrow / open / circle / diamond
   - **Line style**: solid, dashed, dotted, dash-dot, long dash
+  - **Color** per connection — line, label, icon, and pointers tint together
   - **Label + icon** with rotation; line gaps are cut to the label's exact footprint — including where *other* connections cross a label
+- **Bulk connection editing**: Ctrl+Click lines (or marquee over them) to select many, then apply color/style/route/pointers to all at once from the sidebar
+- **Channels**: named, colored flows defined per diagram. Connections subscribe to any subset and render one parallel strand per channel — so a flow can **split and converge** across the graph (e.g. public + internal traffic share the ingress line, split at the load balancer, and re-converge at the destination) while keeping its color everywhere. Managed in the sidebar; toggled per connection in the drawer or across a whole selection
 
 ### Editing
 - **Multi-select**: marquee (drag on empty canvas), Ctrl+Click to toggle, Ctrl+A for all
