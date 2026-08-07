@@ -2297,6 +2297,14 @@ export default function Nodex() {
   };
 
   const clearAll = () => {
+    const summary = [
+      nodes.length && `${nodes.length} node${nodes.length > 1 ? 's' : ''}`,
+      connections.length && `${connections.length} connection${connections.length > 1 ? 's' : ''}`,
+      zones.length && `${zones.length} zone${zones.length > 1 ? 's' : ''}`
+    ].filter(Boolean).join(', ');
+    if (!window.confirm(`Clear this diagram? This removes ${summary || 'everything'} and all nested diagrams. (Ctrl+Z can undo it.)`)) {
+      return;
+    }
     const pathKey = currentPathRef.current.join('/');
     setDiagrams(prev => {
       // Also drop every nested diagram under this one
