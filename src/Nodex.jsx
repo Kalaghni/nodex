@@ -223,6 +223,66 @@ const segmentRectIntersection = (a, b, box) => {
   return [t0, t1];
 };
 
+// Clip the segment p0→p1 against one hexagonal cell (Cyrus–Beck against the
+// six edges). Returns the [t0,t1] parameter interval inside the hex, or null.
+const segmentHexIntersection = (p0, p1, cx, cy, size) => {
+  const d = { x: p1.x - p0.x, y: p1.y - p0.y };
+  let t0 = 0;
+  let t1 = 1;
+  for (let i = 0; i < 6; i++) {
+    const a1 = (Math.PI / 3) * i;
+    const a2 = (Math.PI / 3) * (i + 1);
+    const v1 = { x: cx + size * Math.cos(a1), y: cy + size * Math.sin(a1) };
+    const v2 = { x: cx + size * Math.cos(a2), y: cy + size * Math.sin(a2) };
+    let nx = v2.y - v1.y;
+    let ny = -(v2.x - v1.x);
+    // Point the edge normal inward
+    if (nx * (cx - v1.x) + ny * (cy - v1.y) < 0) {
+      nx = -nx;
+      ny = -ny;
+    }
+    const denom = nx * d.x + ny * d.y;
+    const num = nx * (v1.x - p0.x) + ny * (v1.y - p0.y);
+    if (Math.abs(denom) < 1e-9) {
+      if (num < 0) return null;
+    } else {
+      const t = num / denom;
+      if (denom > 0) {
+        t0 = Math.max(t0, t);
+      } else {
+        t1 = Math.min(t1, t);
+      }
+      if (t0 > t1) return null;
+    }
+  }
+  return [t0, t1];
+};
+
+// Edge of a node hexagon in the direction of `toward`
+const nodeEdgePoint = (center, toward) => {
+  const ang = Math.atan2(toward.y - center.y, toward.x - center.x);
+  const t = hexBoundaryDistance(HEX_SIZE, ang);
+  return { x: center.x + Math.cos(ang) * t, y: center.y + Math.sin(ang) * t };
+};
+
+// Where the ray fromPt→anchorPt first enters the zone — the earliest
+// intersection across ALL cells, i.e. the blob's outer silhouette. Trimming
+// against only the anchor cell put arrowheads inside the zone whenever the
+// line crossed another cell first.
+const zoneBoundaryPoint = (zone, fromPt, anchorPt) => {
+  let bestT = null;
+  zone.cells.forEach(c => {
+    const p = axialToPixel(c.q, c.r);
+    const hit = segmentHexIntersection(fromPt, anchorPt, p.x, p.y, HEX_SIZE);
+    if (hit && (bestT === null || hit[0] < bestT)) bestT = hit[0];
+  });
+  if (bestT === null || bestT <= 0) return anchorPt;
+  return {
+    x: fromPt.x + (anchorPt.x - fromPt.x) * bestT,
+    y: fromPt.y + (anchorPt.y - fromPt.y) * bestT
+  };
+};
+
 // Walk hex rings around a center cell, out to `radius`
 const buildHexRingCells = (cq, cr, radius) => {
   const cells = [{ q: cq, r: cr }];
@@ -2489,20 +2549,29 @@ export default function Nodex() {
 
     if (routing === 'angled' && Math.abs(b.x - a.x) > HEX_SIZE && Math.abs(b.y - a.y) > HEX_SIZE) {
       const corner = { x: b.x, y: a.y };
-      const aAng = Math.atan2(corner.y - a.y, corner.x - a.x);
-      const bAng = Math.atan2(corner.y - b.y, corner.x - b.x);
-      const aTrim = hexBoundaryDistance(HEX_SIZE, aAng);
-      const bTrim = hexBoundaryDistance(HEX_SIZE, bAng);
-      pts = [
-        { x: a.x + Math.cos(aAng) * aTrim, y: a.y + Math.sin(aAng) * aTrim },
-        corner,
-        { x: b.x + Math.cos(bAng) * bTrim, y: b.y + Math.sin(bAng) * bTrim }
-      ];
-    } else {
-      // Direct — also the fallback when nodes are too aligned for an elbow
+      const start = epFrom.type === 'zone'
+        ? zoneBoundaryPoint(epFrom.zone, corner, a)
+        : nodeEdgePoint(a, corner);
+      const end = epTo.type === 'zone'
+        ? zoneBoundaryPoint(epTo.zone, corner, b)
+        : nodeEdgePoint(b, corner);
+      pts = [start, corner, end];
+    } else if (epFrom.type === 'node' && epTo.type === 'node') {
+      // Direct node-node — also the fallback when too aligned for an elbow
       const trimmed = trimSegmentToHexEdges(a, b, HEX_SIZE);
       if (!trimmed) return;
       pts = [trimmed.from, trimmed.to];
+    } else {
+      // Direct with a zone on at least one end: trim each zone end at the
+      // blob's silhouette along the line, node ends at their hex edge
+      const start = epFrom.type === 'zone'
+        ? zoneBoundaryPoint(epFrom.zone, b, a)
+        : nodeEdgePoint(a, b);
+      const end = epTo.type === 'zone'
+        ? zoneBoundaryPoint(epTo.zone, a, b)
+        : nodeEdgePoint(b, a);
+      if (Math.hypot(end.x - start.x, end.y - start.y) < 2) return;
+      pts = [start, end];
     }
 
     // Arc-length midpoint: where the label and delete button live
