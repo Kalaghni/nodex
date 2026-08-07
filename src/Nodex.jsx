@@ -3354,31 +3354,72 @@ export default function Nodex() {
           <g transform={`translate(${viewOffset.x}, ${viewOffset.y}) scale(${zoom})`}>
             {/* Zone backgrounds */}
             {zones.map(zone => (
-              <g
-                key={`zone-${zone.id}`}
-                onClick={(e) => handleZoneClick(e, zone)}
-                onDoubleClick={(e) => handleZoneDoubleClick(e, zone)}
-                onMouseDown={(e) => handleZoneMouseDown(e, zone)}
-                onMouseEnter={() => setHoveredZone(zone.id)}
-                onMouseLeave={() => setHoveredZone(null)}
-              >
-                {zone.cells.map(cell => {
-                  const pos = axialToPixel(cell.q, cell.r);
-                  const isConnectTarget = connectingFrom && hoveredZone === zone.id &&
-                    !(connectingFrom.kind === 'zone' && connectingFrom.id === zone.id);
-                  return (
-                    <polygon
-                      key={`zone-${zone.id}-${cell.q}-${cell.r}`}
-                      points={getHexagonPoints(pos.x, pos.y, HEX_SIZE)}
-                      fill={zone.color}
-                      opacity={isConnectTarget ? 0.35 : selectedZone?.id === zone.id ? 0.4 : 0.2}
-                      stroke={isConnectTarget ? '#22c55e' : zone.color}
-                      strokeWidth={isConnectTarget ? 2.5 : selectedZone?.id === zone.id ? 2 : 1}
-                      className="cursor-pointer transition-opacity"
-                    />
-                  );
-                })}
-              </g>
+              (() => {
+                const cellSet = new Set(zone.cells.map(c => `${c.q},${c.r}`));
+                const isConnectTarget = connectingFrom && hoveredZone === zone.id &&
+                  !(connectingFrom.kind === 'zone' && connectingFrom.id === zone.id);
+                const isZoneSelected = selectedZone?.id === zone.id;
+                // Neighbor direction → index of the hex vertex pair forming
+                // the shared edge (flat-top: vertex i sits at 60°·i)
+                const EDGE_DIRS = [
+                  { dq: 1, dr: 0, vi: 0 },
+                  { dq: 0, dr: 1, vi: 1 },
+                  { dq: -1, dr: 1, vi: 2 },
+                  { dq: -1, dr: 0, vi: 3 },
+                  { dq: 0, dr: -1, vi: 4 },
+                  { dq: 1, dr: -1, vi: 5 }
+                ];
+                return (
+                  <g
+                    key={`zone-${zone.id}`}
+                    onClick={(e) => handleZoneClick(e, zone)}
+                    onDoubleClick={(e) => handleZoneDoubleClick(e, zone)}
+                    onMouseDown={(e) => handleZoneMouseDown(e, zone)}
+                    onMouseEnter={() => setHoveredZone(zone.id)}
+                    onMouseLeave={() => setHoveredZone(null)}
+                  >
+                    {zone.cells.map(cell => {
+                      const pos = axialToPixel(cell.q, cell.r);
+                      return (
+                        <polygon
+                          key={`zone-${zone.id}-${cell.q}-${cell.r}`}
+                          points={getHexagonPoints(pos.x, pos.y, HEX_SIZE)}
+                          fill={zone.color}
+                          opacity={isConnectTarget ? 0.35 : isZoneSelected ? 0.4 : 0.2}
+                          className="cursor-pointer transition-opacity"
+                        />
+                      );
+                    })}
+                    {/* Outer silhouette: only edges not shared with another
+                        cell of this zone — makes the zone's true extent
+                        obvious (0.2-opacity fills alone vanish on dark bg,
+                        so connection endpoints looked like they floated) */}
+                    {zone.cells.flatMap(cell => {
+                      const pos = axialToPixel(cell.q, cell.r);
+                      return EDGE_DIRS
+                        .filter(d => !cellSet.has(`${cell.q + d.dq},${cell.r + d.dr}`))
+                        .map(d => {
+                          const a1 = (Math.PI / 3) * d.vi;
+                          const a2 = (Math.PI / 3) * (d.vi + 1);
+                          return (
+                            <line
+                              key={`zedge-${zone.id}-${cell.q}-${cell.r}-${d.vi}`}
+                              x1={pos.x + HEX_SIZE * Math.cos(a1)}
+                              y1={pos.y + HEX_SIZE * Math.sin(a1)}
+                              x2={pos.x + HEX_SIZE * Math.cos(a2)}
+                              y2={pos.y + HEX_SIZE * Math.sin(a2)}
+                              stroke={isConnectTarget ? '#22c55e' : zone.color}
+                              strokeWidth={isConnectTarget || isZoneSelected ? 2.5 : 1.5}
+                              opacity="0.9"
+                              strokeLinecap="round"
+                              pointerEvents="none"
+                            />
+                          );
+                        });
+                    })}
+                  </g>
+                );
+              })()
             ))}
 
             {/* Zone labels */}
