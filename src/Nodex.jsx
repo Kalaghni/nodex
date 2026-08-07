@@ -97,6 +97,64 @@ const trimSegmentToHexEdges = (from, to, size) => {
   };
 };
 
+// Shared 2D context for measuring label text — SVG has no synchronous API
+let __measureCtx = null;
+const measureTextWidth = (text, font) => {
+  if (!__measureCtx) __measureCtx = document.createElement('canvas').getContext('2d');
+  __measureCtx.font = font;
+  return __measureCtx.measureText(text).width;
+};
+
+// Size + placement of a connection's icon/label block (pre-rotation), used
+// both to lay the content out and to cut matching gaps into lines
+const CONN_ICON_SIZE = 16;
+const CONN_ICON_GAP = 6;
+const getConnLabelBox = (conn, cx, cy) => {
+  const hasIcon = !!conn.iconId;
+  const hasLabel = !!conn.label;
+  if (!hasIcon && !hasLabel) return null;
+  const textW = hasLabel ? measureTextWidth(conn.label, '11px system-ui, -apple-system, sans-serif') : 0;
+  const contentW = (hasIcon ? CONN_ICON_SIZE : 0) + (hasIcon && hasLabel ? CONN_ICON_GAP : 0) + textW;
+  return {
+    cx,
+    cy,
+    rot: ((conn.rotation || 0) * Math.PI) / 180,
+    halfW: contentW / 2 + 6,
+    halfH: 8 + 3,
+    contentW,
+    textW
+  };
+};
+
+// t-interval [t0,t1] where the segment a→b crosses a rotated rectangle, or
+// null if it misses entirely (slab test in the rect's local frame)
+const segmentRectIntersection = (a, b, box) => {
+  const cos = Math.cos(-box.rot);
+  const sin = Math.sin(-box.rot);
+  const local = (p) => ({
+    x: cos * (p.x - box.cx) - sin * (p.y - box.cy),
+    y: sin * (p.x - box.cx) + cos * (p.y - box.cy)
+  });
+  const p0 = local(a);
+  const p1 = local(b);
+  const d = { x: p1.x - p0.x, y: p1.y - p0.y };
+  let t0 = 0;
+  let t1 = 1;
+  for (const [p, dd, half] of [[p0.x, d.x, box.halfW], [p0.y, d.y, box.halfH]]) {
+    if (Math.abs(dd) < 1e-9) {
+      if (Math.abs(p) > half) return null;
+    } else {
+      let ta = (-half - p) / dd;
+      let tb = (half - p) / dd;
+      if (ta > tb) [ta, tb] = [tb, ta];
+      t0 = Math.max(t0, ta);
+      t1 = Math.min(t1, tb);
+      if (t0 >= t1) return null;
+    }
+  }
+  return [t0, t1];
+};
+
 // Walk hex rings around a center cell, out to `radius`
 const buildHexRingCells = (cq, cr, radius) => {
   const cells = [{ q: cq, r: cr }];
@@ -551,8 +609,17 @@ export default function Nodex() {
   const pendingConnectFromRef = useRef(null);
   
   const [hoveredConnection, setHoveredConnection] = useState(null);
-  const [editingConnection, setEditingConnection] = useState(null);
+  // Id-based like zone selection: the drawer edits the live connection, so
+  // every control change is applied (and undoable) immediately
+  const [editingConnectionId, setEditingConnectionId] = useState(null);
+  const editingConnection = connections.find(c => c.id === editingConnectionId) || null;
+  const setEditingConnection = (conn) => setEditingConnectionId(conn ? conn.id : null);
   const [showConnectionEditor, setShowConnectionEditor] = useState(false);
+
+  const updateEditingConnection = (patch) => {
+    if (editingConnectionId == null) return;
+    setConnections(prev => prev.map(c => c.id === editingConnectionId ? { ...c, ...patch } : c));
+  };
   const [viewOffset, setViewOffset] = useState({ x: 400, y: 300 });
   const [isPanning, setIsPanning] = useState(false);
   const [panStart, setPanStart] = useState({ x: 0, y: 0 });
@@ -1823,9 +1890,11 @@ export default function Nodex() {
       }
       const inField = e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA';
       const inModal = showNodeCreator || showZoneCreator || showConnectionEditor;
+      // The connection drawer edits live — undo must stay available there
+      const inBlockingModal = showNodeCreator || showZoneCreator;
 
       // Undo / redo
-      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z' && !inField && !inModal) {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z' && !inField && !inBlockingModal) {
         e.preventDefault();
         if (e.shiftKey) {
           redo();
@@ -1834,7 +1903,7 @@ export default function Nodex() {
         }
         return;
       }
-      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'y' && !inField && !inModal) {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'y' && !inField && !inBlockingModal) {
         e.preventDefault();
         redo();
         return;
@@ -1914,6 +1983,63 @@ export default function Nodex() {
   };
 
   const breadcrumbs = getBreadcrumbs();
+
+  // Connection geometry + label boxes, computed once per render so every
+  // line can subtract every label's footprint (including other connections').
+  // A connection is a polyline: 2 points for direct routing, 3 for angled
+  // (horizontal from the source, right-angle bend, vertical into the target).
+  const connGeoms = {};
+  connections.forEach(conn => {
+    const fromNode = nodes.find(n => n.id === conn.from);
+    const toNode = nodes.find(n => n.id === conn.to);
+    if (!fromNode || !toNode) return;
+    const a = axialToPixel(fromNode.q, fromNode.r);
+    const b = axialToPixel(toNode.q, toNode.r);
+    const routing = conn.routing || 'direct';
+    let pts;
+
+    if (routing === 'angled' && Math.abs(b.x - a.x) > HEX_SIZE && Math.abs(b.y - a.y) > HEX_SIZE) {
+      const corner = { x: b.x, y: a.y };
+      const aAng = Math.atan2(corner.y - a.y, corner.x - a.x);
+      const bAng = Math.atan2(corner.y - b.y, corner.x - b.x);
+      const aTrim = hexBoundaryDistance(HEX_SIZE, aAng);
+      const bTrim = hexBoundaryDistance(HEX_SIZE, bAng);
+      pts = [
+        { x: a.x + Math.cos(aAng) * aTrim, y: a.y + Math.sin(aAng) * aTrim },
+        corner,
+        { x: b.x + Math.cos(bAng) * bTrim, y: b.y + Math.sin(bAng) * bTrim }
+      ];
+    } else {
+      // Direct — also the fallback when nodes are too aligned for an elbow
+      const trimmed = trimSegmentToHexEdges(a, b, HEX_SIZE);
+      if (!trimmed) return;
+      pts = [trimmed.from, trimmed.to];
+    }
+
+    // Arc-length midpoint: where the label and delete button live
+    const segLens = [];
+    let total = 0;
+    for (let i = 0; i < pts.length - 1; i++) {
+      const L = Math.hypot(pts[i + 1].x - pts[i].x, pts[i + 1].y - pts[i].y);
+      segLens.push(L);
+      total += L;
+    }
+    let mid = pts[0];
+    let acc = 0;
+    for (let i = 0; i < segLens.length; i++) {
+      if (acc + segLens[i] >= total / 2) {
+        const t = (total / 2 - acc) / (segLens[i] || 1);
+        mid = {
+          x: pts[i].x + (pts[i + 1].x - pts[i].x) * t,
+          y: pts[i].y + (pts[i + 1].y - pts[i].y) * t
+        };
+        break;
+      }
+      acc += segLens[i];
+    }
+
+    connGeoms[conn.id] = { pts, mid, box: getConnLabelBox(conn, mid.x, mid.y) };
+  });
 
   return (
     <div className="flex flex-col h-screen bg-slate-900 text-white">
@@ -2515,50 +2641,60 @@ export default function Nodex() {
 
             {/* Connections */}
             {connections.map(conn => {
-              const fromNode = nodes.find(n => n.id === conn.from);
-              const toNode = nodes.find(n => n.id === conn.to);
-              if (!fromNode || !toNode) return null;
-
-              const fromCenter = axialToPixel(fromNode.q, fromNode.r);
-              const toCenter = axialToPixel(toNode.q, toNode.r);
-              // Trim to the hexagon boundaries so the arrowhead lands on the
-              // node's edge instead of disappearing under the hexagon
-              const trimmed = trimSegmentToHexEdges(fromCenter, toCenter, HEX_SIZE);
-              if (!trimmed) return null;
-              const fromPos = trimmed.from;
-              const toPos = trimmed.to;
-              const midX = (fromPos.x + toPos.x) / 2;
-              const midY = (fromPos.y + toPos.y) / 2;
+              const geom = connGeoms[conn.id];
+              if (!geom) return null;
+              const { pts, mid } = geom;
               const isHovered = hoveredConnection === conn.id;
               const labelRotation = conn.rotation || 0;
               const ConnIcon = conn.iconId ? AVAILABLE_ICONS.find(i => i.id === conn.iconId)?.icon : null;
               const lineTypeData = LINE_TYPES.find(lt => lt.id === (conn.lineType || 'solid'));
               const strokeDasharray = lineTypeData?.dasharray || null;
+              const arrowHead = conn.arrowHead || 'end';
+              const markerUrl = `url(#arrow-${conn.arrowStyle || 'arrow'})`;
 
-              // Calculate line segment gap for icon/label
-              const lineLength = Math.hypot(toPos.x - fromPos.x, toPos.y - fromPos.y);
-              const hasLabelOrIcon = (conn.label || ConnIcon) && lineLength > 30;
-              const rawGap = hasLabelOrIcon ? (conn.label && ConnIcon ? 35 : conn.label ? 30 : 12) : 0;
-              const gapSize = Math.min(rawGap, lineLength / 2 - 4);
-              const dirX = trimmed.ux;
-              const dirY = trimmed.uy;
-
-              // Points for split line
-              const gap1X = midX - dirX * gapSize;
-              const gap1Y = midY - dirY * gapSize;
-              const gap2X = midX + dirX * gapSize;
-              const gap2Y = midY + dirY * gapSize;
+              // Visible pieces per polyline segment: [0,1] minus the exact
+              // footprint of every label box the segment crosses — its own
+              // and any other connection's whose label overlaps it
+              const pieces = [];
+              for (let i = 0; i < pts.length - 1; i++) {
+                const A = pts[i];
+                const B = pts[i + 1];
+                const segLen = Math.hypot(B.x - A.x, B.y - A.y);
+                let intervals = [[0, 1]];
+                connections.forEach(other => {
+                  const box = connGeoms[other.id]?.box;
+                  if (!box) return;
+                  const hit = segmentRectIntersection(A, B, box);
+                  if (!hit) return;
+                  intervals = intervals.flatMap(([s, e]) => {
+                    if (hit[1] <= s || hit[0] >= e) return [[s, e]];
+                    const kept = [];
+                    if (hit[0] > s) kept.push([s, hit[0]]);
+                    if (hit[1] < e) kept.push([hit[1], e]);
+                    return kept;
+                  });
+                });
+                intervals
+                  .filter(([s, e]) => (e - s) * segLen > 2)
+                  .forEach(([s, e]) => {
+                    pieces.push({
+                      p1: { x: A.x + (B.x - A.x) * s, y: A.y + (B.y - A.y) * s },
+                      p2: { x: A.x + (B.x - A.x) * e, y: A.y + (B.y - A.y) * e },
+                      atStart: i === 0 && s < 0.01,
+                      atEnd: i === pts.length - 2 && e > 0.99
+                    });
+                  });
+              }
+              const pathD = pts.map((p, i) => `${i === 0 ? 'M' : 'L'}${p.x} ${p.y}`).join(' ');
 
               return (
                 <g key={conn.id}>
                   {/* Wider invisible hit area for hover */}
-                  <line
-                    x1={fromPos.x}
-                    y1={fromPos.y}
-                    x2={toPos.x}
-                    y2={toPos.y}
+                  <path
+                    d={pathD}
                     stroke="transparent"
                     strokeWidth="20"
+                    fill="none"
                     className="cursor-pointer"
                     onMouseEnter={() => {
                       setHoveredConnection(conn.id);
@@ -2572,53 +2708,32 @@ export default function Nodex() {
                       setShowConnectionEditor(true);
                     }}
                   />
-                  {/* Visible line - split if has icon/label */}
-                  {hasLabelOrIcon ? (
-                    <>
-                      <line
-                        x1={fromPos.x}
-                        y1={fromPos.y}
-                        x2={gap1X}
-                        y2={gap1Y}
-                        stroke={isHovered ? '#94a3b8' : '#64748b'}
-                        strokeWidth={isHovered ? 3 : 2}
-                        strokeDasharray={strokeDasharray}
-                        pointerEvents="none"
-                      />
-                      <line
-                        x1={gap2X}
-                        y1={gap2Y}
-                        x2={toPos.x}
-                        y2={toPos.y}
-                        stroke={isHovered ? '#94a3b8' : '#64748b'}
-                        strokeWidth={isHovered ? 3 : 2}
-                        strokeDasharray={strokeDasharray}
-                        markerEnd="url(#arrowhead)"
-                        pointerEvents="none"
-                      />
-                    </>
-                  ) : (
+                  {/* Visible line pieces left after label footprints were
+                      subtracted; arrowheads on the pieces touching the nodes */}
+                  {pieces.map((piece, i) => (
                     <line
-                      x1={fromPos.x}
-                      y1={fromPos.y}
-                      x2={toPos.x}
-                      y2={toPos.y}
+                      key={i}
+                      x1={piece.p1.x}
+                      y1={piece.p1.y}
+                      x2={piece.p2.x}
+                      y2={piece.p2.y}
                       stroke={isHovered ? '#94a3b8' : '#64748b'}
                       strokeWidth={isHovered ? 3 : 2}
                       strokeDasharray={strokeDasharray}
-                      markerEnd="url(#arrowhead)"
+                      markerStart={piece.atStart && (arrowHead === 'start' || arrowHead === 'both') ? markerUrl : undefined}
+                      markerEnd={piece.atEnd && (arrowHead === 'end' || arrowHead === 'both') ? markerUrl : undefined}
                       pointerEvents="none"
                     />
-                  )}
+                  ))}
                   {/* Label and icon - hidden when hovered */}
-                  {(conn.label || ConnIcon) && !isHovered && (
-                    <g transform={`translate(${midX}, ${midY}) rotate(${labelRotation})`}>
+                  {geom.box && !isHovered && (
+                    <g transform={`translate(${mid.x}, ${mid.y}) rotate(${labelRotation})`}>
                       {ConnIcon && (
                         <foreignObject
-                          x={conn.label ? -28 : -10}
-                          y="-8"
-                          width="16"
-                          height="16"
+                          x={-geom.box.contentW / 2}
+                          y={-CONN_ICON_SIZE / 2}
+                          width={CONN_ICON_SIZE}
+                          height={CONN_ICON_SIZE}
                           pointerEvents="none"
                         >
                           <div className="w-full h-full flex items-center justify-center">
@@ -2628,7 +2743,9 @@ export default function Nodex() {
                       )}
                       {conn.label && (
                         <text
-                          x={ConnIcon ? 2 : 0}
+                          x={ConnIcon
+                            ? -geom.box.contentW / 2 + CONN_ICON_SIZE + CONN_ICON_GAP + geom.box.textW / 2
+                            : 0}
                           y="0"
                           fill="#e2e8f0"
                           fontSize="11"
@@ -2645,8 +2762,8 @@ export default function Nodex() {
                   {isHovered && (
                     <>
                       <circle
-                        cx={midX}
-                        cy={midY}
+                        cx={mid.x}
+                        cy={mid.y}
                         r="12"
                         fill="transparent"
                         className="cursor-pointer"
@@ -2657,8 +2774,8 @@ export default function Nodex() {
                         }}
                       />
                       <text
-                        x={midX}
-                        y={midY}
+                        x={mid.x}
+                        y={mid.y}
                         fill="#ef4444"
                         fontSize="18"
                         fontWeight="bold"
@@ -2835,15 +2952,23 @@ export default function Nodex() {
             })()}
 
             <defs>
-              <marker
-                id="arrowhead"
-                markerWidth="10"
-                markerHeight="10"
-                refX="9"
-                refY="3"
-                orient="auto"
-              >
+              {/* Legacy id used by the temporary connect line */}
+              <marker id="arrowhead" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
                 <polygon points="0 0, 10 3, 0 6" fill="#64748b" />
+              </marker>
+              {/* Connection pointer styles; auto-start-reverse flips them
+                  correctly when used as markerStart */}
+              <marker id="arrow-arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto-start-reverse">
+                <polygon points="0 0, 10 3, 0 6" fill="#64748b" />
+              </marker>
+              <marker id="arrow-open" markerWidth="12" markerHeight="10" refX="9" refY="4" orient="auto-start-reverse">
+                <path d="M1 1 L9 4 L1 7" fill="none" stroke="#64748b" strokeWidth="1.5" />
+              </marker>
+              <marker id="arrow-circle" markerWidth="8" markerHeight="8" refX="4" refY="4" orient="auto-start-reverse">
+                <circle cx="4" cy="4" r="3" fill="#64748b" />
+              </marker>
+              <marker id="arrow-diamond" markerWidth="12" markerHeight="8" refX="10" refY="4" orient="auto-start-reverse">
+                <path d="M2 4 L6 1 L10 4 L6 7 Z" fill="#64748b" />
               </marker>
             </defs>
           </g>
@@ -3081,143 +3206,209 @@ export default function Nodex() {
         </div>
       )}
 
-      {/* Connection Editor Modal */}
+      {/* Connection Editor Drawer — edits apply live (undo covers mistakes) */}
       {showConnectionEditor && editingConnection && (
-        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
-          <div className="bg-slate-800 rounded-lg p-6 w-full max-w-md">
-            <div className="flex items-center justify-between mb-4">
-              <h2 className="text-xl font-bold">Edit Connection</h2>
+        <div className="fixed right-0 top-0 bottom-0 w-96 bg-slate-800 border-l border-slate-700 z-50 p-6 overflow-y-auto scrollbar-thin shadow-2xl">
+          <div className="flex items-center justify-between mb-4">
+            <h2 className="text-xl font-bold">Edit Connection</h2>
+            <button
+              onClick={() => {
+                setShowConnectionEditor(false);
+                setEditingConnection(null);
+              }}
+              className="text-slate-400 hover:text-white"
+            >
+              <X size={24} />
+            </button>
+          </div>
+
+          <div className="space-y-4">
+            <div>
+              <label className="block text-sm font-medium mb-2">Label</label>
+              <input
+                type="text"
+                value={editingConnection.label || ''}
+                onChange={(e) => updateEditingConnection({ label: e.target.value })}
+                placeholder="e.g., HTTP, API, Data Flow"
+                className="w-full px-3 py-2 bg-slate-700 rounded border border-slate-600 focus:border-blue-500 focus:outline-none"
+              />
+            </div>
+
+            <div>
+              <label className="block text-sm font-medium mb-2">Route</label>
+              <div className="flex gap-2">
+                {[
+                  { id: 'direct', label: 'Direct' },
+                  { id: 'angled', label: 'Angled' }
+                ].map(rt => (
+                  <button
+                    key={rt.id}
+                    onClick={() => updateEditingConnection({ routing: rt.id })}
+                    className={`flex-1 px-3 py-2 rounded text-sm transition-all ${
+                      (editingConnection.routing || 'direct') === rt.id
+                        ? 'bg-blue-600 ring-2 ring-blue-400'
+                        : 'bg-slate-700 hover:bg-slate-600'
+                    }`}
+                  >
+                    {rt.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div>
+              <label className="block text-sm font-medium mb-2">Arrows</label>
+              <div className="flex gap-2">
+                {[
+                  { id: 'none', label: 'None' },
+                  { id: 'end', label: '→ To' },
+                  { id: 'start', label: '← From' },
+                  { id: 'both', label: '↔ Both' }
+                ].map(ah => (
+                  <button
+                    key={ah.id}
+                    onClick={() => updateEditingConnection({ arrowHead: ah.id })}
+                    className={`flex-1 px-2 py-2 rounded text-sm transition-all ${
+                      (editingConnection.arrowHead || 'end') === ah.id
+                        ? 'bg-blue-600 ring-2 ring-blue-400'
+                        : 'bg-slate-700 hover:bg-slate-600'
+                    }`}
+                  >
+                    {ah.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div>
+              <label className="block text-sm font-medium mb-2">Pointer Style</label>
+              <div className="flex gap-2">
+                {[
+                  { id: 'arrow', label: 'Arrow' },
+                  { id: 'open', label: 'Open' },
+                  { id: 'circle', label: 'Circle' },
+                  { id: 'diamond', label: 'Diamond' }
+                ].map(st => (
+                  <button
+                    key={st.id}
+                    onClick={() => updateEditingConnection({ arrowStyle: st.id })}
+                    className={`flex-1 px-2 py-2 rounded text-sm transition-all ${
+                      (editingConnection.arrowStyle || 'arrow') === st.id
+                        ? 'bg-blue-600 ring-2 ring-blue-400'
+                        : 'bg-slate-700 hover:bg-slate-600'
+                    }`}
+                  >
+                    {st.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div>
+              <label className="block text-sm font-medium mb-2">Icon (optional)</label>
+              <div className="max-h-32 overflow-y-auto bg-slate-900 rounded p-2 scrollbar-thin">
+                <div className="grid grid-cols-8 gap-2">
+                  <button
+                    onClick={() => updateEditingConnection({ iconId: null })}
+                    className={`p-2 rounded transition-all ${
+                      !editingConnection.iconId
+                        ? 'bg-blue-600 ring-2 ring-blue-400'
+                        : 'bg-slate-700 hover:bg-slate-600'
+                    }`}
+                    title="No icon"
+                  >
+                    <X size={16} />
+                  </button>
+                  {AVAILABLE_ICONS.map(iconData => {
+                    const Icon = iconData.icon;
+                    return (
+                      <button
+                        key={iconData.id}
+                        onClick={() => updateEditingConnection({ iconId: iconData.id })}
+                        className={`p-2 rounded transition-all ${
+                          editingConnection.iconId === iconData.id
+                            ? 'bg-blue-600 ring-2 ring-blue-400'
+                            : 'bg-slate-700 hover:bg-slate-600'
+                        }`}
+                        title={iconData.label}
+                      >
+                        <Icon size={16} />
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            </div>
+
+            <div>
+              <label className="block text-sm font-medium mb-2">Label Rotation: {editingConnection.rotation || 0}°</label>
+              <div className="flex flex-wrap gap-2">
+                {[0, 15, 30, 45, 60, 75, 90, -15, -30, -45, -60, -75, -90].map(angle => (
+                  <button
+                    key={angle}
+                    onClick={() => updateEditingConnection({ rotation: angle })}
+                    className={`px-3 py-1 rounded text-sm transition-all ${
+                      (editingConnection.rotation || 0) === angle
+                        ? 'bg-blue-600 ring-2 ring-blue-400'
+                        : 'bg-slate-700 hover:bg-slate-600'
+                    }`}
+                  >
+                    {angle}°
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div>
+              <label className="block text-sm font-medium mb-2">Line Style</label>
+              <div className="flex flex-wrap gap-2">
+                {LINE_TYPES.map(lt => (
+                  <button
+                    key={lt.id}
+                    onClick={() => updateEditingConnection({ lineType: lt.id })}
+                    className={`px-3 py-2 rounded text-sm transition-all flex items-center gap-2 ${
+                      (editingConnection.lineType || 'solid') === lt.id
+                        ? 'bg-blue-600 ring-2 ring-blue-400'
+                        : 'bg-slate-700 hover:bg-slate-600'
+                    }`}
+                  >
+                    <svg width="40" height="10">
+                      <line
+                        x1="0"
+                        y1="5"
+                        x2="40"
+                        y2="5"
+                        stroke="currentColor"
+                        strokeWidth="2"
+                        strokeDasharray={lt.dasharray || undefined}
+                      />
+                    </svg>
+                    <span>{lt.label}</span>
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div className="flex gap-3 pt-4">
               <button
                 onClick={() => {
                   setShowConnectionEditor(false);
                   setEditingConnection(null);
                 }}
-                className="text-slate-400 hover:text-white"
+                className="flex-1 px-4 py-2 bg-blue-600 hover:bg-blue-700 rounded transition-colors"
               >
-                <X size={24} />
+                Done
               </button>
-            </div>
-
-            <div className="space-y-4">
-              <div>
-                <label className="block text-sm font-medium mb-2">Label</label>
-                <input
-                  type="text"
-                  value={editingConnection.label || ''}
-                  onChange={(e) => setEditingConnection({ ...editingConnection, label: e.target.value })}
-                  placeholder="e.g., HTTP, API, Data Flow"
-                  className="w-full px-3 py-2 bg-slate-700 rounded border border-slate-600 focus:border-blue-500 focus:outline-none"
-                />
-              </div>
-
-              <div>
-                <label className="block text-sm font-medium mb-2">Icon (optional)</label>
-                <div className="max-h-32 overflow-y-auto bg-slate-900 rounded p-2 scrollbar-thin">
-                  <div className="grid grid-cols-8 gap-2">
-                    <button
-                      onClick={() => setEditingConnection({ ...editingConnection, iconId: null })}
-                      className={`p-2 rounded transition-all ${
-                        !editingConnection.iconId
-                          ? 'bg-blue-600 ring-2 ring-blue-400'
-                          : 'bg-slate-700 hover:bg-slate-600'
-                      }`}
-                      title="No icon"
-                    >
-                      <X size={16} />
-                    </button>
-                    {AVAILABLE_ICONS.map(iconData => {
-                      const Icon = iconData.icon;
-                      return (
-                        <button
-                          key={iconData.id}
-                          onClick={() => setEditingConnection({ ...editingConnection, iconId: iconData.id })}
-                          className={`p-2 rounded transition-all ${
-                            editingConnection.iconId === iconData.id
-                              ? 'bg-blue-600 ring-2 ring-blue-400'
-                              : 'bg-slate-700 hover:bg-slate-600'
-                          }`}
-                          title={iconData.label}
-                        >
-                          <Icon size={16} />
-                        </button>
-                      );
-                    })}
-                  </div>
-                </div>
-              </div>
-
-              <div>
-                <label className="block text-sm font-medium mb-2">Label Rotation: {editingConnection.rotation || 0}°</label>
-                <div className="flex flex-wrap gap-2">
-                  {[0, 15, 30, 45, 60, 75, 90, -15, -30, -45, -60, -75, -90].map(angle => (
-                    <button
-                      key={angle}
-                      onClick={() => setEditingConnection({ ...editingConnection, rotation: angle })}
-                      className={`px-3 py-1 rounded text-sm transition-all ${
-                        (editingConnection.rotation || 0) === angle
-                          ? 'bg-blue-600 ring-2 ring-blue-400'
-                          : 'bg-slate-700 hover:bg-slate-600'
-                      }`}
-                    >
-                      {angle}°
-                    </button>
-                  ))}
-                </div>
-              </div>
-
-              <div>
-                <label className="block text-sm font-medium mb-2">Line Style</label>
-                <div className="flex flex-wrap gap-2">
-                  {LINE_TYPES.map(lt => (
-                    <button
-                      key={lt.id}
-                      onClick={() => setEditingConnection({ ...editingConnection, lineType: lt.id })}
-                      className={`px-3 py-2 rounded text-sm transition-all flex items-center gap-2 ${
-                        (editingConnection.lineType || 'solid') === lt.id
-                          ? 'bg-blue-600 ring-2 ring-blue-400'
-                          : 'bg-slate-700 hover:bg-slate-600'
-                      }`}
-                    >
-                      <svg width="40" height="10">
-                        <line
-                          x1="0"
-                          y1="5"
-                          x2="40"
-                          y2="5"
-                          stroke="currentColor"
-                          strokeWidth="2"
-                          strokeDasharray={lt.dasharray || undefined}
-                        />
-                      </svg>
-                      <span>{lt.label}</span>
-                    </button>
-                  ))}
-                </div>
-              </div>
-
-              <div className="flex gap-3 pt-4">
-                <button
-                  onClick={() => {
-                    setConnections(connections.map(c => 
-                      c.id === editingConnection.id ? editingConnection : c
-                    ));
-                    setShowConnectionEditor(false);
-                    setEditingConnection(null);
-                  }}
-                  className="flex-1 px-4 py-2 bg-blue-600 hover:bg-blue-700 rounded transition-colors"
-                >
-                  Save Connection
-                </button>
-                <button
-                  onClick={() => {
-                    setShowConnectionEditor(false);
-                    setEditingConnection(null);
-                  }}
-                  className="px-4 py-2 bg-slate-700 hover:bg-slate-600 rounded transition-colors"
-                >
-                  Cancel
-                </button>
-              </div>
+              <button
+                onClick={() => {
+                  deleteConnection(editingConnection.id);
+                  setShowConnectionEditor(false);
+                  setEditingConnection(null);
+                }}
+                className="px-4 py-2 bg-red-500 hover:bg-red-600 rounded transition-colors"
+              >
+                <Trash2 size={16} />
+              </button>
             </div>
           </div>
         </div>
