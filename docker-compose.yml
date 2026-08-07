@@ -1,0 +1,8 @@
+version: '3.8'
+
+services:
+  nodex:
+    build: ../../Downloads/nodex
+    ports:
+      - "8080:80"
+    restart: unless-stopped
