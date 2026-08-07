@@ -11,7 +11,7 @@ Architecture diagramming on a hexagonal grid. Nodex is a single-page React app f
 - **Nodes**: hexagons with an icon (90+ built in), color, label, and description
 - **Nested diagrams**: every node can contain its own child diagram — Shift+Click (or "Open Diagram") to descend, breadcrumbs to climb back up
 - **Zones**: colored regions in three shapes — rectangle, hexagon, and circular — with a name label you can place on any side (or center), inside or outside the boundary
-  - Middle-drag a zone to move it; nodes sitting on it come along
+  - Middle-drag a selected zone to move it; nodes sitting on it come along
   - Drag the round handle to resize (corner for rectangles, radius for hex/circular)
 
 ### Connections
@@ -68,7 +68,7 @@ Plain JSON, two flavors, auto-detected on open:
 | Delete / Backspace | Remove selection |
 | Scroll | Zoom |
 | Shift+Drag / Middle-drag | Pan |
-| Middle-drag on zone | Move zone |
+| Middle-drag on selected zone | Move zone |
 | Esc | Cancel / close |
 
 ## Development

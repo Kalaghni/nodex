@@ -695,6 +695,7 @@ export default function Nodex() {
   const [panStart, setPanStart] = useState({ x: 0, y: 0 });
   const [hoveredCell, setHoveredCell] = useState(null);
   const [hoveredNode, setHoveredNode] = useState(null);
+  const [hoveredZone, setHoveredZone] = useState(null);
   const [zoom, setZoom] = useState(1);
   const [isCreatingZone, setIsCreatingZone] = useState(false);
   const [zoneShape, setZoneShape] = useState('rectangle'); // 'rectangle', 'hexagon', or 'circular'
@@ -1688,10 +1689,13 @@ export default function Nodex() {
     } else if (isCreatingZone && e.button === 0) {
       setZoneSelectionStart(pixelToAxial(worldX, worldY));
     } else if (connectingFrom && e.button === 0) {
-      // Clicking an empty cell mid-connection creates a pre-connected node
+      // Clicking an empty cell mid-connection creates a pre-connected node —
+      // but cells inside a zone belong to the zone: their click finishes the
+      // connection on the zone instead (handled by the zone's click handler)
       const { q, r } = pixelToAxial(worldX, worldY);
       const hasNode = nodes.some(n => n.q === q && n.r === r);
-      if (!hasNode) {
+      const zoneUnderCell = getZoneForCell(q, r);
+      if (!hasNode && !zoneUnderCell) {
         openNodeCreator(q, r);
         // Set after openNodeCreator — its resetNodeForm clears the ref
         pendingConnectFromRef.current = { id: connectingFrom.id, kind: connectingFrom.kind };
@@ -1825,8 +1829,12 @@ export default function Nodex() {
     if (!draggingNode && !isPanning && !isCreatingZone && !hoveredConnection && !marquee) {
       const { q, r } = pixelToAxial(worldX, worldY);
       const hasNode = nodes.some(n => n.q === q && n.r === r);
-      
-      if (!hasNode) {
+      // While connecting, zone cells are a drop target for the connection,
+      // not a place to create nodes — hide the + overlay there so clicks
+      // reach the zone
+      const reservedForZone = connectingFrom && getZoneForCell(q, r);
+
+      if (!hasNode && !reservedForZone) {
         setHoveredCell({ q, r });
       } else {
         setHoveredCell(null);
@@ -2076,6 +2084,8 @@ export default function Nodex() {
   const handleZoneMouseDown = (e, zone) => {
     if (e.button !== 1) return;
     if (isCreatingZone) return;
+    // Only a selected zone moves — middle-drag on unselected zones pans
+    if (selectedZoneRef.current?.id !== zone.id) return;
     startZoneDrag(e, zone);
   };
 
@@ -2807,7 +2817,7 @@ export default function Nodex() {
                 <p className="font-medium">{selectedZone.label}</p>
               </div>
               <p className="text-xs text-slate-300">{selectedZone.cells.length} cells</p>
-              <p className="text-xs text-slate-400 mt-1">Middle-drag the zone to move it (nodes on it come along). Drag the round handle to resize.</p>
+              <p className="text-xs text-slate-400 mt-1">Middle-drag this selected zone to move it (nodes on it come along). Drag the round handle to resize.</p>
             </div>
             <button
               onClick={() => deleteZone(selectedZone.id)}
@@ -2888,17 +2898,21 @@ export default function Nodex() {
                 onClick={(e) => handleZoneClick(e, zone)}
                 onDoubleClick={(e) => handleZoneDoubleClick(e, zone)}
                 onMouseDown={(e) => handleZoneMouseDown(e, zone)}
+                onMouseEnter={() => setHoveredZone(zone.id)}
+                onMouseLeave={() => setHoveredZone(null)}
               >
                 {zone.cells.map(cell => {
                   const pos = axialToPixel(cell.q, cell.r);
+                  const isConnectTarget = connectingFrom && hoveredZone === zone.id &&
+                    !(connectingFrom.kind === 'zone' && connectingFrom.id === zone.id);
                   return (
                     <polygon
                       key={`zone-${zone.id}-${cell.q}-${cell.r}`}
                       points={getHexagonPoints(pos.x, pos.y, HEX_SIZE)}
                       fill={zone.color}
-                      opacity={selectedZone?.id === zone.id ? 0.4 : 0.2}
-                      stroke={zone.color}
-                      strokeWidth={selectedZone?.id === zone.id ? 2 : 1}
+                      opacity={isConnectTarget ? 0.35 : selectedZone?.id === zone.id ? 0.4 : 0.2}
+                      stroke={isConnectTarget ? '#22c55e' : zone.color}
+                      strokeWidth={isConnectTarget ? 2.5 : selectedZone?.id === zone.id ? 2 : 1}
                       className="cursor-pointer transition-opacity"
                     />
                   );
@@ -2969,10 +2983,10 @@ export default function Nodex() {
                 }}
                 onMouseDown={(e) => {
                   // This overlay sits on top of zone cells — pass a
-                  // middle-drag through as a zone move
+                  // middle-drag through as a move of the selected zone
                   if (e.button === 1) {
                     const zone = getZoneForCell(hoveredCell.q, hoveredCell.r);
-                    if (zone) startZoneDrag(e, zone);
+                    if (zone && selectedZone?.id === zone.id) startZoneDrag(e, zone);
                   }
                 }}
                 className="cursor-pointer"
