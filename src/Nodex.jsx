@@ -265,17 +265,23 @@ const nodeEdgePoint = (center, toward) => {
   return { x: center.x + Math.cos(ang) * t, y: center.y + Math.sin(ang) * t };
 };
 
-// Where the ray fromPt→anchorPt first enters the zone — the earliest
-// intersection across ALL cells, i.e. the blob's outer silhouette. Trimming
-// against only the anchor cell put arrowheads inside the zone whenever the
-// line crossed another cell first.
-const zoneBoundaryPoint = (zone, fromPt, anchorPt) => {
+// Earliest parameter t where segment p0→p1 enters any cell of the zone
+// (the blob's outer silhouette), or null if it never does
+const zoneEntryT = (zone, p0, p1) => {
   let bestT = null;
   zone.cells.forEach(c => {
     const p = axialToPixel(c.q, c.r);
-    const hit = segmentHexIntersection(fromPt, anchorPt, p.x, p.y, HEX_SIZE);
+    const hit = segmentHexIntersection(p0, p1, p.x, p.y, HEX_SIZE);
     if (hit && (bestT === null || hit[0] < bestT)) bestT = hit[0];
   });
+  return bestT;
+};
+
+// Where the ray fromPt→anchorPt first enters the zone. Trimming against
+// only the anchor cell put arrowheads inside the zone whenever the line
+// crossed another cell first.
+const zoneBoundaryPoint = (zone, fromPt, anchorPt) => {
+  const bestT = zoneEntryT(zone, fromPt, anchorPt);
   if (bestT === null || bestT <= 0) return anchorPt;
   return {
     x: fromPt.x + (anchorPt.x - fromPt.x) * bestT,
@@ -2545,9 +2551,30 @@ export default function Nodex() {
     const epFrom = resolveCenter(conn.from, conn.fromType || 'node');
     const epTo = resolveCenter(conn.to, conn.toType || 'node');
     if (!epFrom || !epTo) return;
-    const a = nearestCellTo(epFrom, epTo);
-    const b = nearestCellTo(epTo, epFrom);
-    if (a.x === b.x && a.y === b.y) return;
+
+    // Anchors: zone-zone uses the closest PAIR of cells across both zones —
+    // centroid-based anchors sent lines on long grazing diagonals when the
+    // blobs were much closer elsewhere. Node-zone keeps nearest-to-node.
+    let a, b;
+    if (epFrom.type === 'zone' && epTo.type === 'zone') {
+      let best = Infinity;
+      epFrom.zone.cells.forEach(ca => {
+        const pa = axialToPixel(ca.q, ca.r);
+        epTo.zone.cells.forEach(cb => {
+          const pb = axialToPixel(cb.q, cb.r);
+          const d = (pa.x - pb.x) ** 2 + (pa.y - pb.y) ** 2;
+          if (d < best) {
+            best = d;
+            a = pa;
+            b = pb;
+          }
+        });
+      });
+    } else {
+      a = nearestCellTo(epFrom, epTo);
+      b = nearestCellTo(epTo, epFrom);
+    }
+    if (!a || !b || (a.x === b.x && a.y === b.y)) return;
     const routing = conn.routing || 'direct';
     let pts;
 
@@ -2613,7 +2640,14 @@ export default function Nodex() {
       box.halfH += ((connChannels.length - 1) / 2) * CHANNEL_SPACING;
     }
 
-    connGeoms[conn.id] = { pts, mid, box, channels: connChannels };
+    connGeoms[conn.id] = {
+      pts,
+      mid,
+      box,
+      channels: connChannels,
+      fromZone: epFrom.type === 'zone' ? epFrom.zone : null,
+      toZone: epTo.type === 'zone' ? epTo.zone : null
+    };
   });
 
   return (
@@ -3641,7 +3675,33 @@ export default function Nodex() {
                       a single strand at offset 0 in the connection color. */}
                   {(geom.channels.length > 0 ? geom.channels : [null]).map((ch, si, strandArr) => {
                     const offset = (si - (strandArr.length - 1) / 2) * CHANNEL_SPACING;
-                    const sPts = offset === 0 ? pts : offsetPolyline(pts, offset);
+                    let sPts = offset === 0 ? pts : offsetPolyline(pts, offset);
+                    // Offset strands end on a square cap, which pokes past
+                    // slanted zone edges — re-trim each strand's zone end
+                    // against the silhouette along the strand's own line
+                    if (offset !== 0 && (geom.fromZone || geom.toZone)) {
+                      sPts = sPts.map(p => ({ ...p }));
+                      const retrim = (endIdx, innerIdx, zone) => {
+                        const pEnd = sPts[endIdx];
+                        const pIn = sPts[innerIdx];
+                        const dx = pEnd.x - pIn.x;
+                        const dy = pEnd.y - pIn.y;
+                        const len = Math.hypot(dx, dy) || 1;
+                        const ext = {
+                          x: pEnd.x + (dx / len) * HEX_SIZE,
+                          y: pEnd.y + (dy / len) * HEX_SIZE
+                        };
+                        const t = zoneEntryT(zone, pIn, ext);
+                        if (t !== null && t > 0) {
+                          sPts[endIdx] = {
+                            x: pIn.x + (ext.x - pIn.x) * t,
+                            y: pIn.y + (ext.y - pIn.y) * t
+                          };
+                        }
+                      };
+                      if (geom.fromZone) retrim(0, 1, geom.fromZone);
+                      if (geom.toZone) retrim(sPts.length - 1, sPts.length - 2, geom.toZone);
+                    }
                     const strandColor = ch ? ch.color : (isHovered && !conn.color ? '#94a3b8' : lineColor);
                     const strandKey = (ch ? ch.color : lineColor).replace('#', '');
                     return pieces.map((piece, i) => {
