@@ -4,6 +4,11 @@ import { Database, Server, Cloud, Zap, Box, Globe, Lock, HardDrive, Cpu, Network
 // Hexagon grid calculations
 const HEX_SIZE = 40;
 
+// Monotonic id generator — Date.now() alone can collide when two items are
+// created within the same millisecond (e.g. paste twice, import + new tab)
+let __nextId = Date.now();
+const genId = () => __nextId++;
+
 const getHexagonPoints = (x, y, size) => {
   const points = [];
   for (let i = 0; i < 6; i++) {
@@ -53,6 +58,84 @@ const hexDistance = (q1, r1, q2, r2) => {
   const x1 = q1, z1 = r1, y1 = -q1 - r1;
   const x2 = q2, z2 = r2, y2 = -q2 - r2;
   return Math.max(Math.abs(x1 - x2), Math.abs(y1 - y2), Math.abs(z1 - z2));
+};
+
+// Distance from a flat-top hexagon's center to its boundary along `angle`.
+// Vertices sit at multiples of 60°, so within each 60° sector the boundary is
+// a straight edge whose apothem is size·√3/2.
+const hexBoundaryDistance = (size, angle) => {
+  const sector = Math.PI / 3;
+  let a = angle % sector;
+  if (a < 0) a += sector;
+  return (size * Math.sqrt(3) / 2) / Math.cos(a - sector / 2);
+};
+
+// Trim a segment between two hex centers so it starts/ends at the hexagon
+// boundaries instead of the centers (keeps arrowheads visible at the edge).
+const trimSegmentToHexEdges = (from, to, size) => {
+  const dx = to.x - from.x;
+  const dy = to.y - from.y;
+  const dist = Math.hypot(dx, dy);
+  if (dist === 0) return null;
+  const angle = Math.atan2(dy, dx);
+  let fromTrim = hexBoundaryDistance(size, angle);
+  let toTrim = hexBoundaryDistance(size, angle + Math.PI);
+  // Adjacent hexes touch — keep at least a sliver of line so markers don't NaN
+  const totalTrim = fromTrim + toTrim;
+  if (dist - totalTrim < 4) {
+    const scale = Math.max(0, dist - 4) / totalTrim;
+    fromTrim *= scale;
+    toTrim *= scale;
+  }
+  const ux = dx / dist;
+  const uy = dy / dist;
+  return {
+    from: { x: from.x + ux * fromTrim, y: from.y + uy * fromTrim },
+    to: { x: to.x - ux * toTrim, y: to.y - uy * toTrim },
+    ux,
+    uy
+  };
+};
+
+// Walk hex rings around a center cell, out to `radius`
+const buildHexRingCells = (cq, cr, radius) => {
+  const cells = [{ q: cq, r: cr }];
+  const directions = [
+    { q: 1, r: -1 }, { q: 1, r: 0 }, { q: 0, r: 1 },
+    { q: -1, r: 1 }, { q: -1, r: 0 }, { q: 0, r: -1 }
+  ];
+  for (let ring = 1; ring <= radius; ring++) {
+    let q = cq + directions[4].q * ring;
+    let r = cr + directions[4].r * ring;
+    for (let side = 0; side < 6; side++) {
+      for (let step = 0; step < ring; step++) {
+        cells.push({ q, r });
+        q += directions[side].q;
+        r += directions[side].r;
+      }
+    }
+  }
+  return cells;
+};
+
+// Round region: cells whose center lies within a Euclidean pixel radius —
+// unlike buildHexRingCells this produces a circle, not a bigger hexagon
+const buildCircularCells = (cq, cr, hexRadius) => {
+  const center = axialToPixel(cq, cr);
+  const pixelRadius = (hexRadius + 0.5) * HEX_SIZE * Math.sqrt(3) / 2 * 1.15;
+  const cells = [];
+  const range = hexRadius + 2;
+  for (let dq = -range; dq <= range; dq++) {
+    for (let dr = -range; dr <= range; dr++) {
+      const q = cq + dq;
+      const r = cr + dr;
+      const pos = axialToPixel(q, r);
+      if (Math.hypot(pos.x - center.x, pos.y - center.y) <= pixelRadius) {
+        cells.push({ q, r });
+      }
+    }
+  }
+  return cells;
 };
 
 const AVAILABLE_ICONS = [
@@ -194,11 +277,12 @@ const createEmptyDiagram = () => ({
 });
 
 // Create a new tab
-const createTab = (name = 'Untitled', diagrams = null) => ({
-  id: Date.now(),
+const createTab = (name = 'Untitled', diagrams = null, fileHandle = null) => ({
+  id: genId(),
   name,
   diagrams: diagrams || { root: createEmptyDiagram() },
-  currentPath: ['root']
+  currentPath: ['root'],
+  fileHandle
 });
 
 export default function Nodex() {
@@ -209,6 +293,8 @@ export default function Nodex() {
   // Refs to avoid stale closures
   const activeTabIdRef = useRef(activeTabId);
   activeTabIdRef.current = activeTabId;
+  const tabsRef = useRef(tabs);
+  tabsRef.current = tabs;
   
   // Get active tab
   const activeTab = tabs.find(t => t.id === activeTabId) || tabs[0];
@@ -250,6 +336,10 @@ export default function Nodex() {
 
   // Clipboard state for copy-paste
   const [clipboard, setClipboard] = useState(null);
+  const clipboardRef = useRef(null);
+  clipboardRef.current = clipboard;
+  const nodesRef = useRef(nodes);
+  nodesRef.current = nodes;
 
   // UI State
   const [showNodeCreator, setShowNodeCreator] = useState(false);
@@ -299,6 +389,12 @@ export default function Nodex() {
   const fileInputRef = useRef(null);
   const [canvasSize, setCanvasSize] = useState({ width: 800, height: 600 });
 
+  // Autosave + project file link
+  const [autosave, setAutosave] = useState(false);
+  const [projectHandle, setProjectHandle] = useState(null);
+  const projectHandleRef = useRef(null);
+  projectHandleRef.current = projectHandle;
+
   // Update canvas size on mount and resize
   useEffect(() => {
     const updateSize = () => {
@@ -311,6 +407,33 @@ export default function Nodex() {
     window.addEventListener('resize', updateSize);
     return () => window.removeEventListener('resize', updateSize);
   }, []);
+
+  // Autosave: after any change settles for a second, write every linked
+  // on-device file (project file and/or per-tab files). No-op until a file
+  // has been linked via Save / Save Project.
+  useEffect(() => {
+    if (!autosave) return;
+    const timer = setTimeout(async () => {
+      try {
+        if (projectHandleRef.current) {
+          await writeToHandle(projectHandleRef.current, getProjectData());
+        }
+        for (const t of tabsRef.current) {
+          if (t.fileHandle) {
+            await writeToHandle(t.fileHandle, {
+              version: 1,
+              name: t.name,
+              diagrams: t.diagrams,
+              currentPath: t.currentPath
+            });
+          }
+        }
+      } catch (err) {
+        console.warn('Autosave failed:', err);
+      }
+    }, 1000);
+    return () => clearTimeout(timer);
+  }, [autosave, tabs]);
 
   // Calculate dynamic grid bounds to fill viewport and include content
   const getGridBounds = () => {
@@ -375,8 +498,8 @@ export default function Nodex() {
   const gridBounds = getGridBounds();
 
   // Tab management
-  const addTab = (name = 'Untitled', diagrams = null) => {
-    const newTab = createTab(name, diagrams);
+  const addTab = (name = 'Untitled', diagrams = null, fileHandle = null) => {
+    const newTab = createTab(name, diagrams, fileHandle);
     setTabs([...tabs, newTab]);
     setActiveTabId(newTab.id);
     setSelectedNode(null);
@@ -387,9 +510,10 @@ export default function Nodex() {
 
   const closeTab = (tabId) => {
     if (tabs.length === 1) {
-      // Don't close the last tab, just clear it
-      setTabs([createTab('Untitled')]);
-      setActiveTabId(tabs[0].id);
+      // Don't close the last tab, just replace it with a fresh one
+      const fresh = createTab('Untitled');
+      setTabs([fresh]);
+      setActiveTabId(fresh.id);
       return;
     }
     const newTabs = tabs.filter(t => t.id !== tabId);
@@ -404,30 +528,186 @@ export default function Nodex() {
   };
 
   // File operations
-  const saveToFile = () => {
-    const data = {
+  const FILE_PICKER_TYPES = [{
+    description: 'Nodex diagram',
+    accept: { 'application/json': ['.json'] }
+  }];
+
+  const getSaveData = () => {
+    const tab = tabsRef.current.find(t => t.id === activeTabIdRef.current) || tabsRef.current[0];
+    return {
       version: 1,
-      name: activeTab.name,
-      diagrams,
-      currentPath
+      name: tab.name,
+      diagrams: tab.diagrams,
+      currentPath: tab.currentPath
     };
+  };
+
+  const suggestedFileName = () => {
+    const tab = tabsRef.current.find(t => t.id === activeTabIdRef.current) || tabsRef.current[0];
+    return `${tab.name.replace(/[^a-z0-9]/gi, '-').toLowerCase() || 'nodex-diagram'}.json`;
+  };
+
+  const writeToHandle = async (handle, data) => {
+    const writable = await handle.createWritable();
+    await writable.write(JSON.stringify(data, null, 2));
+    await writable.close();
+  };
+
+  const downloadJson = (data) => {
     const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `${activeTab.name.replace(/[^a-z0-9]/gi, '-').toLowerCase() || 'nodex-diagram'}.json`;
+    a.download = suggestedFileName();
     a.click();
     URL.revokeObjectURL(url);
   };
 
-  const loadFileData = (data, fileName) => {
+  // Save: writes back to the tab's on-device file when one is linked,
+  // otherwise prompts for a location (File System Access API) and links it.
+  // Falls back to a plain download in browsers without the API.
+  const saveToFile = async () => {
+    const data = getSaveData();
+    const tab = tabsRef.current.find(t => t.id === activeTabIdRef.current);
+
+    if (tab?.fileHandle) {
+      try {
+        await writeToHandle(tab.fileHandle, data);
+        return;
+      } catch (err) {
+        if (err.name === 'AbortError' || err.name === 'NotAllowedError') return;
+        // Handle went bad (file moved/deleted) — fall through to re-pick
+      }
+    }
+
+    if (window.showSaveFilePicker) {
+      try {
+        const handle = await window.showSaveFilePicker({
+          suggestedName: suggestedFileName(),
+          types: FILE_PICKER_TYPES
+        });
+        await writeToHandle(handle, data);
+        setTabs(prevTabs => prevTabs.map(t =>
+          t.id === activeTabIdRef.current ? { ...t, fileHandle: handle } : t
+        ));
+        return;
+      } catch (err) {
+        if (err.name === 'AbortError') return;
+      }
+    }
+
+    downloadJson(data);
+  };
+
+  // Project = every open tab in a single file
+  const getProjectData = () => ({
+    version: 2,
+    type: 'nodex-project',
+    tabs: tabsRef.current.map(t => ({
+      name: t.name,
+      diagrams: t.diagrams,
+      currentPath: t.currentPath
+    }))
+  });
+
+  const saveProject = async () => {
+    const data = getProjectData();
+
+    if (projectHandleRef.current) {
+      try {
+        await writeToHandle(projectHandleRef.current, data);
+        return;
+      } catch (err) {
+        if (err.name === 'AbortError' || err.name === 'NotAllowedError') return;
+        // Handle went bad — fall through to re-pick
+      }
+    }
+
+    if (window.showSaveFilePicker) {
+      try {
+        const handle = await window.showSaveFilePicker({
+          suggestedName: 'nodex-project.json',
+          types: FILE_PICKER_TYPES
+        });
+        await writeToHandle(handle, data);
+        setProjectHandle(handle);
+        return;
+      } catch (err) {
+        if (err.name === 'AbortError') return;
+      }
+    }
+
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'nodex-project.json';
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  // A workspace we can silently replace: one unlinked tab with nothing drawn
+  const isPristineWorkspace = (tabList) =>
+    tabList.length === 1 &&
+    !tabList[0].fileHandle &&
+    Object.values(tabList[0].diagrams).every(
+      d => d.nodes.length === 0 && d.connections.length === 0 && d.zones.length === 0
+    );
+
+  const loadFileData = (data, fileName, fileHandle = null) => {
+    // Project file: restore all tabs
+    if (Array.isArray(data.tabs)) {
+      const newTabs = data.tabs
+        .filter(t => t && t.diagrams)
+        .map(t => ({
+          ...createTab(t.name || 'Untitled', t.diagrams),
+          currentPath: Array.isArray(t.currentPath) && t.currentPath.length > 0 ? t.currentPath : ['root']
+        }));
+      if (newTabs.length === 0) {
+        alert('Failed to load file: project contains no diagrams');
+        return;
+      }
+      setTabs(prevTabs => isPristineWorkspace(prevTabs) ? newTabs : [...prevTabs, ...newTabs]);
+      setActiveTabId(newTabs[0].id);
+      setSelectedNode(null);
+      setSelectedZone(null);
+      setViewOffset({ x: 400, y: 300 });
+      setZoom(1);
+      if (fileHandle) setProjectHandle(fileHandle);
+      return;
+    }
+
+    // Single-diagram file: open as a new tab
     if (data.diagrams) {
       const name = data.name || fileName?.replace('.json', '') || 'Imported';
-      addTab(name, data.diagrams);
+      addTab(name, data.diagrams, fileHandle);
       // Update path after tab is created
       setTimeout(() => {
         setCurrentPath(data.currentPath || ['root']);
       }, 0);
+    } else {
+      alert('Failed to load file: not a Nodex diagram');
+    }
+  };
+
+  // Open: uses the File System Access API when available so the tab stays
+  // linked to the on-device file (Save then writes straight back to it)
+  const openFromDevice = async () => {
+    if (window.showOpenFilePicker) {
+      try {
+        const [handle] = await window.showOpenFilePicker({
+          types: FILE_PICKER_TYPES,
+          multiple: false
+        });
+        const file = await handle.getFile();
+        const data = JSON.parse(await file.text());
+        loadFileData(data, file.name, handle);
+      } catch (err) {
+        if (err.name !== 'AbortError') alert('Failed to load file: Invalid format');
+      }
+    } else {
+      fileInputRef.current?.click();
     }
   };
 
@@ -448,8 +728,15 @@ export default function Nodex() {
     e.target.value = '';
   };
 
-  // Drag and drop file handling
+  // Drag and drop file handling — only react to actual files being dragged
+  // in; dragging selected text/nodes must not trigger the drop overlay
+  const isFileDrag = (e) => {
+    const types = e.dataTransfer?.types;
+    return types && Array.from(types).includes('Files');
+  };
+
   const handleFileDragOver = (e) => {
+    if (!isFileDrag(e)) return;
     e.preventDefault();
     e.stopPropagation();
     setIsDraggingFile(true);
@@ -465,9 +752,10 @@ export default function Nodex() {
     e.preventDefault();
     e.stopPropagation();
     setIsDraggingFile(false);
-    
+
     const file = e.dataTransfer.files?.[0];
-    if (!file || !file.name.endsWith('.json')) {
+    if (!file) return;
+    if (!file.name.endsWith('.json')) {
       alert('Please drop a .json file');
       return;
     }
@@ -484,93 +772,190 @@ export default function Nodex() {
     reader.readAsText(file);
   };
 
-  const exportAsSVG = () => {
+  // Bounding box (world coordinates) of everything in the current diagram —
+  // exports must cover all content, not just what's scrolled into view
+  const getContentBounds = () => {
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    const include = (x, y, pad) => {
+      minX = Math.min(minX, x - pad);
+      maxX = Math.max(maxX, x + pad);
+      minY = Math.min(minY, y - pad);
+      maxY = Math.max(maxY, y + pad);
+    };
+
+    nodes.forEach(n => {
+      const p = axialToPixel(n.q, n.r);
+      include(p.x, p.y, HEX_SIZE);
+      // Label below the hexagon — generous width since text size is unknown here
+      include(p.x, p.y + HEX_SIZE + 22, 8 + n.label.length * 4);
+    });
+    zones.forEach(z => z.cells.forEach(c => {
+      const p = axialToPixel(c.q, c.r);
+      include(p.x, p.y, HEX_SIZE);
+    }));
+
+    if (minX === Infinity) return null;
+    const margin = 30;
+    return {
+      x: minX - margin,
+      y: minY - margin,
+      width: maxX - minX + margin * 2,
+      height: maxY - minY + margin * 2
+    };
+  };
+
+  // Clone the live SVG into a standalone document: proper namespace, sized to
+  // the full content bounds, dark background baked in, and lucide icons
+  // pulled out of their <foreignObject> wrappers (foreignObject HTML doesn't
+  // render outside the app because it relies on Tailwind classes/XHTML)
+  const prepareExportSvg = () => {
     const svgElement = canvasRef.current?.querySelector('svg');
-    if (!svgElement) return;
-    
+    const bounds = getContentBounds();
+    if (!svgElement || !bounds) return null;
+
+    const SVG_NS = 'http://www.w3.org/2000/svg';
     const clone = svgElement.cloneNode(true);
-    const blob = new Blob([clone.outerHTML], { type: 'image/svg+xml' });
+    clone.setAttribute('xmlns', SVG_NS);
+    clone.removeAttribute('class');
+    clone.setAttribute('width', Math.ceil(bounds.width));
+    clone.setAttribute('height', Math.ceil(bounds.height));
+    clone.setAttribute('viewBox', `${bounds.x} ${bounds.y} ${bounds.width} ${bounds.height}`);
+    clone.setAttribute('font-family', 'system-ui, -apple-system, sans-serif');
+
+    // Neutralize the pan/zoom transform — the viewBox does the framing now
+    const rootGroup = clone.querySelector('g');
+    if (rootGroup) rootGroup.removeAttribute('transform');
+
+    // Background
+    const bg = document.createElementNS(SVG_NS, 'rect');
+    bg.setAttribute('x', bounds.x);
+    bg.setAttribute('y', bounds.y);
+    bg.setAttribute('width', bounds.width);
+    bg.setAttribute('height', bounds.height);
+    bg.setAttribute('fill', '#0f172a');
+    clone.insertBefore(bg, clone.firstChild);
+
+    // Replace each foreignObject with the lucide <svg> it wraps, centered in
+    // the same box, so icons render in standalone SVG/PNG output
+    clone.querySelectorAll('foreignObject').forEach(fo => {
+      const innerSvg = fo.querySelector('svg');
+      if (!innerSvg) {
+        fo.remove();
+        return;
+      }
+      const foX = parseFloat(fo.getAttribute('x')) || 0;
+      const foY = parseFloat(fo.getAttribute('y')) || 0;
+      const foW = parseFloat(fo.getAttribute('width')) || 0;
+      const foH = parseFloat(fo.getAttribute('height')) || 0;
+      const iconW = parseFloat(innerSvg.getAttribute('width')) || 24;
+      const iconH = parseFloat(innerSvg.getAttribute('height')) || 24;
+      const icon = innerSvg.cloneNode(true);
+      icon.setAttribute('x', foX + (foW - iconW) / 2);
+      icon.setAttribute('y', foY + (foH - iconH) / 2);
+      icon.removeAttribute('class');
+      fo.replaceWith(icon);
+    });
+
+    return {
+      svgString: new XMLSerializer().serializeToString(clone),
+      width: Math.ceil(bounds.width),
+      height: Math.ceil(bounds.height)
+    };
+  };
+
+  const exportFileName = (ext) =>
+    `${activeTab.name.replace(/[^a-z0-9]/gi, '-').toLowerCase() || 'nodex-diagram'}.${ext}`;
+
+  const exportAsSVG = () => {
+    const prepared = prepareExportSvg();
+    if (!prepared) {
+      alert('Nothing to export — the diagram is empty');
+      return;
+    }
+    const blob = new Blob([prepared.svgString], { type: 'image/svg+xml' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `${activeTab.name.replace(/[^a-z0-9]/gi, '-').toLowerCase() || 'nodex-diagram'}.svg`;
+    a.download = exportFileName('svg');
     a.click();
     URL.revokeObjectURL(url);
   };
 
   const exportAsPNG = () => {
-    const svgElement = canvasRef.current?.querySelector('svg');
-    if (!svgElement) return;
-    
+    const prepared = prepareExportSvg();
+    if (!prepared) {
+      alert('Nothing to export — the diagram is empty');
+      return;
+    }
+
+    const scale = 2;
     const canvas = document.createElement('canvas');
+    canvas.width = prepared.width * scale;
+    canvas.height = prepared.height * scale;
     const ctx = canvas.getContext('2d');
-    const svgData = new XMLSerializer().serializeToString(svgElement);
+
     const img = new Image();
-    
-    canvas.width = canvasSize.width * 2;
-    canvas.height = canvasSize.height * 2;
-    ctx.scale(2, 2);
-    
     img.onload = () => {
       ctx.fillStyle = '#0f172a';
       ctx.fillRect(0, 0, canvas.width, canvas.height);
-      ctx.drawImage(img, 0, 0);
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
       const a = document.createElement('a');
       a.href = canvas.toDataURL('image/png');
-      a.download = `${activeTab.name.replace(/[^a-z0-9]/gi, '-').toLowerCase() || 'nodex-diagram'}.png`;
+      a.download = exportFileName('png');
       a.click();
     };
-    img.src = 'data:image/svg+xml;base64,' + btoa(unescape(encodeURIComponent(svgData)));
+    img.src = 'data:image/svg+xml;base64,' + btoa(unescape(encodeURIComponent(prepared.svgString)));
   };
 
   const newDiagram = () => {
     addTab('Untitled');
   };
 
-  // Copy-paste functionality
+  // Copy-paste functionality — read through refs so the keyboard shortcut
+  // handler (registered once) never operates on stale state
   const copyNode = () => {
-    if (selectedNode) {
-      setClipboard({ type: 'node', data: { ...selectedNode } });
+    const node = selectedNodeRef.current;
+    if (node) {
+      setClipboard({ type: 'node', data: { ...node } });
     }
   };
 
   const pasteNode = () => {
-    if (!clipboard || clipboard.type !== 'node') return;
-    
-    const nodeData = clipboard.data;
-    
-    // Find a non-overlapping position
+    const clip = clipboardRef.current;
+    if (!clip || clip.type !== 'node') return;
+
+    const nodeData = clip.data;
+    const currentNodes = nodesRef.current;
+
+    // Find a non-overlapping position, spiralling outward ring by ring
     let newQ = nodeData.q + 1;
     let newR = nodeData.r;
-    let attempts = 0;
-    const maxAttempts = 50;
-    
-    while (attempts < maxAttempts) {
-      const isOccupied = nodes.some(n => n.q === newQ && n.r === newR);
-      if (!isOccupied) break;
-      
-      // Spiral outward to find empty cell
-      attempts++;
-      const ring = Math.ceil(attempts / 6);
-      const posInRing = attempts % 6;
-      const directions = [
-        { q: 1, r: 0 }, { q: 0, r: 1 }, { q: -1, r: 1 },
-        { q: -1, r: 0 }, { q: 0, r: -1 }, { q: 1, r: -1 }
-      ];
-      const dir = directions[posInRing];
-      newQ = nodeData.q + dir.q * ring;
-      newR = nodeData.r + dir.r * ring;
+    const directions = [
+      { q: 1, r: 0 }, { q: 0, r: 1 }, { q: -1, r: 1 },
+      { q: -1, r: 0 }, { q: 0, r: -1 }, { q: 1, r: -1 }
+    ];
+    outer:
+    for (let ring = 1; ring <= 10; ring++) {
+      for (const dir of directions) {
+        const q = nodeData.q + dir.q * ring;
+        const r = nodeData.r + dir.r * ring;
+        if (!currentNodes.some(n => n.q === q && n.r === r)) {
+          newQ = q;
+          newR = r;
+          break outer;
+        }
+      }
     }
-    
+
     const newNode = {
       ...nodeData,
-      id: Date.now(),
+      id: genId(),
       q: newQ,
       r: newR,
       label: `${nodeData.label} (copy)`
     };
-    
-    setNodes([...nodes, newNode]);
+
+    setNodes(prev => [...prev, newNode]);
     setSelectedNode(newNode);
   };
 
@@ -582,41 +967,29 @@ export default function Nodex() {
     setViewOffset({ x: canvasSize.width / 2, y: canvasSize.height / 2 });
   };
 
-  // Helper to update current diagram
+  // Helper to update current diagram — reads path via ref and previous state
+  // via the functional updater so it's safe to call from event handlers and
+  // keyboard shortcuts without capturing stale state
   const updateCurrentDiagram = (updates) => {
-    const path = currentPath.join('/');
-    setDiagrams(prev => ({
-      ...prev,
-      [path]: {
-        ...prev[path],
-        ...updates
-      }
-    }));
+    const path = currentPathRef.current.join('/');
+    setDiagrams(prev => {
+      const diag = prev[path] || createEmptyDiagram();
+      return { ...prev, [path]: { ...diag, ...updates } };
+    });
   };
 
-  const setNodes = (newNodes) => {
-    if (typeof newNodes === 'function') {
-      updateCurrentDiagram({ nodes: newNodes(nodes) });
-    } else {
-      updateCurrentDiagram({ nodes: newNodes });
-    }
+  const setDiagramField = (field, value) => {
+    const path = currentPathRef.current.join('/');
+    setDiagrams(prev => {
+      const diag = prev[path] || createEmptyDiagram();
+      const next = typeof value === 'function' ? value(diag[field]) : value;
+      return { ...prev, [path]: { ...diag, [field]: next } };
+    });
   };
 
-  const setConnections = (newConnections) => {
-    if (typeof newConnections === 'function') {
-      updateCurrentDiagram({ connections: newConnections(connections) });
-    } else {
-      updateCurrentDiagram({ connections: newConnections });
-    }
-  };
-
-  const setZones = (newZones) => {
-    if (typeof newZones === 'function') {
-      updateCurrentDiagram({ zones: newZones(zones) });
-    } else {
-      updateCurrentDiagram({ zones: newZones });
-    }
-  };
+  const setNodes = (newNodes) => setDiagramField('nodes', newNodes);
+  const setConnections = (newConnections) => setDiagramField('connections', newConnections);
+  const setZones = (newZones) => setDiagramField('zones', newZones);
 
   // Navigation
   const navigateToNode = (node) => {
@@ -702,7 +1075,7 @@ export default function Nodex() {
     } else {
       const coords = newNodeData.presetCoords || { q: 0, r: 0 };
       const newNode = {
-        id: Date.now(),
+        id: genId(),
         label: newNodeData.label,
         description: newNodeData.description,
         iconId: newNodeData.iconId,
@@ -762,7 +1135,7 @@ export default function Nodex() {
       ));
     } else {
       const newZone = {
-        id: Date.now(),
+        id: genId(),
         label: newZoneData.label,
         color: newZoneData.color,
         cells: selectedZoneCells
@@ -829,91 +1202,35 @@ export default function Nodex() {
     // Zone selection drag
     if (isCreatingZone && zoneSelectionStart) {
       const { q, r } = pixelToAxial(worldX, worldY);
-      const cells = [];
-      
+      let cells = [];
+
       if (zoneShape === 'rectangle') {
         const minQ = Math.min(zoneSelectionStart.q, q);
         const maxQ = Math.max(zoneSelectionStart.q, q);
         const minR = Math.min(zoneSelectionStart.r, r);
         const maxR = Math.max(zoneSelectionStart.r, r);
-        
+
         for (let qi = minQ; qi <= maxQ; qi++) {
           for (let ri = minR; ri <= maxR; ri++) {
             cells.push({ q: qi, r: ri });
           }
         }
       } else if (zoneShape === 'hexagon') {
-        // First click = center, drag outward to set radius
+        // Hex-shaped zone: first click = center, drag outward to set radius
         const cq = zoneSelectionStart.q;
         const cr = zoneSelectionStart.r;
-        const mouseCell = pixelToAxial(worldX, worldY);
-        
-        // Radius is the hex distance from center (start) to mouse
-        const radius = Math.max(1, hexDistance(
-          cq, cr,
-          mouseCell.q, mouseCell.r
-        ));
+        const radius = Math.max(1, hexDistance(cq, cr, q, r));
         setZoneRadius(radius);
-        
-        // Build hexagon centered at start point
-        cells.push({ q: cq, r: cr });
-        
-        const directions = [
-          { q: 1, r: -1 }, { q: 1, r: 0 }, { q: 0, r: 1 },
-          { q: -1, r: 1 }, { q: -1, r: 0 }, { q: 0, r: -1 }
-        ];
-        
-        for (let ring = 1; ring <= radius; ring++) {
-          let q = cq + directions[4].q * ring;
-          let r = cr + directions[4].r * ring;
-          
-          for (let side = 0; side < 6; side++) {
-            for (let step = 0; step < ring; step++) {
-              cells.push({ q, r });
-              q += directions[side].q;
-              r += directions[side].r;
-            }
-          }
-        }
+        cells = buildHexRingCells(cq, cr, radius);
       } else if (zoneShape === 'circular') {
-        // First click = edge of hexagon, drag = center
-        const centerCell = pixelToAxial(worldX, worldY);
-        const cq = centerCell.q;
-        const cr = centerCell.r;
-        
-        // Radius is the hex distance from center (mouse) to edge (start point)
-        const radius = Math.max(1, hexDistance(
-          cq, cr,
-          zoneSelectionStart.q, zoneSelectionStart.r
-        ));
+        // Round zone: first click = center, drag outward to set radius —
+        // cells are picked by Euclidean distance so the result is a circle,
+        // not a bigger hexagon
+        const cq = zoneSelectionStart.q;
+        const cr = zoneSelectionStart.r;
+        const radius = Math.max(1, hexDistance(cq, cr, q, r));
         setZoneRadius(radius);
-        
-        // Build hexagon centered at mouse position
-        cells.push({ q: cq, r: cr });
-        
-        // Direction vectors for walking around a hex ring
-        const directions = [
-          { q: 1, r: -1 },  // NE
-          { q: 1, r: 0 },   // E
-          { q: 0, r: 1 },   // SE
-          { q: -1, r: 1 },  // SW
-          { q: -1, r: 0 },  // W
-          { q: 0, r: -1 }   // NW
-        ];
-        
-        // Add each ring
-        for (let ring = 1; ring <= radius; ring++) {
-          let q = cq + directions[4].q * ring;
-          let r = cr + directions[4].r * ring;
-          
-          for (let side = 0; side < 6; side++) {
-            for (let step = 0; step < ring; step++) {
-              cells.push({ q, r });
-              q += directions[side].q;
-              r += directions[side].r;
-            }
-          }
-        }
+        cells = buildCircularCells(cq, cr, radius);
       }
       setSelectedZoneCells(cells);
     }
@@ -969,6 +1286,9 @@ export default function Nodex() {
   const handleNodeMouseDown = (e, node) => {
     if (e.button !== 0) return;
     e.stopPropagation();
+    // Stop the browser starting a text selection — otherwise dragging a node
+    // selects labels, and double-click selects the node's label text
+    e.preventDefault();
 
     // Shift+click to navigate into nested diagram
     if (e.shiftKey) {
@@ -1002,8 +1322,8 @@ export default function Nodex() {
                (c.from === node.id && c.to === connectingFrom.id)
         );
         if (!connectionExists) {
-          const newConnection = { 
-            id: Date.now(), 
+          const newConnection = {
+            id: genId(),
             from: connectingFrom.id, 
             to: node.id,
             label: '',
@@ -1079,16 +1399,27 @@ export default function Nodex() {
 
   useEffect(() => {
     const handleKeyDown = (e) => {
-      // Copy-paste
-      if ((e.ctrlKey || e.metaKey) && e.key === 'c' && selectedNodeRef.current && !showNodeCreator && !showZoneCreator) {
+      // Save (Ctrl+S = active tab, Ctrl+Shift+S = whole project)
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
+        e.preventDefault();
+        if (e.shiftKey) {
+          saveProject();
+        } else {
+          saveToFile();
+        }
+        return;
+      }
+      // Copy-paste — skip when typing in a field
+      const inField = e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA';
+      if ((e.ctrlKey || e.metaKey) && e.key === 'c' && selectedNodeRef.current && !showNodeCreator && !showZoneCreator && !inField) {
         e.preventDefault();
         copyNode();
       }
-      if ((e.ctrlKey || e.metaKey) && e.key === 'v' && clipboard && !showNodeCreator && !showZoneCreator) {
+      if ((e.ctrlKey || e.metaKey) && e.key === 'v' && clipboardRef.current && !showNodeCreator && !showZoneCreator && !inField) {
         e.preventDefault();
         pasteNode();
       }
-      
+
       if ((e.key === 'Delete' || e.key === 'Backspace') && !showNodeCreator && !showZoneCreator && !showConnectionEditor) {
         // Don't prevent default if we're in an input field
         if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
@@ -1154,7 +1485,7 @@ export default function Nodex() {
             <FilePlus size={18} />
           </button>
           <button
-            onClick={() => fileInputRef.current?.click()}
+            onClick={openFromDevice}
             className="p-2 hover:bg-slate-700 rounded transition-colors"
             title="Open File"
           >
@@ -1163,9 +1494,30 @@ export default function Nodex() {
           <button
             onClick={saveToFile}
             className="p-2 hover:bg-slate-700 rounded transition-colors"
-            title="Save"
+            title={activeTab.fileHandle ? `Save to ${activeTab.fileHandle.name} (Ctrl+S)` : 'Save Tab (Ctrl+S)'}
           >
             <Save size={18} />
+          </button>
+          <button
+            onClick={saveProject}
+            className="p-2 hover:bg-slate-700 rounded transition-colors"
+            title={projectHandle ? `Save project to ${projectHandle.name} (Ctrl+Shift+S)` : 'Save Project — all tabs in one file (Ctrl+Shift+S)'}
+          >
+            <Archive size={18} />
+          </button>
+          <button
+            onClick={() => setAutosave(a => !a)}
+            className={`p-2 rounded transition-colors text-xs flex items-center gap-1 ${
+              autosave
+                ? 'bg-emerald-700 text-white hover:bg-emerald-600'
+                : 'hover:bg-slate-700 text-slate-400'
+            }`}
+            title={autosave
+              ? 'Autosave on — linked files are written automatically after each change'
+              : 'Autosave off — click to enable (link a file with Save or Save Project first)'}
+          >
+            <Clock size={16} />
+            <span>Auto</span>
           </button>
           <input
             ref={fileInputRef}
@@ -1305,12 +1657,14 @@ export default function Nodex() {
           >
             <span
               className="max-w-32 truncate"
+              title={tab.fileHandle ? `Linked to ${tab.fileHandle.name}` : tab.name}
               onDoubleClick={(e) => {
                 e.stopPropagation();
                 const newName = prompt('Rename tab:', tab.name);
                 if (newName) renameTab(tab.id, newName);
               }}
             >
+              {tab.fileHandle && <span className="text-emerald-400 mr-1">●</span>}
               {tab.name}
             </span>
             <button
@@ -1402,11 +1756,11 @@ export default function Nodex() {
               {zoneShape === 'rectangle' ? 'Rectangle' : zoneShape === 'hexagon' ? 'Hexagon' : 'Circular'} Zone Mode
             </p>
             <p className="text-amber-300/80 text-xs">
-              {zoneShape === 'rectangle' 
+              {zoneShape === 'rectangle'
                 ? 'Click and drag to select a rectangular area.'
                 : zoneShape === 'hexagon'
-                ? 'Click the center, drag outward to set size.'
-                : 'Click on the edge, drag to the center.'}
+                ? 'Click the center, drag outward — hex-shaped zone.'
+                : 'Click the center, drag outward — round zone.'}
             </p>
             {(zoneShape === 'hexagon' || zoneShape === 'circular') && selectedZoneCells.length > 0 && (
               <p className="text-amber-200 text-xs mt-1">Size: {zoneRadius}</p>
@@ -1419,6 +1773,8 @@ export default function Nodex() {
           <ul className="text-xs space-y-1 text-slate-300">
             <li><kbd className="px-1 bg-slate-600 rounded">Ctrl+C</kbd> Copy node</li>
             <li><kbd className="px-1 bg-slate-600 rounded">Ctrl+V</kbd> Paste node</li>
+            <li><kbd className="px-1 bg-slate-600 rounded">Ctrl+S</kbd> Save tab</li>
+            <li><kbd className="px-1 bg-slate-600 rounded">Ctrl+Shift+S</kbd> Save project</li>
             <li><kbd className="px-1 bg-slate-600 rounded">Shift+Click</kbd> Open nested diagram</li>
             <li><kbd className="px-1 bg-slate-600 rounded">Double-click</kbd> Start connecting</li>
             <li><kbd className="px-1 bg-slate-600 rounded">Delete</kbd> Remove selected</li>
@@ -1539,9 +1895,9 @@ export default function Nodex() {
       </div>
 
       {/* Canvas */}
-      <div 
+      <div
         ref={canvasRef}
-        className="flex-1 relative overflow-hidden"
+        className="flex-1 relative overflow-hidden select-none"
         onMouseDown={handleCanvasMouseDown}
         onMouseMove={handleCanvasMouseMove}
         onMouseUp={handleCanvasMouseUp}
@@ -1666,8 +2022,14 @@ export default function Nodex() {
               const toNode = nodes.find(n => n.id === conn.to);
               if (!fromNode || !toNode) return null;
 
-              const fromPos = axialToPixel(fromNode.q, fromNode.r);
-              const toPos = axialToPixel(toNode.q, toNode.r);
+              const fromCenter = axialToPixel(fromNode.q, fromNode.r);
+              const toCenter = axialToPixel(toNode.q, toNode.r);
+              // Trim to the hexagon boundaries so the arrowhead lands on the
+              // node's edge instead of disappearing under the hexagon
+              const trimmed = trimSegmentToHexEdges(fromCenter, toCenter, HEX_SIZE);
+              if (!trimmed) return null;
+              const fromPos = trimmed.from;
+              const toPos = trimmed.to;
               const midX = (fromPos.x + toPos.x) / 2;
               const midY = (fromPos.y + toPos.y) / 2;
               const isHovered = hoveredConnection === conn.id;
@@ -1675,14 +2037,15 @@ export default function Nodex() {
               const ConnIcon = conn.iconId ? AVAILABLE_ICONS.find(i => i.id === conn.iconId)?.icon : null;
               const lineTypeData = LINE_TYPES.find(lt => lt.id === (conn.lineType || 'solid'));
               const strokeDasharray = lineTypeData?.dasharray || null;
-              
+
               // Calculate line segment gap for icon/label
-              const hasLabelOrIcon = conn.label || ConnIcon;
-              const gapSize = hasLabelOrIcon ? (conn.label && ConnIcon ? 35 : conn.label ? 30 : 12) : 0;
-              const lineLength = Math.sqrt(Math.pow(toPos.x - fromPos.x, 2) + Math.pow(toPos.y - fromPos.y, 2));
-              const dirX = (toPos.x - fromPos.x) / lineLength;
-              const dirY = (toPos.y - fromPos.y) / lineLength;
-              
+              const lineLength = Math.hypot(toPos.x - fromPos.x, toPos.y - fromPos.y);
+              const hasLabelOrIcon = (conn.label || ConnIcon) && lineLength > 30;
+              const rawGap = hasLabelOrIcon ? (conn.label && ConnIcon ? 35 : conn.label ? 30 : 12) : 0;
+              const gapSize = Math.min(rawGap, lineLength / 2 - 4);
+              const dirX = trimmed.ux;
+              const dirY = trimmed.uy;
+
               // Points for split line
               const gap1X = midX - dirX * gapSize;
               const gap1Y = midY - dirY * gapSize;
@@ -1815,17 +2178,29 @@ export default function Nodex() {
             })}
 
             {/* Temporary connection line */}
-            {connectingFrom && (
-              <line
-                x1={axialToPixel(connectingFrom.q, connectingFrom.r).x}
-                y1={axialToPixel(connectingFrom.q, connectingFrom.r).y}
-                x2={mousePos.x}
-                y2={mousePos.y}
-                stroke="#f59e0b"
-                strokeWidth="2"
-                strokeDasharray="5,5"
-              />
-            )}
+            {connectingFrom && (() => {
+              const start = axialToPixel(connectingFrom.q, connectingFrom.r);
+              const dist = Math.hypot(mousePos.x - start.x, mousePos.y - start.y);
+              // Start from the hexagon edge once the cursor has left it
+              let x1 = start.x, y1 = start.y;
+              if (dist > HEX_SIZE) {
+                const angle = Math.atan2(mousePos.y - start.y, mousePos.x - start.x);
+                const trim = hexBoundaryDistance(HEX_SIZE, angle);
+                x1 = start.x + Math.cos(angle) * trim;
+                y1 = start.y + Math.sin(angle) * trim;
+              }
+              return (
+                <line
+                  x1={x1}
+                  y1={y1}
+                  x2={mousePos.x}
+                  y2={mousePos.y}
+                  stroke="#f59e0b"
+                  strokeWidth="2"
+                  strokeDasharray="5,5"
+                />
+              );
+            })()}
 
             {/* Nodes */}
             {nodes.map(node => {
