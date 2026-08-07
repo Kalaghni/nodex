@@ -161,12 +161,13 @@ const measureTextWidth = (text, font) => {
 // both to lay the content out and to cut matching gaps into lines
 const CONN_ICON_SIZE = 16;
 const CONN_ICON_GAP = 6;
-const getConnLabelBox = (conn, cx, cy) => {
+const getConnLabelBox = (conn, cx, cy, channelCount = 0) => {
   const hasIcon = !!conn.iconId;
   const hasLabel = !!conn.label;
   if (!hasIcon && !hasLabel) return null;
   const textW = hasLabel ? measureTextWidth(conn.label, '11px system-ui, -apple-system, sans-serif') : 0;
-  const contentW = (hasIcon ? CONN_ICON_SIZE : 0) + (hasIcon && hasLabel ? CONN_ICON_GAP : 0) + textW;
+  const dotsW = channelCount > 0 ? channelCount * 8 + 4 : 0;
+  const contentW = (hasIcon ? CONN_ICON_SIZE : 0) + (hasIcon && hasLabel ? CONN_ICON_GAP : 0) + textW + dotsW;
   return {
     cx,
     cy,
@@ -480,8 +481,40 @@ const LINE_TYPES = [
 const createEmptyDiagram = () => ({
   nodes: [],
   connections: [],
-  zones: []
+  zones: [],
+  channels: []
 });
+
+// Channels: diagram-level flows (name + color). Connections subscribe via
+// channelIds and render one strand per subscribed channel, so a flow can
+// split and converge across the graph while keeping its color identity.
+const CHANNEL_SPACING = 5;
+
+// Offset a 2- or 3-point polyline perpendicular to its direction. The
+// 3-point case is the angled route's 90° elbow — summing both segment
+// normals at the corner is the exact miter for right angles.
+const offsetPolyline = (pts, offset) => {
+  const perp = (a, b) => {
+    const dx = b.x - a.x;
+    const dy = b.y - a.y;
+    const len = Math.hypot(dx, dy) || 1;
+    return { x: -dy / len, y: dx / len };
+  };
+  if (pts.length === 2) {
+    const n = perp(pts[0], pts[1]);
+    return [
+      { x: pts[0].x + n.x * offset, y: pts[0].y + n.y * offset },
+      { x: pts[1].x + n.x * offset, y: pts[1].y + n.y * offset }
+    ];
+  }
+  const n0 = perp(pts[0], pts[1]);
+  const n1 = perp(pts[1], pts[2]);
+  return [
+    { x: pts[0].x + n0.x * offset, y: pts[0].y + n0.y * offset },
+    { x: pts[1].x + (n0.x + n1.x) * offset, y: pts[1].y + (n0.y + n1.y) * offset },
+    { x: pts[2].x + n1.x * offset, y: pts[2].y + n1.y * offset }
+  ];
+};
 
 // Create a new tab
 const createTab = (name = 'Untitled', diagrams = null, fileHandle = null) => ({
@@ -611,6 +644,7 @@ export default function Nodex() {
   const nodes = currentDiagram.nodes;
   const connections = currentDiagram.connections;
   const zones = currentDiagram.zones;
+  const channels = currentDiagram.channels || [];
 
   // Clipboard state for copy-paste
   const [clipboard, setClipboard] = useState(null);
@@ -1512,6 +1546,49 @@ export default function Nodex() {
   const setNodes = (newNodes) => setDiagramField('nodes', newNodes);
   const setConnections = (newConnections) => setDiagramField('connections', newConnections);
   const setZones = (newZones) => setDiagramField('zones', newZones);
+  const setChannels = (newChannels) => setDiagramField('channels', newChannels);
+
+  // Channel CRUD (sidebar inline form: { id: null | existing, name, color })
+  const [channelForm, setChannelForm] = useState(null);
+
+  const saveChannelForm = () => {
+    if (!channelForm || !channelForm.name.trim()) return;
+    if (channelForm.id != null) {
+      setChannels(prev => (prev || []).map(ch =>
+        ch.id === channelForm.id ? { ...ch, name: channelForm.name, color: channelForm.color } : ch
+      ));
+    } else {
+      setChannels(prev => [...(prev || []), { id: genId(), name: channelForm.name, color: channelForm.color }]);
+    }
+    setChannelForm(null);
+  };
+
+  const deleteChannel = (channelId) => {
+    setChannels(prev => (prev || []).filter(ch => ch.id !== channelId));
+    setConnections(prev => prev.map(c =>
+      c.channelIds ? { ...c, channelIds: c.channelIds.filter(i => i !== channelId) } : c
+    ));
+    setChannelForm(null);
+  };
+
+  // Bulk channel toggle: if every selected connection carries the channel,
+  // remove it from all; otherwise add it to all
+  const toggleBulkChannel = (channelId) => {
+    const sel = new Set(selectedConnectionIdsRef.current);
+    if (sel.size === 0) return;
+    setConnections(prev => {
+      const selected = prev.filter(c => sel.has(c.id));
+      const allHave = selected.every(c => (c.channelIds || []).includes(channelId));
+      return prev.map(c => {
+        if (!sel.has(c.id)) return c;
+        const ids = c.channelIds || [];
+        return {
+          ...c,
+          channelIds: allHave ? ids.filter(i => i !== channelId) : [...new Set([...ids, channelId])]
+        };
+      });
+    });
+  };
 
   // Navigation. No diagram entry is created just for looking — reads fall
   // back to an empty diagram, and the entry is created on first write.
@@ -2442,7 +2519,20 @@ export default function Nodex() {
       acc += segLens[i];
     }
 
-    connGeoms[conn.id] = { pts, mid, box: getConnLabelBox(conn, mid.x, mid.y) };
+    // Channels this connection subscribes to, in diagram order so strand
+    // colors keep consistent sides across splits/merges
+    const connChannels = (conn.channelIds || [])
+      .length > 0
+      ? channels.filter(ch => conn.channelIds.includes(ch.id))
+      : [];
+
+    const box = getConnLabelBox(conn, mid.x, mid.y, connChannels.length);
+    if (box && connChannels.length > 1) {
+      // Wider bundle needs a taller cut through crossing lines
+      box.halfH += ((connChannels.length - 1) / 2) * CHANNEL_SPACING;
+    }
+
+    connGeoms[conn.id] = { pts, mid, box, channels: connChannels };
   });
 
   return (
@@ -2983,6 +3073,23 @@ export default function Nodex() {
                   ))}
                 </select>
               </div>
+              {channels.length > 0 && (
+                <div>
+                  <p className="text-xs text-slate-400 mb-1">Channels (toggle on all)</p>
+                  <div className="flex flex-wrap gap-1">
+                    {channels.map(ch => (
+                      <button
+                        key={ch.id}
+                        onClick={() => toggleBulkChannel(ch.id)}
+                        className="flex items-center gap-1 px-2 py-1 rounded text-xs bg-slate-600 hover:bg-slate-500 transition-colors"
+                      >
+                        <span className="w-2 h-2 rounded-full" style={{ backgroundColor: ch.color }} />
+                        {ch.name}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
               <button
                 onClick={deleteSelectedConnections}
                 className="w-full px-3 py-1.5 bg-red-500 hover:bg-red-600 rounded text-sm transition-colors"
@@ -3050,6 +3157,83 @@ export default function Nodex() {
             </div>
           </div>
         )}
+
+        {/* Channels */}
+        <div className="mb-4">
+          <div className="flex items-center justify-between mb-2">
+            <h3 className="text-sm font-semibold text-slate-400">Channels</h3>
+            <button
+              onClick={() => setChannelForm({ id: null, name: '', color: COLOR_PALETTE[0] })}
+              className="p-1 rounded hover:bg-slate-700 text-slate-400 hover:text-white transition-colors"
+              title="Add Channel"
+            >
+              <Plus size={14} />
+            </button>
+          </div>
+          {channels.length === 0 && !channelForm && (
+            <p className="text-xs text-slate-500">
+              Channels are colored flows that run through connections — and can split and converge across them. Add one, then toggle it on connections.
+            </p>
+          )}
+          <div className="space-y-1">
+            {channels.map(ch => (
+              <div key={ch.id} className="flex items-center gap-2 p-2 rounded hover:bg-slate-700 group text-sm">
+                <div className="w-3 h-3 rounded-full shrink-0" style={{ backgroundColor: ch.color }} />
+                <span className="flex-1 truncate">{ch.name}</span>
+                <button
+                  onClick={() => setChannelForm({ id: ch.id, name: ch.name, color: ch.color })}
+                  className="opacity-0 group-hover:opacity-100 text-blue-400 hover:text-blue-300 transition-opacity"
+                >
+                  <Edit2 size={13} />
+                </button>
+                <button
+                  onClick={() => deleteChannel(ch.id)}
+                  className="opacity-0 group-hover:opacity-100 text-red-400 hover:text-red-300 transition-opacity"
+                >
+                  <Trash2 size={13} />
+                </button>
+              </div>
+            ))}
+          </div>
+          {channelForm && (
+            <div className="mt-2 p-3 bg-slate-700 rounded-lg space-y-2">
+              <input
+                type="text"
+                value={channelForm.name}
+                onChange={(e) => setChannelForm({ ...channelForm, name: e.target.value })}
+                onKeyDown={(e) => { if (e.key === 'Enter') saveChannelForm(); }}
+                placeholder="e.g., Public traffic"
+                autoFocus
+                className="w-full px-2 py-1.5 bg-slate-800 rounded border border-slate-600 focus:border-blue-500 focus:outline-none text-sm"
+              />
+              <div className="flex flex-wrap gap-1.5">
+                {COLOR_PALETTE.map(color => (
+                  <button
+                    key={color}
+                    onClick={() => setChannelForm({ ...channelForm, color })}
+                    className={`w-5 h-5 rounded ${channelForm.color === color ? 'ring-2 ring-white' : ''}`}
+                    style={{ backgroundColor: color }}
+                  />
+                ))}
+              </div>
+              <div className="flex gap-2">
+                <button
+                  onClick={saveChannelForm}
+                  disabled={!channelForm.name.trim()}
+                  className="flex-1 px-2 py-1 bg-blue-600 hover:bg-blue-700 disabled:bg-slate-600 disabled:cursor-not-allowed rounded text-xs transition-colors"
+                >
+                  {channelForm.id != null ? 'Update' : 'Add'} Channel
+                </button>
+                <button
+                  onClick={() => setChannelForm(null)}
+                  className="px-2 py-1 bg-slate-600 hover:bg-slate-500 rounded text-xs transition-colors"
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
 
         {(nodes.length > 0 || zones.length > 0) && (
           <button
@@ -3240,6 +3424,9 @@ export default function Nodex() {
                   .filter(([s, e]) => (e - s) * segLen > 2)
                   .forEach(([s, e]) => {
                     pieces.push({
+                      segIdx: i,
+                      s,
+                      e,
                       p1: { x: A.x + (B.x - A.x) * s, y: A.y + (B.y - A.y) * s },
                       p2: { x: A.x + (B.x - A.x) * e, y: A.y + (B.y - A.y) * e },
                       atStart: i === 0 && s < 0.01,
@@ -3266,18 +3453,31 @@ export default function Nodex() {
                     onClick={(e) => {
                       e.stopPropagation();
                       if (didMarqueeRef.current) return;
-                      // Ctrl+Click toggles the connection in the bulk selection
+                      // Ctrl+Click toggles the connection in the bulk selection.
+                      // If the single-edit drawer is open, its connection joins
+                      // the selection and the drawer closes — otherwise edits
+                      // would silently keep applying to only the drawer's line.
                       if (e.ctrlKey || e.metaKey) {
-                        setSelectedConnectionIds(prev =>
-                          prev.includes(conn.id) ? prev.filter(i => i !== conn.id) : [...prev, conn.id]
-                        );
+                        const editingId = showConnectionEditor ? editingConnectionId : null;
+                        setSelectedConnectionIds(prev => {
+                          let base = prev;
+                          if (editingId != null && !base.includes(editingId)) base = [...base, editingId];
+                          if (conn.id !== editingId) {
+                            base = base.includes(conn.id) ? base.filter(i => i !== conn.id) : [...base, conn.id];
+                          }
+                          return base;
+                        });
+                        if (editingId != null) {
+                          setShowConnectionEditor(false);
+                          setEditingConnectionId(null);
+                        }
                         return;
                       }
                       setEditingConnection(conn);
                       setShowConnectionEditor(true);
                     }}
                   />
-                  {/* Selection glow under the line */}
+                  {/* Selection glow under the line (covers the whole bundle) */}
                   {isConnSelected && pieces.map((piece, i) => (
                     <line
                       key={`sel-${i}`}
@@ -3286,29 +3486,43 @@ export default function Nodex() {
                       x2={piece.p2.x}
                       y2={piece.p2.y}
                       stroke="#fbbf24"
-                      strokeWidth="7"
+                      strokeWidth={7 + Math.max(0, geom.channels.length - 1) * CHANNEL_SPACING}
                       opacity="0.35"
                       strokeLinecap="round"
                       pointerEvents="none"
                     />
                   ))}
                   {/* Visible line pieces left after label footprints were
-                      subtracted; arrowheads on the pieces touching the nodes */}
-                  {pieces.map((piece, i) => (
-                    <line
-                      key={i}
-                      x1={piece.p1.x}
-                      y1={piece.p1.y}
-                      x2={piece.p2.x}
-                      y2={piece.p2.y}
-                      stroke={isHovered && !conn.color ? '#94a3b8' : lineColor}
-                      strokeWidth={isHovered ? 3 : 2}
-                      strokeDasharray={strokeDasharray}
-                      markerStart={piece.atStart && endStyles.start !== 'none' ? `url(#arrow-${endStyles.start}-${markerColorKey})` : undefined}
-                      markerEnd={piece.atEnd && endStyles.end !== 'none' ? `url(#arrow-${endStyles.end}-${markerColorKey})` : undefined}
-                      pointerEvents="none"
-                    />
-                  ))}
+                      subtracted; arrowheads on the pieces touching the nodes.
+                      With channels, one parallel strand per channel; without,
+                      a single strand at offset 0 in the connection color. */}
+                  {(geom.channels.length > 0 ? geom.channels : [null]).map((ch, si, strandArr) => {
+                    const offset = (si - (strandArr.length - 1) / 2) * CHANNEL_SPACING;
+                    const sPts = offset === 0 ? pts : offsetPolyline(pts, offset);
+                    const strandColor = ch ? ch.color : (isHovered && !conn.color ? '#94a3b8' : lineColor);
+                    const strandKey = (ch ? ch.color : lineColor).replace('#', '');
+                    return pieces.map((piece, i) => {
+                      const A = sPts[piece.segIdx];
+                      const B = sPts[piece.segIdx + 1];
+                      const p1 = { x: A.x + (B.x - A.x) * piece.s, y: A.y + (B.y - A.y) * piece.s };
+                      const p2 = { x: A.x + (B.x - A.x) * piece.e, y: A.y + (B.y - A.y) * piece.e };
+                      return (
+                        <line
+                          key={`${si}-${i}`}
+                          x1={p1.x}
+                          y1={p1.y}
+                          x2={p2.x}
+                          y2={p2.y}
+                          stroke={strandColor}
+                          strokeWidth={isHovered ? 3 : 2}
+                          strokeDasharray={strokeDasharray}
+                          markerStart={piece.atStart && endStyles.start !== 'none' ? `url(#arrow-${endStyles.start}-${strandKey})` : undefined}
+                          markerEnd={piece.atEnd && endStyles.end !== 'none' ? `url(#arrow-${endStyles.end}-${strandKey})` : undefined}
+                          pointerEvents="none"
+                        />
+                      );
+                    });
+                  })}
                   {/* Label and icon - hidden when hovered */}
                   {geom.box && !isHovered && (
                     <g transform={`translate(${mid.x}, ${mid.y}) rotate(${labelRotation})`}>
@@ -3329,7 +3543,7 @@ export default function Nodex() {
                         <text
                           x={ConnIcon
                             ? -geom.box.contentW / 2 + CONN_ICON_SIZE + CONN_ICON_GAP + geom.box.textW / 2
-                            : 0}
+                            : -geom.box.contentW / 2 + geom.box.textW / 2}
                           y="0"
                           fill={conn.color || '#e2e8f0'}
                           fontSize="11"
@@ -3340,6 +3554,17 @@ export default function Nodex() {
                           {conn.label}
                         </text>
                       )}
+                      {/* Channel dots after the label */}
+                      {geom.channels.map((ch, i) => (
+                        <circle
+                          key={ch.id}
+                          cx={geom.box.contentW / 2 - (geom.channels.length - i) * 8 + 4}
+                          cy="0"
+                          r="3"
+                          fill={ch.color}
+                          pointerEvents="none"
+                        />
+                      ))}
                     </g>
                   )}
                   {/* Delete button - centered on line, only visible on hover */}
@@ -3564,7 +3789,10 @@ export default function Nodex() {
               </marker>
               {/* Connection pointer styles, one set per color in use;
                   auto-start-reverse flips them correctly as markerStart */}
-              {[...new Set(connections.map(c => c.color || '#64748b'))].map(color => {
+              {[...new Set([
+                ...connections.map(c => c.color || '#64748b'),
+                ...channels.map(ch => ch.color)
+              ])].map(color => {
                 const key = color.replace('#', '');
                 return (
                   <React.Fragment key={color}>
@@ -3880,6 +4108,39 @@ export default function Nodex() {
                 ))}
               </div>
             </div>
+
+            {channels.length > 0 && (
+              <div>
+                <label className="block text-sm font-medium mb-2">Channels</label>
+                <div className="flex flex-wrap gap-2">
+                  {channels.map(ch => {
+                    const active = (editingConnection.channelIds || []).includes(ch.id);
+                    return (
+                      <button
+                        key={ch.id}
+                        onClick={() => {
+                          const ids = editingConnection.channelIds || [];
+                          updateEditingConnection({
+                            channelIds: active ? ids.filter(i => i !== ch.id) : [...ids, ch.id]
+                          });
+                        }}
+                        className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded text-xs transition-all border ${
+                          active
+                            ? 'bg-slate-600 border-white/60'
+                            : 'bg-slate-700 border-transparent hover:bg-slate-600'
+                        }`}
+                      >
+                        <span className="w-2.5 h-2.5 rounded-full" style={{ backgroundColor: ch.color }} />
+                        {ch.name}
+                      </button>
+                    );
+                  })}
+                </div>
+                <p className="text-xs text-slate-400 mt-1">
+                  Subscribed channels render as side-by-side strands; the same channel keeps its color across connections.
+                </p>
+              </div>
+            )}
 
             <div>
               <label className="block text-sm font-medium mb-2">Route</label>
