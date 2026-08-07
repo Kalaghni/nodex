@@ -4,5 +4,5 @@ dist
 .idea
 .env*
 # Local scratch
-img.png
+img*.png
 *.local.png
