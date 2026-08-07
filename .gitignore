@@ -3,3 +3,6 @@ dist
 
 .idea
 .env*
+# Local scratch
+img.png
+*.local.png
