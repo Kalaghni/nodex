@@ -10,7 +10,7 @@ COPY package*.json ./
 RUN npm install
 
 # Copy source files
-COPY ../../Downloads/nodex .
+COPY . .
 
 # Build the application
 RUN npm run build
