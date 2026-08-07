@@ -657,7 +657,13 @@ export default function Nodex() {
   // Compat shim: select a single node (or clear) — used throughout
   const setSelectedNode = (node) => setSelectedNodeIds(node ? [node.id] : []);
 
+  // Connection multi-selection (Ctrl+Click a line, or marquee over midpoints)
+  const [selectedConnectionIds, setSelectedConnectionIds] = useState([]);
+  const selectedConnections = connections.filter(c => selectedConnectionIds.includes(c.id));
+
   // Refs for selected items to avoid stale closures
+  const selectedConnectionIdsRef = useRef([]);
+  selectedConnectionIdsRef.current = selectedConnectionIds;
   const selectedNodeIdsRef = useRef([]);
   selectedNodeIdsRef.current = selectedNodeIds;
   const selectedNodeRef = useRef(null);
@@ -689,6 +695,36 @@ export default function Nodex() {
   const updateEditingConnection = (patch) => {
     if (editingConnectionId == null) return;
     setConnections(prev => prev.map(c => c.id === editingConnectionId ? { ...c, ...patch } : c));
+  };
+
+  // Bulk connection editing — apply a patch to every selected connection
+  const updateSelectedConnections = (patch) => {
+    const sel = new Set(selectedConnectionIdsRef.current);
+    if (sel.size === 0) return;
+    setConnections(prev => prev.map(c => sel.has(c.id) ? { ...c, ...patch } : c));
+  };
+
+  const deleteSelectedConnections = () => {
+    const sel = new Set(selectedConnectionIdsRef.current);
+    if (sel.size === 0) return;
+    setConnections(prev => prev.filter(c => !sel.has(c.id)));
+    setSelectedConnectionIds([]);
+  };
+
+  // Bulk pointer change: materialize the other end's current style per
+  // connection so the legacy arrowHead/arrowStyle fallback can't shift it
+  const setBulkPointer = (which, value) => {
+    const sel = new Set(selectedConnectionIdsRef.current);
+    if (sel.size === 0) return;
+    setConnections(prev => prev.map(c => {
+      if (!sel.has(c.id)) return c;
+      const cur = getConnEndStyles(c);
+      return {
+        ...c,
+        startStyle: which === 'start' ? value : cur.start,
+        endStyle: which === 'end' ? value : cur.end
+      };
+    }));
   };
   const [viewOffset, setViewOffset] = useState({ x: 400, y: 300 });
   const [isPanning, setIsPanning] = useState(false);
@@ -788,6 +824,12 @@ export default function Nodex() {
     window.addEventListener('resize', updateSize);
     return () => window.removeEventListener('resize', updateSize);
   }, []);
+
+  // Connection selection is per-diagram — clear it on tab/level changes
+  const currentPathKey = currentPath.join('/');
+  useEffect(() => {
+    setSelectedConnectionIds([]);
+  }, [activeTabId, currentPathKey]);
 
   // Autosave: after any change settles for a second, write every linked
   // on-device file (project file and/or per-tab files). No-op until a file
@@ -1716,6 +1758,7 @@ export default function Nodex() {
       const additive = e.ctrlKey || e.metaKey;
       if (!additive) {
         setSelectedNodeIds([]);
+        setSelectedConnectionIds([]);
         setSelectedZone(null);
         setConnectingFrom(null);
       }
@@ -1723,6 +1766,7 @@ export default function Nodex() {
       e.preventDefault();
     } else {
       setSelectedNodeIds([]);
+      setSelectedConnectionIds([]);
       setSelectedZone(null);
       setConnectingFrom(null);
     }
@@ -1912,6 +1956,14 @@ export default function Nodex() {
           })
           .map(n => n.id);
         setSelectedNodeIds(prev => marquee.additive ? [...new Set([...prev, ...ids])] : ids);
+        // Connections whose midpoint falls inside the box get selected too
+        const connIds = connections
+          .filter(c => {
+            const g = connGeoms[c.id];
+            return g && g.mid.x >= x1 && g.mid.x <= x2 && g.mid.y >= y1 && g.mid.y <= y2;
+          })
+          .map(c => c.id);
+        setSelectedConnectionIds(prev => marquee.additive ? [...new Set([...prev, ...connIds])] : connIds);
       }
       setMarquee(null);
     }
@@ -2249,8 +2301,9 @@ export default function Nodex() {
         // Don't prevent default if we're in an input field
         if (inField) return;
         e.preventDefault();
-        if (selectedNodeIdsRef.current.length > 0) {
-          deleteSelectedNodes();
+        if (selectedNodeIdsRef.current.length > 0 || selectedConnectionIdsRef.current.length > 0) {
+          if (selectedNodeIdsRef.current.length > 0) deleteSelectedNodes();
+          if (selectedConnectionIdsRef.current.length > 0) deleteSelectedConnections();
         } else if (selectedZoneRef.current) {
           deleteZone(selectedZoneRef.current.id);
         }
@@ -2258,6 +2311,7 @@ export default function Nodex() {
       if (e.key === 'Escape') {
         setConnectingFrom(null);
         setSelectedNodeIds([]);
+        setSelectedConnectionIds([]);
         setSelectedZone(null);
         setMarquee(null);
         setResizingZone(null);
@@ -2848,6 +2902,97 @@ export default function Nodex() {
           </div>
         )}
 
+        {selectedConnections.length > 0 && (
+          <div className="mb-4 p-4 bg-slate-700 rounded-lg">
+            <h3 className="text-sm font-semibold mb-2">
+              {selectedConnections.length} connection{selectedConnections.length > 1 ? 's' : ''} selected
+            </h3>
+            <p className="text-xs text-slate-300 mb-3">
+              Changes below apply to all of them. Ctrl+Click lines to add/remove.
+            </p>
+            <div className="space-y-3">
+              <div>
+                <p className="text-xs text-slate-400 mb-1">Color</p>
+                <div className="flex flex-wrap gap-1.5">
+                  <button
+                    onClick={() => updateSelectedConnections({ color: null })}
+                    className="w-6 h-6 rounded"
+                    style={{ backgroundColor: '#64748b' }}
+                    title="Default"
+                  />
+                  {COLOR_PALETTE.map(color => (
+                    <button
+                      key={color}
+                      onClick={() => updateSelectedConnections({ color })}
+                      className="w-6 h-6 rounded"
+                      style={{ backgroundColor: color }}
+                    />
+                  ))}
+                </div>
+              </div>
+              <div>
+                <p className="text-xs text-slate-400 mb-1">Line Style</p>
+                <div className="flex flex-wrap gap-1">
+                  {LINE_TYPES.map(lt => (
+                    <button
+                      key={lt.id}
+                      onClick={() => updateSelectedConnections({ lineType: lt.id })}
+                      className="px-2 py-1 rounded text-xs bg-slate-600 hover:bg-slate-500 transition-colors"
+                    >
+                      {lt.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+              <div>
+                <p className="text-xs text-slate-400 mb-1">Route</p>
+                <div className="flex gap-1">
+                  <button
+                    onClick={() => updateSelectedConnections({ routing: 'direct' })}
+                    className="flex-1 px-2 py-1 rounded text-xs bg-slate-600 hover:bg-slate-500 transition-colors"
+                  >
+                    Direct
+                  </button>
+                  <button
+                    onClick={() => updateSelectedConnections({ routing: 'angled' })}
+                    className="flex-1 px-2 py-1 rounded text-xs bg-slate-600 hover:bg-slate-500 transition-colors"
+                  >
+                    Angled
+                  </button>
+                </div>
+              </div>
+              <div className="flex gap-2">
+                <select
+                  onChange={(e) => setBulkPointer('start', e.target.value)}
+                  defaultValue=""
+                  className="flex-1 px-2 py-1 bg-slate-600 rounded text-xs"
+                >
+                  <option value="" disabled>Start pointer…</option>
+                  {['none', 'arrow', 'open', 'circle', 'diamond'].map(s => (
+                    <option key={s} value={s}>{s}</option>
+                  ))}
+                </select>
+                <select
+                  onChange={(e) => setBulkPointer('end', e.target.value)}
+                  defaultValue=""
+                  className="flex-1 px-2 py-1 bg-slate-600 rounded text-xs"
+                >
+                  <option value="" disabled>End pointer…</option>
+                  {['none', 'arrow', 'open', 'circle', 'diamond'].map(s => (
+                    <option key={s} value={s}>{s}</option>
+                  ))}
+                </select>
+              </div>
+              <button
+                onClick={deleteSelectedConnections}
+                className="w-full px-3 py-1.5 bg-red-500 hover:bg-red-600 rounded text-sm transition-colors"
+              >
+                Delete Connections
+              </button>
+            </div>
+          </div>
+        )}
+
         {selectedZone && (
           <div className="mb-4 p-4 bg-slate-700 rounded-lg">
             <div className="flex items-start justify-between mb-2">
@@ -3065,6 +3210,9 @@ export default function Nodex() {
               const lineTypeData = LINE_TYPES.find(lt => lt.id === (conn.lineType || 'solid'));
               const strokeDasharray = lineTypeData?.dasharray || null;
               const endStyles = getConnEndStyles(conn);
+              const lineColor = conn.color || '#64748b';
+              const markerColorKey = lineColor.replace('#', '');
+              const isConnSelected = selectedConnectionIds.includes(conn.id);
 
               // Visible pieces per polyline segment: [0,1] minus the exact
               // footprint of every label box the segment crosses — its own
@@ -3118,10 +3266,32 @@ export default function Nodex() {
                     onClick={(e) => {
                       e.stopPropagation();
                       if (didMarqueeRef.current) return;
+                      // Ctrl+Click toggles the connection in the bulk selection
+                      if (e.ctrlKey || e.metaKey) {
+                        setSelectedConnectionIds(prev =>
+                          prev.includes(conn.id) ? prev.filter(i => i !== conn.id) : [...prev, conn.id]
+                        );
+                        return;
+                      }
                       setEditingConnection(conn);
                       setShowConnectionEditor(true);
                     }}
                   />
+                  {/* Selection glow under the line */}
+                  {isConnSelected && pieces.map((piece, i) => (
+                    <line
+                      key={`sel-${i}`}
+                      x1={piece.p1.x}
+                      y1={piece.p1.y}
+                      x2={piece.p2.x}
+                      y2={piece.p2.y}
+                      stroke="#fbbf24"
+                      strokeWidth="7"
+                      opacity="0.35"
+                      strokeLinecap="round"
+                      pointerEvents="none"
+                    />
+                  ))}
                   {/* Visible line pieces left after label footprints were
                       subtracted; arrowheads on the pieces touching the nodes */}
                   {pieces.map((piece, i) => (
@@ -3131,11 +3301,11 @@ export default function Nodex() {
                       y1={piece.p1.y}
                       x2={piece.p2.x}
                       y2={piece.p2.y}
-                      stroke={isHovered ? '#94a3b8' : '#64748b'}
+                      stroke={isHovered && !conn.color ? '#94a3b8' : lineColor}
                       strokeWidth={isHovered ? 3 : 2}
                       strokeDasharray={strokeDasharray}
-                      markerStart={piece.atStart && endStyles.start !== 'none' ? `url(#arrow-${endStyles.start})` : undefined}
-                      markerEnd={piece.atEnd && endStyles.end !== 'none' ? `url(#arrow-${endStyles.end})` : undefined}
+                      markerStart={piece.atStart && endStyles.start !== 'none' ? `url(#arrow-${endStyles.start}-${markerColorKey})` : undefined}
+                      markerEnd={piece.atEnd && endStyles.end !== 'none' ? `url(#arrow-${endStyles.end}-${markerColorKey})` : undefined}
                       pointerEvents="none"
                     />
                   ))}
@@ -3151,7 +3321,7 @@ export default function Nodex() {
                           pointerEvents="none"
                         >
                           <div className="w-full h-full flex items-center justify-center">
-                            <ConnIcon size={14} color="#94a3b8" />
+                            <ConnIcon size={14} color={conn.color || '#94a3b8'} />
                           </div>
                         </foreignObject>
                       )}
@@ -3161,7 +3331,7 @@ export default function Nodex() {
                             ? -geom.box.contentW / 2 + CONN_ICON_SIZE + CONN_ICON_GAP + geom.box.textW / 2
                             : 0}
                           y="0"
-                          fill="#e2e8f0"
+                          fill={conn.color || '#e2e8f0'}
                           fontSize="11"
                           textAnchor="middle"
                           dominantBaseline="middle"
@@ -3392,20 +3562,27 @@ export default function Nodex() {
               <marker id="arrowhead" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
                 <polygon points="0 0, 10 3, 0 6" fill="#64748b" />
               </marker>
-              {/* Connection pointer styles; auto-start-reverse flips them
-                  correctly when used as markerStart */}
-              <marker id="arrow-arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto-start-reverse">
-                <polygon points="0 0, 10 3, 0 6" fill="#64748b" />
-              </marker>
-              <marker id="arrow-open" markerWidth="12" markerHeight="10" refX="9" refY="4" orient="auto-start-reverse">
-                <path d="M1 1 L9 4 L1 7" fill="none" stroke="#64748b" strokeWidth="1.5" />
-              </marker>
-              <marker id="arrow-circle" markerWidth="8" markerHeight="8" refX="4" refY="4" orient="auto-start-reverse">
-                <circle cx="4" cy="4" r="3" fill="#64748b" />
-              </marker>
-              <marker id="arrow-diamond" markerWidth="12" markerHeight="8" refX="10" refY="4" orient="auto-start-reverse">
-                <path d="M2 4 L6 1 L10 4 L6 7 Z" fill="#64748b" />
-              </marker>
+              {/* Connection pointer styles, one set per color in use;
+                  auto-start-reverse flips them correctly as markerStart */}
+              {[...new Set(connections.map(c => c.color || '#64748b'))].map(color => {
+                const key = color.replace('#', '');
+                return (
+                  <React.Fragment key={color}>
+                    <marker id={`arrow-arrow-${key}`} markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto-start-reverse">
+                      <polygon points="0 0, 10 3, 0 6" fill={color} />
+                    </marker>
+                    <marker id={`arrow-open-${key}`} markerWidth="12" markerHeight="10" refX="9" refY="4" orient="auto-start-reverse">
+                      <path d="M1 1 L9 4 L1 7" fill="none" stroke={color} strokeWidth="1.5" />
+                    </marker>
+                    <marker id={`arrow-circle-${key}`} markerWidth="8" markerHeight="8" refX="4" refY="4" orient="auto-start-reverse">
+                      <circle cx="4" cy="4" r="3" fill={color} />
+                    </marker>
+                    <marker id={`arrow-diamond-${key}`} markerWidth="12" markerHeight="8" refX="10" refY="4" orient="auto-start-reverse">
+                      <path d="M2 4 L6 1 L10 4 L6 7 Z" fill={color} />
+                    </marker>
+                  </React.Fragment>
+                );
+              })}
             </defs>
           </g>
         </svg>
@@ -3678,6 +3855,30 @@ export default function Nodex() {
                 placeholder="e.g., HTTP, API, Data Flow"
                 className="w-full px-3 py-2 bg-slate-700 rounded border border-slate-600 focus:border-blue-500 focus:outline-none"
               />
+            </div>
+
+            <div>
+              <label className="block text-sm font-medium mb-2">Color</label>
+              <div className="grid grid-cols-8 gap-2">
+                <button
+                  onClick={() => updateEditingConnection({ color: null })}
+                  className={`w-8 h-8 rounded transition-all ${
+                    !editingConnection.color ? 'ring-2 ring-white ring-offset-2 ring-offset-slate-800' : ''
+                  }`}
+                  style={{ backgroundColor: '#64748b' }}
+                  title="Default"
+                />
+                {COLOR_PALETTE.map(color => (
+                  <button
+                    key={color}
+                    onClick={() => updateEditingConnection({ color })}
+                    className={`w-8 h-8 rounded transition-all ${
+                      editingConnection.color === color ? 'ring-2 ring-white ring-offset-2 ring-offset-slate-800' : ''
+                    }`}
+                    style={{ backgroundColor: color }}
+                  />
+                ))}
+              </div>
             </div>
 
             <div>
