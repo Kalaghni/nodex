@@ -67,6 +67,7 @@ Plain JSON, two flavors, auto-detected on open:
 | Ctrl+S | Save tab |
 | Ctrl+Shift+S | Save project (all tabs) |
 | Double-click node/zone | Start a connection |
+| Right-click node | Edit the node |
 | Shift+Click node | Open nested diagram |
 | Delete / Backspace | Remove selection |
 | Scroll | Zoom |

@@ -2919,6 +2919,7 @@ export default function Nodex() {
             <li><kbd className="px-1 bg-slate-600 rounded">Ctrl+Shift+S</kbd> Save project</li>
             <li><kbd className="px-1 bg-slate-600 rounded">Shift+Click</kbd> Open nested diagram</li>
             <li><kbd className="px-1 bg-slate-600 rounded">Double-click</kbd> Start connecting</li>
+            <li><kbd className="px-1 bg-slate-600 rounded">Right-click</kbd> Edit node</li>
             <li><kbd className="px-1 bg-slate-600 rounded">Delete</kbd> Remove selected</li>
             <li><kbd className="px-1 bg-slate-600 rounded">Scroll</kbd> Zoom in/out</li>
             <li><kbd className="px-1 bg-slate-600 rounded">Shift+Drag</kbd> Pan canvas</li>
@@ -3673,6 +3674,12 @@ export default function Nodex() {
                   onMouseDown={(e) => handleNodeMouseDown(e, node)}
                   onClick={(e) => handleNodeClick(e, node)}
                   onDoubleClick={(e) => handleNodeDoubleClick(e, node)}
+                  onContextMenu={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    setSelectedNodeIds([node.id]);
+                    openNodeEditor(node);
+                  }}
                   onMouseEnter={() => setHoveredNode(node.id)}
                   onMouseLeave={() => setHoveredNode(null)}
                   style={{ cursor: 'move' }}
