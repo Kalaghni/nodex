@@ -899,6 +899,7 @@ export default function Nodex() {
       const fresh = createTab('Untitled');
       setTabs([fresh]);
       setActiveTabId(fresh.id);
+      delete historyRef.current[tabId];
       return;
     }
     const newTabs = tabs.filter(t => t.id !== tabId);
@@ -906,6 +907,8 @@ export default function Nodex() {
     if (activeTabId === tabId) {
       setActiveTabId(newTabs[0].id);
     }
+    // Drop the closed tab's undo history
+    delete historyRef.current[tabId];
   };
 
   const renameTab = (tabId, newName) => {
@@ -1320,10 +1323,12 @@ export default function Nodex() {
       return;
     }
 
-    const scale = 2;
+    // 2× normally, reduced for huge diagrams — past the browser's canvas
+    // limit toDataURL silently produces a blank image
+    const scale = Math.max(0.5, Math.min(2, 8192 / Math.max(prepared.width, prepared.height)));
     const canvas = document.createElement('canvas');
-    canvas.width = prepared.width * scale;
-    canvas.height = prepared.height * scale;
+    canvas.width = Math.round(prepared.width * scale);
+    canvas.height = Math.round(prepared.height * scale);
     const ctx = canvas.getContext('2d');
 
     const img = new Image();
@@ -1434,9 +1439,9 @@ export default function Nodex() {
   // Ctrl+D: copy + paste in one step, without touching the clipboard
   const duplicateSelection = () => pasteClip(buildClipFromSelection());
 
-  // Zoom controls
-  const zoomIn = () => setZoom(prev => Math.min(prev * 1.2, 3));
-  const zoomOut = () => setZoom(prev => Math.max(prev / 1.2, 0.3));
+  // Zoom controls — anchored to the canvas center
+  const zoomIn = () => zoomAt(1.2, canvasSize.width / 2, canvasSize.height / 2);
+  const zoomOut = () => zoomAt(1 / 1.2, canvasSize.width / 2, canvasSize.height / 2);
   const resetView = () => {
     setZoom(1);
     setViewOffset({ x: canvasSize.width / 2, y: canvasSize.height / 2 });
@@ -1466,19 +1471,11 @@ export default function Nodex() {
   const setConnections = (newConnections) => setDiagramField('connections', newConnections);
   const setZones = (newZones) => setDiagramField('zones', newZones);
 
-  // Navigation
+  // Navigation. No diagram entry is created just for looking — reads fall
+  // back to an empty diagram, and the entry is created on first write.
+  // (Pre-creating polluted saved files with empty entries.)
   const navigateToNode = (node) => {
     const newPath = [...currentPath, node.id.toString()];
-    const pathKey = newPath.join('/');
-    
-    // Create diagram if it doesn't exist
-    if (!diagrams[pathKey]) {
-      setDiagrams(prev => ({
-        ...prev,
-        [pathKey]: createEmptyDiagram()
-      }));
-    }
-    
     setCurrentPath(newPath);
     setSelectedNode(null);
     setSelectedZone(null);
@@ -1549,7 +1546,18 @@ export default function Nodex() {
           : n
       ));
     } else {
-      const coords = newNodeData.presetCoords || { q: 0, r: 0 };
+      // Without preset coords (toolbar/sidebar button), place at the first
+      // free cell near the center of the current view instead of stacking
+      // everything on (0,0)
+      let coords = newNodeData.presetCoords;
+      if (!coords) {
+        const center = pixelToAxial(
+          (canvasSize.width / 2 - viewOffset.x) / zoom,
+          (canvasSize.height / 2 - viewOffset.y) / zoom
+        );
+        coords = buildHexRingCells(center.q, center.r, 10)
+          .find(c => !nodes.some(n => n.q === c.q && n.r === c.r)) || center;
+      }
       const newNode = {
         id: genId(),
         label: newNodeData.label,
@@ -1869,6 +1877,10 @@ export default function Nodex() {
     setHoveredConnection(null);
   };
 
+  // Registered on window (re-attached each render so closures stay fresh):
+  // releasing the mouse over the sidebar/toolbar or outside the window must
+  // still end drags, marquees, and zone resizes — a canvas-only listener
+  // left them stuck to the cursor
   const handleCanvasMouseUp = () => {
     setIsPanning(false);
     setDraggingNode(null);
@@ -1910,10 +1922,35 @@ export default function Nodex() {
     setZoneSelectionStart(null);
   };
 
+  useEffect(() => {
+    window.addEventListener('mouseup', handleCanvasMouseUp);
+    return () => window.removeEventListener('mouseup', handleCanvasMouseUp);
+  });
+
+  // Zoom keeping a screen point fixed (focal zoom). Refs are updated
+  // immediately so rapid wheel bursts between renders don't drift.
+  const zoomStateRef = useRef({ zoom: 1, offset: { x: 400, y: 300 } });
+  zoomStateRef.current = { zoom, offset: viewOffset };
+
+  const zoomAt = (factor, screenX, screenY) => {
+    const { zoom: prev, offset } = zoomStateRef.current;
+    const next = Math.min(Math.max(prev * factor, 0.3), 3);
+    if (next === prev) return;
+    const ratio = next / prev;
+    const newOffset = {
+      x: screenX - (screenX - offset.x) * ratio,
+      y: screenY - (screenY - offset.y) * ratio
+    };
+    zoomStateRef.current = { zoom: next, offset: newOffset };
+    setZoom(next);
+    setViewOffset(newOffset);
+  };
+
   const handleWheel = (e) => {
     e.preventDefault();
-    const delta = e.deltaY > 0 ? 0.9 : 1.1;
-    setZoom(prev => Math.min(Math.max(prev * delta, 0.3), 3));
+    const rect = canvasRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    zoomAt(e.deltaY > 0 ? 0.9 : 1.1, e.clientX - rect.left, e.clientY - rect.top);
   };
 
   const handleNodeMouseDown = (e, node) => {
@@ -2107,8 +2144,13 @@ export default function Nodex() {
           connections: currentDiag.connections.filter(c => !idSet.has(c.from) && !idSet.has(c.to))
         }
       };
+      // Remove the whole nested subtree of each deleted node — grandchildren
+      // (root/X/Y) would otherwise linger as orphans in saved files
       ids.forEach(id => {
-        delete newDiagrams[[...currentPathRef.current, id.toString()].join('/')];
+        const prefix = [...currentPathRef.current, id.toString()].join('/');
+        Object.keys(newDiagrams).forEach(k => {
+          if (k === prefix || k.startsWith(prefix + '/')) delete newDiagrams[k];
+        });
       });
       return newDiagrams;
     });
@@ -2126,7 +2168,16 @@ export default function Nodex() {
   };
 
   const clearAll = () => {
-    updateCurrentDiagram(createEmptyDiagram());
+    const pathKey = currentPathRef.current.join('/');
+    setDiagrams(prev => {
+      // Also drop every nested diagram under this one
+      const next = {};
+      Object.keys(prev).forEach(k => {
+        if (k !== pathKey && !k.startsWith(pathKey + '/')) next[k] = prev[k];
+      });
+      next[pathKey] = createEmptyDiagram();
+      return next;
+    });
     setSelectedNode(null);
     setSelectedZone(null);
     setConnectingFrom(null);
@@ -2871,7 +2922,6 @@ export default function Nodex() {
         className="flex-1 relative overflow-hidden select-none"
         onMouseDown={handleCanvasMouseDown}
         onMouseMove={handleCanvasMouseMove}
-        onMouseUp={handleCanvasMouseUp}
         onMouseLeave={handleCanvasMouseLeave}
         onWheel={handleWheel}
         onContextMenu={(e) => e.preventDefault()}
