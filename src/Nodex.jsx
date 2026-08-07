@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { Database, Server, Cloud, Zap, Box, Globe, Lock, HardDrive, Cpu, Network, Shield, Wifi, Code, Container, FileText, Users, Settings, Activity, Mail, Phone, CheckCircle, XCircle, AlertCircle, Plus, Edit2, X, ChevronRight, Hexagon, Trash2, Save, FolderOpen, Download, FilePlus, ZoomIn, ZoomOut, Maximize, Undo, Redo, Copy, Clipboard, Grid, Eye, EyeOff, Home, Building, Factory, Warehouse, ShoppingCart, CreditCard, DollarSign, PieChart, BarChart, LineChart, TrendingUp, Clock, Calendar, Bell, MessageSquare, Send, Upload, Link, Layers, Package, Archive, Folder, Search, Filter, Terminal, GitBranch, Github, Smartphone, Tablet, Monitor, Printer, Camera, Mic, Video, Play, Pause, Square, Circle, Triangle, Star, Heart, ThumbsUp, ThumbsDown, Flag, Bookmark, Tag, Hash, AtSign, MapPin, Navigation, Compass, Map, Truck, Plane, Ship, Train, Car, Bike, Footprints, Key, Unlock, UserCheck, UserX, UserPlus, User, Bot, Cog, Wrench, Hammer, Lightbulb, Flame, Droplet, Wind, Sun, Moon, CloudRain, Snowflake, Thermometer } from 'lucide-react';
+import { Database, Server, Cloud, Zap, Box, Globe, Lock, HardDrive, Cpu, Network, Shield, Wifi, Code, Container, FileText, Users, Settings, Activity, Mail, Phone, CheckCircle, XCircle, AlertCircle, Plus, Edit2, X, ChevronRight, Hexagon, Trash2, Save, FolderOpen, Download, FilePlus, ZoomIn, ZoomOut, Maximize, Undo, Redo, Copy, Clipboard, Grid, Eye, EyeOff, Home, Building, Factory, Warehouse, ShoppingCart, CreditCard, DollarSign, PieChart, BarChart, LineChart, TrendingUp, Clock, Calendar, Bell, MessageSquare, Send, Upload, Link, Layers, Package, Archive, Folder, Search, Filter, Terminal, GitBranch, Github, Smartphone, Tablet, Monitor, Printer, Camera, Mic, Video, Play, Pause, Square, Circle, Triangle, Star, Heart, ThumbsUp, ThumbsDown, Flag, Bookmark, Tag, Hash, AtSign, MapPin, Navigation, Compass, Map, Truck, Plane, Ship, Train, Car, Bike, Footprints, Key, Unlock, UserCheck, UserX, UserPlus, User, Bot, Cog, Wrench, Hammer, Lightbulb, Flame, Droplet, Wind, Sun, Moon, CloudRain, Snowflake, Thermometer, History } from 'lucide-react';
 
 // Hexagon grid calculations
 const HEX_SIZE = 40;
@@ -8,6 +8,58 @@ const HEX_SIZE = 40;
 // created within the same millisecond (e.g. paste twice, import + new tab)
 let __nextId = Date.now();
 const genId = () => __nextId++;
+
+// ---- Recent files ----
+// Stored in IndexedDB, not localStorage: FileSystemFileHandle objects are
+// structured-cloneable, so the actual on-device file can be reopened later.
+const RECENTS_DB = 'nodex';
+const RECENTS_STORE = 'recents';
+const RECENTS_MAX = 10;
+
+const openRecentsDb = () => new Promise((resolve, reject) => {
+  const req = indexedDB.open(RECENTS_DB, 1);
+  req.onupgradeneeded = () => req.result.createObjectStore(RECENTS_STORE, { keyPath: 'id', autoIncrement: true });
+  req.onsuccess = () => resolve(req.result);
+  req.onerror = () => reject(req.error);
+});
+
+const recentsGetAll = async () => {
+  const db = await openRecentsDb();
+  return new Promise((resolve, reject) => {
+    const rq = db.transaction(RECENTS_STORE, 'readonly').objectStore(RECENTS_STORE).getAll();
+    rq.onsuccess = () => resolve(rq.result || []);
+    rq.onerror = () => reject(rq.error);
+  });
+};
+
+const recentsPut = async (entry) => {
+  const db = await openRecentsDb();
+  return new Promise((resolve, reject) => {
+    const rq = db.transaction(RECENTS_STORE, 'readwrite').objectStore(RECENTS_STORE).put(entry);
+    rq.onsuccess = () => resolve(rq.result);
+    rq.onerror = () => reject(rq.error);
+  });
+};
+
+const recentsRemove = async (id) => {
+  const db = await openRecentsDb();
+  return new Promise((resolve, reject) => {
+    const rq = db.transaction(RECENTS_STORE, 'readwrite').objectStore(RECENTS_STORE).delete(id);
+    rq.onsuccess = () => resolve();
+    rq.onerror = () => reject(rq.error);
+  });
+};
+
+const timeAgo = (ts) => {
+  const s = Math.floor((Date.now() - ts) / 1000);
+  if (s < 60) return 'just now';
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m} min ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h} h ago`;
+  const d = Math.floor(h / 24);
+  return d === 1 ? 'yesterday' : `${d} days ago`;
+};
 
 const getHexagonPoints = (x, y, size) => {
   const points = [];
@@ -657,6 +709,69 @@ export default function Nodex() {
   const projectHandleRef = useRef(null);
   projectHandleRef.current = projectHandle;
 
+  // Recent files (IndexedDB-backed, see helpers at top)
+  const [recentFiles, setRecentFiles] = useState([]);
+  const [showRecents, setShowRecents] = useState(false);
+
+  const refreshRecents = async () => {
+    try {
+      const all = await recentsGetAll();
+      setRecentFiles(all.sort((a, b) => b.lastOpened - a.lastOpened));
+    } catch (err) {
+      // IndexedDB unavailable — feature quietly disabled
+    }
+  };
+
+  useEffect(() => {
+    refreshRecents();
+  }, []);
+
+  const addRecent = async (name, kind, handle) => {
+    if (!handle) return;
+    try {
+      const all = await recentsGetAll();
+      const entry = { name, kind, handle, lastOpened: Date.now() };
+      for (const e of all) {
+        try {
+          if (e.handle && await e.handle.isSameEntry(handle)) {
+            entry.id = e.id;
+            break;
+          }
+        } catch (err) { /* dead handle — ignore */ }
+      }
+      await recentsPut(entry);
+      const refreshed = (await recentsGetAll()).sort((a, b) => b.lastOpened - a.lastOpened);
+      for (const stale of refreshed.slice(RECENTS_MAX)) {
+        await recentsRemove(stale.id);
+      }
+      setRecentFiles(refreshed.slice(0, RECENTS_MAX));
+    } catch (err) { /* non-fatal */ }
+  };
+
+  const removeRecent = async (id) => {
+    try {
+      await recentsRemove(id);
+      refreshRecents();
+    } catch (err) { /* non-fatal */ }
+  };
+
+  const openRecent = async (entry) => {
+    setShowRecents(false);
+    if (!entry.handle) return;
+    try {
+      let perm = await entry.handle.queryPermission({ mode: 'read' });
+      if (perm !== 'granted') perm = await entry.handle.requestPermission({ mode: 'read' });
+      if (perm !== 'granted') return;
+      const file = await entry.handle.getFile();
+      const data = JSON.parse(await file.text());
+      loadFileData(data, file.name, entry.handle);
+      addRecent(file.name, Array.isArray(data.tabs) ? 'project' : 'diagram', entry.handle);
+    } catch (err) {
+      alert('Could not open this file — it may have been moved or deleted.');
+      removeRecent(entry.id);
+    }
+  };
+
   // Update canvas size on mount and resize
   useEffect(() => {
     const updateSize = () => {
@@ -860,6 +975,7 @@ export default function Nodex() {
           t.id === activeTabIdRef.current ? { ...t, fileHandle: handle } : t
         ));
         dirtyRef.current = false;
+        addRecent(handle.name, 'diagram', handle);
         return;
       } catch (err) {
         if (err.name === 'AbortError') return;
@@ -904,6 +1020,7 @@ export default function Nodex() {
         await writeToHandle(handle, data);
         setProjectHandle(handle);
         dirtyRef.current = false;
+        addRecent(handle.name, 'project', handle);
         return;
       } catch (err) {
         if (err.name === 'AbortError') return;
@@ -976,6 +1093,7 @@ export default function Nodex() {
         const file = await handle.getFile();
         const data = JSON.parse(await file.text());
         loadFileData(data, file.name, handle);
+        addRecent(file.name, Array.isArray(data.tabs) ? 'project' : 'diagram', handle);
       } catch (err) {
         if (err.name !== 'AbortError') alert('Failed to load file: Invalid format');
       }
@@ -2076,6 +2194,55 @@ export default function Nodex() {
           >
             <FolderOpen size={18} />
           </button>
+          <div className="relative">
+            <button
+              onClick={() => setShowRecents(s => !s)}
+              className={`p-2 rounded transition-colors ${showRecents ? 'bg-slate-700' : 'hover:bg-slate-700'}`}
+              title="Open Recent"
+            >
+              <History size={18} />
+            </button>
+            {showRecents && (
+              <>
+                <div className="fixed inset-0 z-40" onClick={() => setShowRecents(false)} />
+                <div className="absolute left-0 top-full mt-1 w-72 bg-slate-800 border border-slate-600 rounded-lg shadow-2xl z-50 py-1">
+                  {recentFiles.length === 0 ? (
+                    <p className="px-3 py-2 text-xs text-slate-400">
+                      No recent files yet — files you open or save on this device will show up here.
+                    </p>
+                  ) : (
+                    recentFiles.map(entry => (
+                      <div
+                        key={entry.id}
+                        onClick={() => openRecent(entry)}
+                        className="flex items-center gap-2 px-3 py-1.5 hover:bg-slate-700 cursor-pointer group"
+                      >
+                        {entry.kind === 'project'
+                          ? <Archive size={14} className="text-slate-400 shrink-0" />
+                          : <FileText size={14} className="text-slate-400 shrink-0" />}
+                        <div className="flex-1 min-w-0">
+                          <p className="text-sm truncate">{entry.name}</p>
+                          <p className="text-xs text-slate-400">
+                            {entry.kind === 'project' ? 'Project' : 'Diagram'} · {timeAgo(entry.lastOpened)}
+                          </p>
+                        </div>
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            removeRecent(entry.id);
+                          }}
+                          className="p-0.5 rounded hover:bg-slate-600 opacity-0 group-hover:opacity-100 transition-opacity"
+                          title="Remove from recents"
+                        >
+                          <X size={12} />
+                        </button>
+                      </div>
+                    ))
+                  )}
+                </div>
+              </>
+            )}
+          </div>
           <button
             onClick={saveToFile}
             className="p-2 hover:bg-slate-700 rounded transition-colors"
