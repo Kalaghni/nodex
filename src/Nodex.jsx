@@ -2552,40 +2552,34 @@ export default function Nodex() {
     const epTo = resolveCenter(conn.to, conn.toType || 'node');
     if (!epFrom || !epTo) return;
 
-    // Anchors: zone-zone uses the closest PAIR of cells across both zones —
-    // centroid-based anchors sent lines on long grazing diagonals when the
-    // blobs were much closer elsewhere. Node-zone keeps nearest-to-node.
-    let a, b;
-    if (epFrom.type === 'zone' && epTo.type === 'zone') {
-      let best = Infinity;
-      epFrom.zone.cells.forEach(ca => {
-        const pa = axialToPixel(ca.q, ca.r);
-        epTo.zone.cells.forEach(cb => {
-          const pb = axialToPixel(cb.q, cb.r);
-          const d = (pa.x - pb.x) ** 2 + (pa.y - pb.y) ** 2;
-          if (d < best) {
-            best = d;
-            a = pa;
-            b = pb;
-          }
-        });
-      });
-    } else {
-      a = nearestCellTo(epFrom, epTo);
-      b = nearestCellTo(epTo, epFrom);
-    }
-    if (!a || !b || (a.x === b.x && a.y === b.y)) return;
+    // Center-to-center style: the line runs as if drawn between the entity
+    // centers (node center / zone centroid) and is trimmed where it crosses
+    // each silhouette. Falls back to the nearest cell when a concave zone's
+    // centroid lies outside the blob and the center ray misses it entirely.
+    const a = { x: epFrom.x, y: epFrom.y };
+    const b = { x: epTo.x, y: epTo.y };
+    if (a.x === b.x && a.y === b.y) return;
+
+    const zoneEnd = (zoneEp, fromPt) => {
+      const center = { x: zoneEp.x, y: zoneEp.y };
+      const t = zoneEntryT(zoneEp.zone, fromPt, center);
+      if (t !== null && t > 0) {
+        return {
+          x: fromPt.x + (center.x - fromPt.x) * t,
+          y: fromPt.y + (center.y - fromPt.y) * t
+        };
+      }
+      const cell = nearestCellTo(zoneEp, fromPt);
+      return zoneBoundaryPoint(zoneEp.zone, fromPt, cell);
+    };
+
     const routing = conn.routing || 'direct';
     let pts;
 
     if (routing === 'angled' && Math.abs(b.x - a.x) > HEX_SIZE && Math.abs(b.y - a.y) > HEX_SIZE) {
       const corner = { x: b.x, y: a.y };
-      const start = epFrom.type === 'zone'
-        ? zoneBoundaryPoint(epFrom.zone, corner, a)
-        : nodeEdgePoint(a, corner);
-      const end = epTo.type === 'zone'
-        ? zoneBoundaryPoint(epTo.zone, corner, b)
-        : nodeEdgePoint(b, corner);
+      const start = epFrom.type === 'zone' ? zoneEnd(epFrom, corner) : nodeEdgePoint(a, corner);
+      const end = epTo.type === 'zone' ? zoneEnd(epTo, corner) : nodeEdgePoint(b, corner);
       pts = [start, corner, end];
     } else if (epFrom.type === 'node' && epTo.type === 'node') {
       // Direct node-node — also the fallback when too aligned for an elbow
@@ -2593,14 +2587,8 @@ export default function Nodex() {
       if (!trimmed) return;
       pts = [trimmed.from, trimmed.to];
     } else {
-      // Direct with a zone on at least one end: trim each zone end at the
-      // blob's silhouette along the line, node ends at their hex edge
-      const start = epFrom.type === 'zone'
-        ? zoneBoundaryPoint(epFrom.zone, b, a)
-        : nodeEdgePoint(a, b);
-      const end = epTo.type === 'zone'
-        ? zoneBoundaryPoint(epTo.zone, a, b)
-        : nodeEdgePoint(b, a);
+      const start = epFrom.type === 'zone' ? zoneEnd(epFrom, b) : nodeEdgePoint(a, b);
+      const end = epTo.type === 'zone' ? zoneEnd(epTo, a) : nodeEdgePoint(b, a);
       if (Math.hypot(end.x - start.x, end.y - start.y) < 2) return;
       pts = [start, end];
     }
