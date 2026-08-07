@@ -1562,8 +1562,10 @@ export default function Nodex() {
       if (pendingConnectFromRef.current) {
         const newConnection = {
           id: genId(),
-          from: pendingConnectFromRef.current,
+          from: pendingConnectFromRef.current.id,
+          fromType: pendingConnectFromRef.current.kind,
           to: newNode.id,
+          toType: 'node',
           label: '',
           iconId: null,
           rotation: 0,
@@ -1660,7 +1662,8 @@ export default function Nodex() {
         ...prev,
         [pathKey]: {
           ...currentDiag,
-          zones: currentDiag.zones.filter(z => z.id !== zoneId)
+          zones: currentDiag.zones.filter(z => z.id !== zoneId),
+          connections: currentDiag.connections.filter(c => c.from !== zoneId && c.to !== zoneId)
         }
       };
     });
@@ -1688,7 +1691,7 @@ export default function Nodex() {
       if (!hasNode) {
         openNodeCreator(q, r);
         // Set after openNodeCreator — its resetNodeForm clears the ref
-        pendingConnectFromRef.current = connectingFrom.id;
+        pendingConnectFromRef.current = { id: connectingFrom.id, kind: connectingFrom.kind };
         setConnectingFrom(null);
         setHoveredCell(null);
       }
@@ -1923,7 +1926,8 @@ export default function Nodex() {
   const handleNodeClick = (e, node) => {
     e.stopPropagation();
     if (connectingFrom) {
-      if (connectingFrom.id !== node.id) {
+      const isSelf = connectingFrom.kind === 'node' && connectingFrom.id === node.id;
+      if (!isSelf) {
         const connectionExists = connections.some(
           c => (c.from === connectingFrom.id && c.to === node.id) ||
                (c.from === node.id && c.to === connectingFrom.id)
@@ -1931,8 +1935,10 @@ export default function Nodex() {
         if (!connectionExists) {
           const newConnection = {
             id: genId(),
-            from: connectingFrom.id, 
+            from: connectingFrom.id,
+            fromType: connectingFrom.kind,
             to: node.id,
+            toType: 'node',
             label: '',
             iconId: null,
             rotation: 0,
@@ -1953,15 +1959,50 @@ export default function Nodex() {
     // Set initial mouse position to node position so the line doesn't jump to (0,0)
     const nodePos = axialToPixel(node.q, node.r);
     setMousePos({ x: nodePos.x, y: nodePos.y });
-    setConnectingFrom(node);
+    setConnectingFrom({ kind: 'node', id: node.id, label: node.label, q: node.q, r: node.r });
   };
 
   const handleZoneClick = (e, zone) => {
     e.stopPropagation();
     // A marquee drag that ended on this zone fires a click — ignore it
     if (didMarqueeRef.current) return;
+
+    // Clicking a zone mid-connection finishes the connection on the zone
+    if (connectingFrom) {
+      const isSelf = connectingFrom.kind === 'zone' && connectingFrom.id === zone.id;
+      if (!isSelf) {
+        const connectionExists = connections.some(
+          c => (c.from === connectingFrom.id && c.to === zone.id) ||
+               (c.from === zone.id && c.to === connectingFrom.id)
+        );
+        if (!connectionExists) {
+          const newConnection = {
+            id: genId(),
+            from: connectingFrom.id,
+            fromType: connectingFrom.kind,
+            to: zone.id,
+            toType: 'zone',
+            label: '',
+            iconId: null,
+            rotation: 0,
+            lineType: 'solid'
+          };
+          setConnections(prev => [...prev, newConnection]);
+          setEditingConnection(newConnection);
+          setShowConnectionEditor(true);
+        }
+      }
+      setConnectingFrom(null);
+      return;
+    }
+
     setSelectedZone(zone);
     setSelectedNode(null);
+  };
+
+  const handleZoneDoubleClick = (e, zone) => {
+    e.stopPropagation();
+    setConnectingFrom({ kind: 'zone', id: zone.id, label: zone.label || 'Zone' });
   };
 
   // Deletes every selected node (single or bulk), their connections, and
@@ -1992,7 +2033,12 @@ export default function Nodex() {
   };
 
   const deleteConnection = (connectionId) => {
-    setConnections(connections.filter(c => c.id !== connectionId));
+    setConnections(prev => prev.filter(c => c.id !== connectionId));
+    // If this connection was open in the drawer, close it
+    if (editingConnectionId === connectionId) {
+      setShowConnectionEditor(false);
+      setEditingConnectionId(null);
+    }
   };
 
   const clearAll = () => {
@@ -2123,11 +2169,47 @@ export default function Nodex() {
   // (horizontal from the source, right-angle bend, vertical into the target).
   const connGeoms = {};
   connections.forEach(conn => {
-    const fromNode = nodes.find(n => n.id === conn.from);
-    const toNode = nodes.find(n => n.id === conn.to);
-    if (!fromNode || !toNode) return;
-    const a = axialToPixel(fromNode.q, fromNode.r);
-    const b = axialToPixel(toNode.q, toNode.r);
+    // Endpoints can be nodes or zones. A zone endpoint anchors to its cell
+    // nearest the other endpoint, which is a hex center — so all the node
+    // trimming/routing logic below applies unchanged.
+    const resolveCenter = (id, type) => {
+      if (type === 'zone') {
+        const z = zones.find(zz => zz.id === id);
+        if (!z || z.cells.length === 0) return null;
+        let sx = 0, sy = 0;
+        z.cells.forEach(c => {
+          const p = axialToPixel(c.q, c.r);
+          sx += p.x;
+          sy += p.y;
+        });
+        return { type: 'zone', zone: z, x: sx / z.cells.length, y: sy / z.cells.length };
+      }
+      const n = nodes.find(nn => nn.id === id);
+      if (!n) return null;
+      const p = axialToPixel(n.q, n.r);
+      return { type: 'node', x: p.x, y: p.y };
+    };
+    const nearestCellTo = (ep, toward) => {
+      if (ep.type !== 'zone') return { x: ep.x, y: ep.y };
+      let best = { x: ep.x, y: ep.y };
+      let bd = Infinity;
+      ep.zone.cells.forEach(c => {
+        const p = axialToPixel(c.q, c.r);
+        const d = Math.hypot(p.x - toward.x, p.y - toward.y);
+        if (d < bd) {
+          bd = d;
+          best = p;
+        }
+      });
+      return best;
+    };
+
+    const epFrom = resolveCenter(conn.from, conn.fromType || 'node');
+    const epTo = resolveCenter(conn.to, conn.toType || 'node');
+    if (!epFrom || !epTo) return;
+    const a = nearestCellTo(epFrom, epTo);
+    const b = nearestCellTo(epTo, epFrom);
+    if (a.x === b.x && a.y === b.y) return;
     const routing = conn.routing || 'direct';
     let pts;
 
@@ -2727,7 +2809,11 @@ export default function Nodex() {
           <g transform={`translate(${viewOffset.x}, ${viewOffset.y}) scale(${zoom})`}>
             {/* Zone backgrounds */}
             {zones.map(zone => (
-              <g key={`zone-${zone.id}`} onClick={(e) => handleZoneClick(e, zone)}>
+              <g
+                key={`zone-${zone.id}`}
+                onClick={(e) => handleZoneClick(e, zone)}
+                onDoubleClick={(e) => handleZoneDoubleClick(e, zone)}
+              >
                 {zone.cells.map(cell => {
                   const pos = axialToPixel(cell.q, cell.r);
                   return (
@@ -2801,7 +2887,7 @@ export default function Nodex() {
                   e.stopPropagation();
                   openNodeCreator(hoveredCell.q, hoveredCell.r);
                   if (connectingFrom) {
-                    pendingConnectFromRef.current = connectingFrom.id;
+                    pendingConnectFromRef.current = { id: connectingFrom.id, kind: connectingFrom.kind };
                     setConnectingFrom(null);
                   }
                   setHoveredCell(null);
@@ -2975,7 +3061,23 @@ export default function Nodex() {
 
             {/* Temporary connection line */}
             {connectingFrom && (() => {
-              const start = axialToPixel(connectingFrom.q, connectingFrom.r);
+              let start;
+              if (connectingFrom.kind === 'zone') {
+                const z = zones.find(zz => zz.id === connectingFrom.id);
+                if (!z || z.cells.length === 0) return null;
+                // Track the zone cell nearest the cursor, like the final line will
+                let bd = Infinity;
+                z.cells.forEach(c => {
+                  const p = axialToPixel(c.q, c.r);
+                  const d = Math.hypot(p.x - mousePos.x, p.y - mousePos.y);
+                  if (d < bd) {
+                    bd = d;
+                    start = p;
+                  }
+                });
+              } else {
+                start = axialToPixel(connectingFrom.q, connectingFrom.r);
+              }
               const dist = Math.hypot(mousePos.x - start.x, mousePos.y - start.y);
               // Start from the hexagon edge once the cursor has left it
               let x1 = start.x, y1 = start.y;
@@ -3392,15 +3494,25 @@ export default function Nodex() {
         <div className="fixed right-0 top-0 bottom-0 w-96 bg-slate-800 border-l border-slate-700 z-50 p-6 overflow-y-auto scrollbar-thin shadow-2xl">
           <div className="flex items-center justify-between mb-4">
             <h2 className="text-xl font-bold">Edit Connection</h2>
-            <button
-              onClick={() => {
-                setShowConnectionEditor(false);
-                setEditingConnection(null);
-              }}
-              className="text-slate-400 hover:text-white"
-            >
-              <X size={24} />
-            </button>
+            <div className="flex items-center gap-1">
+              <button
+                onClick={() => deleteConnection(editingConnection.id)}
+                className="p-1.5 rounded text-slate-400 hover:text-red-400 hover:bg-slate-700 transition-colors"
+                title="Delete Connection"
+              >
+                <Trash2 size={18} />
+              </button>
+              <button
+                onClick={() => {
+                  setShowConnectionEditor(false);
+                  setEditingConnection(null);
+                }}
+                className="p-1.5 rounded text-slate-400 hover:text-white hover:bg-slate-700 transition-colors"
+                title="Close"
+              >
+                <X size={20} />
+              </button>
+            </div>
           </div>
 
           <div className="space-y-4">
