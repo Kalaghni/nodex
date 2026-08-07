@@ -1,71 +1,105 @@
 # Nodex
 
-A hexagonal grid architecture diagram tool built with React.
+Architecture diagramming on a hexagonal grid. Nodex is a single-page React app for sketching systems as hexagon nodes, connections, and colored zones — with nesting, multi-tab documents, and files that live on your device.
+
+![](public/favicon.svg)
 
 ## Features
 
-- **Hexagonal Grid**: Infinite, auto-expanding grid layout
-- **Nodes**: Create custom nodes with icons, colors, and labels
-- **Connections**: Link nodes with labeled, styled connections
-- **Zones**: Group cells with rectangular, hexagonal, or circular zones
-- **Nested Diagrams**: Shift+click any node to open its child diagram
-- **File Operations**: Save/load JSON, export to SVG/PNG
+### Canvas
+- **Infinite hex grid** that expands as you pan, zoom (scroll wheel), and place content
+- **Nodes**: hexagons with an icon (90+ built in), color, label, and description
+- **Nested diagrams**: every node can contain its own child diagram — Shift+Click (or "Open Diagram") to descend, breadcrumbs to climb back up
+- **Zones**: colored regions in three shapes — rectangle, hexagon, and circular — with a name label you can place on any side (or center), inside or outside the boundary
+  - Drag a zone to move it; nodes sitting on it come along
+  - Drag the round handle to resize (corner for rectangles, radius for hex/circular)
 
-## Quick Start with Docker
+### Connections
+- Double-click a node **or zone** to start a connection; click another node or zone to finish — node→node, node→zone, and zone→zone all work
+- Mid-connection, click an **empty cell** to create a new node pre-wired to the source
+- Lines terminate at hexagon edges; zone endpoints anchor to the zone cell nearest the other end
+- Per-connection options, edited in a live side drawer:
+  - **Route**: direct or angled (right-angle elbow)
+  - **Pointer per end**: none / arrow / open / circle / diamond
+  - **Line style**: solid, dashed, dotted, dash-dot, long dash
+  - **Label + icon** with rotation; line gaps are cut to the label's exact footprint — including where *other* connections cross a label
 
-```bash
-# Build the image
-docker build -t nodex .
+### Editing
+- **Multi-select**: marquee (drag on empty canvas), Ctrl+Click to toggle, Ctrl+A for all
+- **Group drag** preserves relative layout; **bulk delete** removes nodes, their connections, and nested diagrams
+- **Copy/paste/duplicate** is group-aware and keeps connections between copied nodes; pasted labels ending in a number get bumped (`Server 2` → `Server 3`)
+- **Undo/redo** per tab (a whole drag is one step)
 
-# Run the container
-docker run -p 8080:80 nodex
-```
+### Files
+- **Tabs** — each tab is an independent diagram document
+- **Work directly on device files** (File System Access API): Open links the file to the tab, Save writes straight back to it. Falls back to download/upload in browsers without the API
+- **Projects**: save every tab into a single `nodex-project.json`; opening one restores all tabs
+- **Autosave** toggle: changes are debounced and written to every linked file
+- **Open Recent**: last 10 opened/saved files, reopenable in one click (file handles persisted in IndexedDB)
+- **Drag & drop** a `.json` anywhere on the page to open it
+- Unsaved changes trigger a leave-page warning
+- **Export** the full diagram (not just the viewport) as standalone **SVG** or 2× **PNG**
 
-Then open http://localhost:8080 in your browser.
+## File formats
+
+Plain JSON, two flavors, auto-detected on open:
+
+| Format | Shape |
+|--------|-------|
+| Diagram | `{ "version": 1, "name", "diagrams", "currentPath" }` |
+| Project | `{ "version": 2, "type": "nodex-project", "tabs": [{ "name", "diagrams", "currentPath" }] }` |
+
+`diagrams` is a flat map keyed by nesting path (`"root"`, `"root/<nodeId>"`, …), each entry holding `nodes`, `connections`, and `zones`.
+
+## Keyboard shortcuts
+
+| Key | Action |
+|-----|--------|
+| Drag empty canvas | Box-select nodes |
+| Ctrl+Click node | Add/remove from selection |
+| Ctrl+A | Select all nodes |
+| Ctrl+C / Ctrl+V | Copy / paste selection |
+| Ctrl+D | Duplicate selection |
+| Ctrl+Z / Ctrl+Y | Undo / redo |
+| Ctrl+S | Save tab |
+| Ctrl+Shift+S | Save project (all tabs) |
+| Double-click node/zone | Start a connection |
+| Shift+Click node | Open nested diagram |
+| Delete / Backspace | Remove selection |
+| Scroll | Zoom |
+| Shift+Drag / Middle-drag | Pan |
+| Esc | Cancel / close |
 
 ## Development
 
 ```bash
-# Install dependencies
 npm install
-
-# Start dev server
-npm run dev
-
-# Build for production
-npm run build
+npm run dev        # Vite dev server (port 3030)
+npm run build      # production build to dist/
 ```
 
-## Docker Compose
+Stack: React 18, Vite 5, Tailwind CSS 3, [lucide-react](https://lucide.dev) icons. The whole app lives in `src/Nodex.jsx`.
 
-Create a `docker-compose.yml`:
+## Deployment
 
-```yaml
-version: '3.8'
-services:
-  nodex:
-    build: ../../Downloads/nodex
-    ports:
-      - "8080:80"
-    restart: unless-stopped
+### Docker
+
+```bash
+docker build -t nodex .
+docker run -p 8080:80 nodex
 ```
 
-Then run:
+Then open http://localhost:8080.
+
+### Docker Compose
 
 ```bash
 docker-compose up -d
 ```
 
-## Keyboard Shortcuts
+## Browser support
 
-| Key | Action |
-|-----|--------|
-| Shift+Click | Open nested diagram |
-| Double-click | Start connecting nodes |
-| Delete | Remove selected node/zone |
-| Scroll | Zoom in/out |
-| Shift+Drag | Pan canvas |
-| Esc | Cancel current action |
+Best in Chromium browsers (Chrome, Edge): on-device file linking, autosave, and Open Recent use the File System Access API. Firefox and Safari fall back to classic download/upload for saving and opening; everything else works everywhere.
 
 ## License
 
