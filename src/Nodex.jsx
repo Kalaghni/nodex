@@ -2045,11 +2045,10 @@ export default function Nodex() {
     setConnectingFrom({ kind: 'zone', id: zone.id, label: zone.label || 'Zone' });
   };
 
-  const handleZoneMouseDown = (e, zone) => {
-    // Only plain left-drag moves a zone — shift keeps panning, ctrl keeps
-    // additive marquee, and connect/zone-create clicks keep their meaning
-    if (e.button !== 0 || e.shiftKey || e.ctrlKey || e.metaKey) return;
-    if (isCreatingZone || connectingFrom) return;
+  // Begin moving a zone (middle-click drag). Left-drag can't be used: the
+  // hover "+" overlay owns plain clicks on empty zone cells, and left-drag
+  // on the canvas is marquee selection.
+  const startZoneDrag = (e, zone) => {
     e.stopPropagation();
     e.preventDefault();
 
@@ -2072,6 +2071,12 @@ export default function Nodex() {
       moved: false
     };
     setIsDraggingZone(true);
+  };
+
+  const handleZoneMouseDown = (e, zone) => {
+    if (e.button !== 1) return;
+    if (isCreatingZone) return;
+    startZoneDrag(e, zone);
   };
 
   // Deletes every selected node (single or bulk), their connections, and
@@ -2802,7 +2807,7 @@ export default function Nodex() {
                 <p className="font-medium">{selectedZone.label}</p>
               </div>
               <p className="text-xs text-slate-300">{selectedZone.cells.length} cells</p>
-              <p className="text-xs text-slate-400 mt-1">Drag the zone to move it (nodes on it come along). Drag the round handle to resize.</p>
+              <p className="text-xs text-slate-400 mt-1">Middle-drag the zone to move it (nodes on it come along). Drag the round handle to resize.</p>
             </div>
             <button
               onClick={() => deleteZone(selectedZone.id)}
@@ -2961,6 +2966,14 @@ export default function Nodex() {
                     setConnectingFrom(null);
                   }
                   setHoveredCell(null);
+                }}
+                onMouseDown={(e) => {
+                  // This overlay sits on top of zone cells — pass a
+                  // middle-drag through as a zone move
+                  if (e.button === 1) {
+                    const zone = getZoneForCell(hoveredCell.q, hoveredCell.r);
+                    if (zone) startZoneDrag(e, zone);
+                  }
                 }}
                 className="cursor-pointer"
               >
@@ -3286,6 +3299,12 @@ export default function Nodex() {
                   className="ui-overlay"
                   transform={`translate(${handlePos.x}, ${handlePos.y})`}
                   onMouseDown={(e) => {
+                    // Left-drag resizes; middle-drag moves the zone
+                    if (e.button === 1) {
+                      startZoneDrag(e, zone);
+                      return;
+                    }
+                    if (e.button !== 0) return;
                     e.stopPropagation();
                     e.preventDefault();
                     setResizingZone({ id: zone.id, shape, anchor });
