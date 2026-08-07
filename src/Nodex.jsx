@@ -665,11 +665,14 @@ export default function Nodex() {
   const selectedZoneRef = useRef(null);
   selectedZoneRef.current = selectedZone;
 
-  // Marquee (box) selection, group-drag bookkeeping, zone resizing
+  // Marquee (box) selection, group-drag bookkeeping, zone resizing/moving
   const [marquee, setMarquee] = useState(null);
   const didMarqueeRef = useRef(false);
   const dragGroupRef = useRef(null);
   const [resizingZone, setResizingZone] = useState(null);
+  const zoneDragRef = useRef(null);
+  const zoneJustDraggedRef = useRef(false);
+  const [isDraggingZone, setIsDraggingZone] = useState(false);
 
   // When a connection drag ends on an empty cell, the node creator opens and
   // this holds the source node id to auto-connect to the node being created
@@ -1729,6 +1732,30 @@ export default function Nodex() {
       setMarquee(prev => prev ? { ...prev, end: { x: worldX, y: worldY } } : prev);
     }
 
+    // Zone move drag — shift the zone's cells (and the nodes riding on
+    // them) by the axial delta from the drag start
+    if (zoneDragRef.current) {
+      const drag = zoneDragRef.current;
+      const cell = pixelToAxial(worldX, worldY);
+      const dq = cell.q - drag.startCell.q;
+      const dr = cell.r - drag.startCell.r;
+      if (dq !== 0 || dr !== 0) drag.moved = true;
+      setZones(prev => prev.map(z =>
+        z.id === drag.id
+          ? { ...z, cells: drag.cells0.map(c => ({ q: c.q + dq, r: c.r + dr })) }
+          : z
+      ));
+      if (Object.keys(drag.nodes0).length > 0) {
+        setNodes(prev => prev.map(n =>
+          drag.nodes0[n.id]
+            ? { ...n, q: drag.nodes0[n.id].q + dq, r: drag.nodes0[n.id].r + dr }
+            : n
+        ));
+      }
+      setHoveredCell(null);
+      return;
+    }
+
     // Zone resize drag — rebuild the zone's cells from its shape + anchor
     if (resizingZone) {
       const cell = pixelToAxial(worldX, worldY);
@@ -1839,6 +1866,14 @@ export default function Nodex() {
     setDraggingNode(null);
     dragGroupRef.current = null;
     setResizingZone(null);
+
+    if (zoneDragRef.current) {
+      // A real move must not fire the follow-up click (which would select
+      // the zone or complete a connection)
+      if (zoneDragRef.current.moved) zoneJustDraggedRef.current = true;
+      zoneDragRef.current = null;
+      setIsDraggingZone(false);
+    }
 
     // Finish marquee selection: pick every node whose center is in the box.
     // A near-zero box is just a click — keep the click's clear behavior.
@@ -1966,6 +2001,11 @@ export default function Nodex() {
     e.stopPropagation();
     // A marquee drag that ended on this zone fires a click — ignore it
     if (didMarqueeRef.current) return;
+    // Same for the click that follows a zone move
+    if (zoneJustDraggedRef.current) {
+      zoneJustDraggedRef.current = false;
+      return;
+    }
 
     // Clicking a zone mid-connection finishes the connection on the zone
     if (connectingFrom) {
@@ -2003,6 +2043,35 @@ export default function Nodex() {
   const handleZoneDoubleClick = (e, zone) => {
     e.stopPropagation();
     setConnectingFrom({ kind: 'zone', id: zone.id, label: zone.label || 'Zone' });
+  };
+
+  const handleZoneMouseDown = (e, zone) => {
+    // Only plain left-drag moves a zone — shift keeps panning, ctrl keeps
+    // additive marquee, and connect/zone-create clicks keep their meaning
+    if (e.button !== 0 || e.shiftKey || e.ctrlKey || e.metaKey) return;
+    if (isCreatingZone || connectingFrom) return;
+    e.stopPropagation();
+    e.preventDefault();
+
+    const rect = canvasRef.current.getBoundingClientRect();
+    const worldX = (e.clientX - rect.left - viewOffset.x) / zoom;
+    const worldY = (e.clientY - rect.top - viewOffset.y) / zoom;
+
+    // Nodes sitting on the zone's cells move along with it
+    const cellSet = new Set(zone.cells.map(c => `${c.q},${c.r}`));
+    const containedNodes = {};
+    nodesRef.current.forEach(n => {
+      if (cellSet.has(`${n.q},${n.r}`)) containedNodes[n.id] = { q: n.q, r: n.r };
+    });
+
+    zoneDragRef.current = {
+      id: zone.id,
+      startCell: pixelToAxial(worldX, worldY),
+      cells0: zone.cells.map(c => ({ ...c })),
+      nodes0: containedNodes,
+      moved: false
+    };
+    setIsDraggingZone(true);
   };
 
   // Deletes every selected node (single or bulk), their connections, and
@@ -2733,7 +2802,7 @@ export default function Nodex() {
                 <p className="font-medium">{selectedZone.label}</p>
               </div>
               <p className="text-xs text-slate-300">{selectedZone.cells.length} cells</p>
-              <p className="text-xs text-slate-400 mt-1">Drag the round handle on the canvas to resize.</p>
+              <p className="text-xs text-slate-400 mt-1">Drag the zone to move it (nodes on it come along). Drag the round handle to resize.</p>
             </div>
             <button
               onClick={() => deleteZone(selectedZone.id)}
@@ -2792,7 +2861,7 @@ export default function Nodex() {
         onWheel={handleWheel}
         onContextMenu={(e) => e.preventDefault()}
         style={{
-          cursor: isPanning ? 'grabbing' : isCreatingZone ? 'crosshair' : connectingFrom ? 'crosshair' : resizingZone ? 'nwse-resize' : 'default'
+          cursor: isPanning || isDraggingZone ? 'grabbing' : isCreatingZone ? 'crosshair' : connectingFrom ? 'crosshair' : resizingZone ? 'nwse-resize' : 'default'
         }}
       >
         {/* File drop overlay — pointer-events-none so it never steals the
@@ -2813,6 +2882,7 @@ export default function Nodex() {
                 key={`zone-${zone.id}`}
                 onClick={(e) => handleZoneClick(e, zone)}
                 onDoubleClick={(e) => handleZoneDoubleClick(e, zone)}
+                onMouseDown={(e) => handleZoneMouseDown(e, zone)}
               >
                 {zone.cells.map(cell => {
                   const pos = axialToPixel(cell.q, cell.r);
