@@ -777,6 +777,10 @@ export default function Nodex() {
   // When a connection drag ends on an empty cell, the node creator opens and
   // this holds the source node id to auto-connect to the node being created
   const pendingConnectFromRef = useRef(null);
+
+  // Debounce timer for clicks on the hover "+" over zone cells: a single
+  // click opens the node creator, a double-click starts a zone connection
+  const pendingCellClickRef = useRef(null);
   
   const [hoveredConnection, setHoveredConnection] = useState(null);
   // Id-based like zone selection: the drawer edits the live connection, so
@@ -3431,12 +3435,32 @@ export default function Nodex() {
                 transform={`translate(${axialToPixel(hoveredCell.q, hoveredCell.r).x}, ${axialToPixel(hoveredCell.q, hoveredCell.r).y})`}
                 onClick={(e) => {
                   e.stopPropagation();
-                  openNodeCreator(hoveredCell.q, hoveredCell.r);
-                  if (connectingFrom) {
-                    pendingConnectFromRef.current = { id: connectingFrom.id, kind: connectingFrom.kind };
-                    setConnectingFrom(null);
+                  const { q, r } = hoveredCell;
+                  const openCreatorHere = () => {
+                    openNodeCreator(q, r);
+                    if (connectingFrom) {
+                      pendingConnectFromRef.current = { id: connectingFrom.id, kind: connectingFrom.kind };
+                      setConnectingFrom(null);
+                    }
+                    setHoveredCell(null);
+                  };
+                  // On zone cells, wait long enough to tell a double-click
+                  // (start a connection from the zone) from a single click
+                  // (create a node here) — the overlay owns both gestures
+                  if (!connectingFrom && getZoneForCell(q, r)) {
+                    clearTimeout(pendingCellClickRef.current);
+                    pendingCellClickRef.current = setTimeout(openCreatorHere, 250);
+                  } else {
+                    openCreatorHere();
                   }
-                  setHoveredCell(null);
+                }}
+                onDoubleClick={(e) => {
+                  e.stopPropagation();
+                  const zone = getZoneForCell(hoveredCell.q, hoveredCell.r);
+                  if (zone) {
+                    clearTimeout(pendingCellClickRef.current);
+                    setConnectingFrom({ kind: 'zone', id: zone.id, label: zone.label || 'Zone' });
+                  }
                 }}
                 onMouseDown={(e) => {
                   // This overlay sits on top of zone cells — pass a
