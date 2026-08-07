@@ -126,6 +126,21 @@ const getConnLabelBox = (conn, cx, cy) => {
   };
 };
 
+// Pointer style for each end of a connection: 'none' | 'arrow' | 'open' |
+// 'circle' | 'diamond'. Falls back to the legacy arrowHead/arrowStyle pair
+// (whose default was a filled arrow on the target end).
+const getConnEndStyles = (conn) => {
+  if (conn.startStyle !== undefined || conn.endStyle !== undefined) {
+    return { start: conn.startStyle || 'none', end: conn.endStyle || 'none' };
+  }
+  const style = conn.arrowStyle || 'arrow';
+  const head = conn.arrowHead || 'end';
+  return {
+    start: head === 'start' || head === 'both' ? style : 'none',
+    end: head === 'end' || head === 'both' ? style : 'none'
+  };
+};
+
 // t-interval [t0,t1] where the segment a→b crosses a rotated rectangle, or
 // null if it misses entirely (slab test in the rect's local frame)
 const segmentRectIntersection = (a, b, box) => {
@@ -2649,8 +2664,7 @@ export default function Nodex() {
               const ConnIcon = conn.iconId ? AVAILABLE_ICONS.find(i => i.id === conn.iconId)?.icon : null;
               const lineTypeData = LINE_TYPES.find(lt => lt.id === (conn.lineType || 'solid'));
               const strokeDasharray = lineTypeData?.dasharray || null;
-              const arrowHead = conn.arrowHead || 'end';
-              const markerUrl = `url(#arrow-${conn.arrowStyle || 'arrow'})`;
+              const endStyles = getConnEndStyles(conn);
 
               // Visible pieces per polyline segment: [0,1] minus the exact
               // footprint of every label box the segment crosses — its own
@@ -2720,8 +2734,8 @@ export default function Nodex() {
                       stroke={isHovered ? '#94a3b8' : '#64748b'}
                       strokeWidth={isHovered ? 3 : 2}
                       strokeDasharray={strokeDasharray}
-                      markerStart={piece.atStart && (arrowHead === 'start' || arrowHead === 'both') ? markerUrl : undefined}
-                      markerEnd={piece.atEnd && (arrowHead === 'end' || arrowHead === 'both') ? markerUrl : undefined}
+                      markerStart={piece.atStart && endStyles.start !== 'none' ? `url(#arrow-${endStyles.start})` : undefined}
+                      markerEnd={piece.atEnd && endStyles.end !== 'none' ? `url(#arrow-${endStyles.end})` : undefined}
                       pointerEvents="none"
                     />
                   ))}
@@ -3256,53 +3270,49 @@ export default function Nodex() {
               </div>
             </div>
 
-            <div>
-              <label className="block text-sm font-medium mb-2">Arrows</label>
-              <div className="flex gap-2">
-                {[
-                  { id: 'none', label: 'None' },
-                  { id: 'end', label: '→ To' },
-                  { id: 'start', label: '← From' },
-                  { id: 'both', label: '↔ Both' }
-                ].map(ah => (
-                  <button
-                    key={ah.id}
-                    onClick={() => updateEditingConnection({ arrowHead: ah.id })}
-                    className={`flex-1 px-2 py-2 rounded text-sm transition-all ${
-                      (editingConnection.arrowHead || 'end') === ah.id
-                        ? 'bg-blue-600 ring-2 ring-blue-400'
-                        : 'bg-slate-700 hover:bg-slate-600'
-                    }`}
-                  >
-                    {ah.label}
-                  </button>
-                ))}
-              </div>
-            </div>
-
-            <div>
-              <label className="block text-sm font-medium mb-2">Pointer Style</label>
-              <div className="flex gap-2">
-                {[
-                  { id: 'arrow', label: 'Arrow' },
-                  { id: 'open', label: 'Open' },
-                  { id: 'circle', label: 'Circle' },
-                  { id: 'diamond', label: 'Diamond' }
-                ].map(st => (
-                  <button
-                    key={st.id}
-                    onClick={() => updateEditingConnection({ arrowStyle: st.id })}
-                    className={`flex-1 px-2 py-2 rounded text-sm transition-all ${
-                      (editingConnection.arrowStyle || 'arrow') === st.id
-                        ? 'bg-blue-600 ring-2 ring-blue-400'
-                        : 'bg-slate-700 hover:bg-slate-600'
-                    }`}
-                  >
-                    {st.label}
-                  </button>
-                ))}
-              </div>
-            </div>
+            {(() => {
+              const POINTER_STYLES = [
+                { id: 'none', label: 'None' },
+                { id: 'arrow', label: 'Arrow' },
+                { id: 'open', label: 'Open' },
+                { id: 'circle', label: 'Circle' },
+                { id: 'diamond', label: 'Diamond' }
+              ];
+              const current = getConnEndStyles(editingConnection);
+              // Always write both fields so the legacy arrowHead/arrowStyle
+              // fallback stops applying once either end has been edited
+              const setEnd = (which, id) =>
+                updateEditingConnection({
+                  startStyle: which === 'start' ? id : current.start,
+                  endStyle: which === 'end' ? id : current.end
+                });
+              return (
+                <>
+                  {['start', 'end'].map(which => (
+                    <div key={which}>
+                      <label className="block text-sm font-medium mb-2">
+                        {which === 'start' ? 'Start Pointer (from)' : 'End Pointer (to)'}
+                      </label>
+                      <div className="flex gap-1">
+                        {POINTER_STYLES.map(st => (
+                          <button
+                            key={st.id}
+                            onClick={() => setEnd(which, st.id)}
+                            className={`flex-1 px-1 py-2 rounded text-xs transition-all ${
+                              current[which] === st.id
+                                ? 'bg-blue-600 ring-2 ring-blue-400'
+                                : 'bg-slate-700 hover:bg-slate-600'
+                            }`}
+                          >
+                            {st.label}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  ))}
+                </>
+              );
+            })()}
 
             <div>
               <label className="block text-sm font-medium mb-2">Icon (optional)</label>
