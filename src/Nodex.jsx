@@ -545,6 +545,10 @@ export default function Nodex() {
   const didMarqueeRef = useRef(false);
   const dragGroupRef = useRef(null);
   const [resizingZone, setResizingZone] = useState(null);
+
+  // When a connection drag ends on an empty cell, the node creator opens and
+  // this holds the source node id to auto-connect to the node being created
+  const pendingConnectFromRef = useRef(null);
   
   const [hoveredConnection, setHoveredConnection] = useState(null);
   const [editingConnection, setEditingConnection] = useState(null);
@@ -1309,6 +1313,7 @@ export default function Nodex() {
       color: '#3b82f6'
     });
     setEditingNode(null);
+    pendingConnectFromRef.current = null;
   };
 
   const openNodeCreator = (q = null, r = null) => {
@@ -1350,7 +1355,23 @@ export default function Nodex() {
         q: coords.q,
         r: coords.r
       };
-      setNodes([...nodes, newNode]);
+      setNodes(prev => [...prev, newNode]);
+
+      // Creator opened by clicking an empty cell mid-connection → wire the
+      // new node to the source automatically
+      if (pendingConnectFromRef.current) {
+        const newConnection = {
+          id: genId(),
+          from: pendingConnectFromRef.current,
+          to: newNode.id,
+          label: '',
+          iconId: null,
+          rotation: 0,
+          lineType: 'solid'
+        };
+        setConnections(prev => [...prev, newConnection]);
+        pendingConnectFromRef.current = null;
+      }
     }
 
     setShowNodeCreator(false);
@@ -1460,6 +1481,18 @@ export default function Nodex() {
       e.preventDefault();
     } else if (isCreatingZone && e.button === 0) {
       setZoneSelectionStart(pixelToAxial(worldX, worldY));
+    } else if (connectingFrom && e.button === 0) {
+      // Clicking an empty cell mid-connection creates a pre-connected node
+      const { q, r } = pixelToAxial(worldX, worldY);
+      const hasNode = nodes.some(n => n.q === q && n.r === r);
+      if (!hasNode) {
+        openNodeCreator(q, r);
+        // Set after openNodeCreator — its resetNodeForm clears the ref
+        pendingConnectFromRef.current = connectingFrom.id;
+        setConnectingFrom(null);
+        setHoveredCell(null);
+      }
+      // Clicks on nodes are handled by the node's own click handler
     } else if (e.button === 0) {
       // Marquee (box) selection — Ctrl held keeps the existing selection
       const additive = e.ctrlKey || e.metaKey;
@@ -1556,8 +1589,10 @@ export default function Nodex() {
       setSelectedZoneCells(cells);
     }
 
-    // Check hover over empty cells (skip if hovering a connection)
-    if (!draggingNode && !isPanning && !connectingFrom && !isCreatingZone && !hoveredConnection && !marquee) {
+    // Check hover over empty cells (skip if hovering a connection).
+    // Stays active while connecting — clicking an empty cell then creates a
+    // pre-connected node.
+    if (!draggingNode && !isPanning && !isCreatingZone && !hoveredConnection && !marquee) {
       const { q, r } = pixelToAxial(worldX, worldY);
       const hasNode = nodes.some(n => n.q === q && n.r === r);
       
@@ -2059,7 +2094,9 @@ export default function Nodex() {
           <span>Connections: {connections.length}</span>
           <span>Zones: {zones.length}</span>
           {connectingFrom && (
-            <span className="text-amber-400">Connecting from: {connectingFrom.label}</span>
+            <span className="text-amber-400">
+              Connecting from: {connectingFrom.label} — click a node to link, or an empty cell to create one
+            </span>
           )}
           {selectedNodes.length > 1 && (
             <span className="text-blue-400">Selected: {selectedNodes.length}</span>
@@ -2455,18 +2492,22 @@ export default function Nodex() {
                 onClick={(e) => {
                   e.stopPropagation();
                   openNodeCreator(hoveredCell.q, hoveredCell.r);
+                  if (connectingFrom) {
+                    pendingConnectFromRef.current = connectingFrom.id;
+                    setConnectingFrom(null);
+                  }
                   setHoveredCell(null);
                 }}
                 className="cursor-pointer"
               >
                 <polygon
                   points={getHexagonPoints(0, 0, HEX_SIZE)}
-                  fill="#3b82f6"
+                  fill={connectingFrom ? '#f59e0b' : '#3b82f6'}
                   opacity="0.2"
-                  stroke="#3b82f6"
+                  stroke={connectingFrom ? '#f59e0b' : '#3b82f6'}
                   strokeWidth="2"
                 />
-                <circle cx="0" cy="0" r="15" fill="#3b82f6" />
+                <circle cx="0" cy="0" r="15" fill={connectingFrom ? '#f59e0b' : '#3b82f6'} />
                 <line x1="-8" y1="0" x2="8" y2="0" stroke="white" strokeWidth="2.5" strokeLinecap="round" />
                 <line x1="0" y1="-8" x2="0" y2="8" stroke="white" strokeWidth="2.5" strokeLinecap="round" />
               </g>
