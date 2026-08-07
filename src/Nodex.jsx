@@ -118,6 +118,88 @@ const buildHexRingCells = (cq, cr, radius) => {
   return cells;
 };
 
+// Determine a zone's shape — stored on zones created after shapes were added,
+// inferred from the cell layout for zones loaded from older files
+const inferZoneShape = (zone) => {
+  if (zone.shape) return zone.shape;
+  const qs = zone.cells.map(c => c.q);
+  const rs = zone.cells.map(c => c.r);
+  const w = Math.max(...qs) - Math.min(...qs) + 1;
+  const h = Math.max(...rs) - Math.min(...rs) + 1;
+  if (zone.cells.length === w * h) return 'rectangle';
+  // A full hex blob of radius R has 3R² + 3R + 1 cells
+  const R = Math.round((Math.sqrt(12 * zone.cells.length - 3) - 3) / 6);
+  if (3 * R * R + 3 * R + 1 === zone.cells.length) return 'hexagon';
+  return 'circular';
+};
+
+// Center cell of a zone (cube-rounded centroid)
+const zoneCenterCell = (zone) => {
+  const cq = zone.cells.reduce((s, c) => s + c.q, 0) / zone.cells.length;
+  const cr = zone.cells.reduce((s, c) => s + c.r, 0) / zone.cells.length;
+  return axialRound(cq, cr);
+};
+
+// Where to draw a zone's label, from its labelSide (top/bottom/left/right/
+// center) and labelPlacement (inside/outside — ignored for center).
+// Defaults: center, matching the pre-labelSide behaviour.
+//
+// Top/bottom edges are measured at the label's x (and left/right at its y):
+// a q/r rectangle is a slanted parallelogram in pixel space, so the bounding
+// box edge can sit far away from the cells at the center. Vertical alignment
+// uses explicit baseline offsets — dominant-baseline is unreliable across
+// renderers (and in exported SVGs).
+const getZoneLabelLayout = (zone) => {
+  const side = zone.labelSide || 'center';
+  const inside = (zone.labelPlacement || 'inside') === 'inside';
+  const pts = zone.cells.map(c => axialToPixel(c.q, c.r));
+  const V = HEX_SIZE * Math.sqrt(3) / 2; // vertical half-extent of a cell
+
+  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+  pts.forEach(p => {
+    minX = Math.min(minX, p.x - HEX_SIZE);
+    maxX = Math.max(maxX, p.x + HEX_SIZE);
+    minY = Math.min(minY, p.y - V);
+    maxY = Math.max(maxY, p.y + V);
+  });
+  const cx = (minX + maxX) / 2;
+  const cy = (minY + maxY) / 2;
+  const pad = 8;
+  const ASCENT = 11;  // ≈ cap height above baseline at fontSize 14
+  const DESCENT = 4;  // ≈ descent below baseline
+  const MID = 5;      // baseline shift that visually centers 14px text
+
+  // Zone edges at the label's cross position
+  const colBand = pts.filter(p => Math.abs(p.x - cx) <= HEX_SIZE);
+  const rowBand = pts.filter(p => Math.abs(p.y - cy) <= V);
+  const topEdge = (colBand.length ? Math.min(...colBand.map(p => p.y)) - V : minY);
+  const bottomEdge = (colBand.length ? Math.max(...colBand.map(p => p.y)) + V : maxY);
+  const leftEdge = (rowBand.length ? Math.min(...rowBand.map(p => p.x)) - HEX_SIZE : minX);
+  const rightEdge = (rowBand.length ? Math.max(...rowBand.map(p => p.x)) + HEX_SIZE : maxX);
+
+  switch (side) {
+    case 'top':
+      return inside
+        ? { x: cx, y: topEdge + pad + ASCENT, textAnchor: 'middle' }
+        : { x: cx, y: topEdge - pad - DESCENT, textAnchor: 'middle' };
+    case 'bottom':
+      return inside
+        ? { x: cx, y: bottomEdge - pad - DESCENT, textAnchor: 'middle' }
+        : { x: cx, y: bottomEdge + pad + ASCENT, textAnchor: 'middle' };
+    case 'left':
+      return inside
+        ? { x: leftEdge + pad, y: cy + MID, textAnchor: 'start' }
+        : { x: leftEdge - pad, y: cy + MID, textAnchor: 'end' };
+    case 'right':
+      return inside
+        ? { x: rightEdge - pad, y: cy + MID, textAnchor: 'end' }
+        : { x: rightEdge + pad, y: cy + MID, textAnchor: 'start' };
+    case 'center':
+    default:
+      return { x: cx, y: cy + MID, textAnchor: 'middle' };
+  }
+};
+
 // Round region: cells whose center lies within a Euclidean pixel radius —
 // unlike buildHexRingCells this produces a circle, not a bigger hexagon
 const buildCircularCells = (cq, cr, hexRadius) => {
@@ -310,8 +392,79 @@ export default function Nodex() {
     setTabs(prevTabs => prevTabs.map(t => t.id === activeTabIdRef.current ? { ...t, ...updates } : t));
   };
   
-  // Set diagrams for active tab - use functional update for diagrams too
+  // Undo/redo history, per tab. Snapshots of the whole `diagrams` map are
+  // pushed before each change; rapid bursts (dragging) coalesce into one
+  // entry via the 500 ms window. `historyVersion` just forces re-renders so
+  // the Undo/Redo buttons enable/disable correctly.
+  const historyRef = useRef({});
+  const [, setHistoryVersion] = useState(0);
+  const bumpHistory = () => setHistoryVersion(v => v + 1);
+
+  // Unsaved-changes tracking for the beforeunload guard
+  const dirtyRef = useRef(false);
+
+  const getHistory = (tabId) => {
+    if (!historyRef.current[tabId]) {
+      historyRef.current[tabId] = { past: [], future: [], lastPush: 0 };
+    }
+    return historyRef.current[tabId];
+  };
+
+  const recordHistory = (tabId, diagramsSnapshot) => {
+    const h = getHistory(tabId);
+    const now = performance.now();
+    if (now - h.lastPush > 500) {
+      h.past.push(diagramsSnapshot);
+      if (h.past.length > 100) h.past.shift();
+      h.future = [];
+      bumpHistory();
+    }
+    h.lastPush = now;
+  };
+
+  const undo = () => {
+    const tabId = activeTabIdRef.current;
+    const h = getHistory(tabId);
+    if (h.past.length === 0) return;
+    const tab = tabsRef.current.find(t => t.id === tabId);
+    if (!tab) return;
+    const prevDiagrams = h.past.pop();
+    h.future.push(tab.diagrams);
+    h.lastPush = 0;
+    dirtyRef.current = true;
+    setTabs(prevTabs => prevTabs.map(t => t.id === tabId ? { ...t, diagrams: prevDiagrams } : t));
+    setSelectedNodeIds([]);
+    setSelectedZone(null);
+    bumpHistory();
+  };
+
+  const redo = () => {
+    const tabId = activeTabIdRef.current;
+    const h = getHistory(tabId);
+    if (h.future.length === 0) return;
+    const tab = tabsRef.current.find(t => t.id === tabId);
+    if (!tab) return;
+    const nextDiagrams = h.future.pop();
+    h.past.push(tab.diagrams);
+    h.lastPush = 0;
+    dirtyRef.current = true;
+    setTabs(prevTabs => prevTabs.map(t => t.id === tabId ? { ...t, diagrams: nextDiagrams } : t));
+    setSelectedNodeIds([]);
+    setSelectedZone(null);
+    bumpHistory();
+  };
+
+  const activeHistory = historyRef.current[activeTabId];
+  const canUndo = (activeHistory?.past.length || 0) > 0;
+  const canRedo = (activeHistory?.future.length || 0) > 0;
+
+  // Set diagrams for active tab - use functional update for diagrams too.
+  // Every diagram mutation flows through here, so this is where history is
+  // recorded and the document is marked dirty.
   const setDiagrams = (newDiagrams) => {
+    const tab = tabsRef.current.find(t => t.id === activeTabIdRef.current);
+    if (tab) recordHistory(tab.id, tab.diagrams);
+    dirtyRef.current = true;
     setTabs(prevTabs => prevTabs.map(t => {
       if (t.id !== activeTabIdRef.current) return t;
       const updatedDiagrams = typeof newDiagrams === 'function' ? newDiagrams(t.diagrams) : newDiagrams;
@@ -340,6 +493,8 @@ export default function Nodex() {
   clipboardRef.current = clipboard;
   const nodesRef = useRef(nodes);
   nodesRef.current = nodes;
+  const connectionsRef = useRef(connections);
+  connectionsRef.current = connections;
 
   // UI State
   const [showNodeCreator, setShowNodeCreator] = useState(false);
@@ -355,20 +510,41 @@ export default function Nodex() {
   const [newZoneData, setNewZoneData] = useState({
     label: '',
     color: '#3b82f6',
-    cells: []
+    cells: [],
+    labelSide: 'center',
+    labelPlacement: 'inside'
   });
   const [draggingNode, setDraggingNode] = useState(null);
   const [dragOffset, setDragOffset] = useState({ x: 0, y: 0 });
   const [connectingFrom, setConnectingFrom] = useState(null);
   const [mousePos, setMousePos] = useState({ x: 0, y: 0 });
-  const [selectedNode, setSelectedNode] = useState(null);
-  const [selectedZone, setSelectedZone] = useState(null);
-  
+  const [selectedNodeIds, setSelectedNodeIds] = useState([]);
+  // Only the id is stored — the zone object is derived from `zones` so the
+  // selection always reflects the latest edit/resize instead of a stale copy
+  const [selectedZoneId, setSelectedZoneId] = useState(null);
+  const selectedZone = zones.find(z => z.id === selectedZoneId) || null;
+  const setSelectedZone = (zone) => setSelectedZoneId(zone ? zone.id : null);
+
+  // Derived selection — `selectedNode` is only set when exactly one node is
+  // selected (drives the single-node panel); bulk actions use the id list
+  const selectedNodes = nodes.filter(n => selectedNodeIds.includes(n.id));
+  const selectedNode = selectedNodes.length === 1 ? selectedNodes[0] : null;
+  // Compat shim: select a single node (or clear) — used throughout
+  const setSelectedNode = (node) => setSelectedNodeIds(node ? [node.id] : []);
+
   // Refs for selected items to avoid stale closures
+  const selectedNodeIdsRef = useRef([]);
+  selectedNodeIdsRef.current = selectedNodeIds;
   const selectedNodeRef = useRef(null);
   selectedNodeRef.current = selectedNode;
   const selectedZoneRef = useRef(null);
   selectedZoneRef.current = selectedZone;
+
+  // Marquee (box) selection, group-drag bookkeeping, zone resizing
+  const [marquee, setMarquee] = useState(null);
+  const didMarqueeRef = useRef(false);
+  const dragGroupRef = useRef(null);
+  const [resizingZone, setResizingZone] = useState(null);
   
   const [hoveredConnection, setHoveredConnection] = useState(null);
   const [editingConnection, setEditingConnection] = useState(null);
@@ -415,8 +591,10 @@ export default function Nodex() {
     if (!autosave) return;
     const timer = setTimeout(async () => {
       try {
+        let wrote = false;
         if (projectHandleRef.current) {
           await writeToHandle(projectHandleRef.current, getProjectData());
+          wrote = true;
         }
         for (const t of tabsRef.current) {
           if (t.fileHandle) {
@@ -426,8 +604,10 @@ export default function Nodex() {
               diagrams: t.diagrams,
               currentPath: t.currentPath
             });
+            wrote = true;
           }
         }
+        if (wrote) dirtyRef.current = false;
       } catch (err) {
         console.warn('Autosave failed:', err);
       }
@@ -500,7 +680,7 @@ export default function Nodex() {
   // Tab management
   const addTab = (name = 'Untitled', diagrams = null, fileHandle = null) => {
     const newTab = createTab(name, diagrams, fileHandle);
-    setTabs([...tabs, newTab]);
+    setTabs(prevTabs => [...prevTabs, newTab]);
     setActiveTabId(newTab.id);
     setSelectedNode(null);
     setSelectedZone(null);
@@ -524,7 +704,8 @@ export default function Nodex() {
   };
 
   const renameTab = (tabId, newName) => {
-    setTabs(tabs.map(t => t.id === tabId ? { ...t, name: newName } : t));
+    dirtyRef.current = true;
+    setTabs(prevTabs => prevTabs.map(t => t.id === tabId ? { ...t, name: newName } : t));
   };
 
   // File operations
@@ -574,6 +755,7 @@ export default function Nodex() {
     if (tab?.fileHandle) {
       try {
         await writeToHandle(tab.fileHandle, data);
+        dirtyRef.current = false;
         return;
       } catch (err) {
         if (err.name === 'AbortError' || err.name === 'NotAllowedError') return;
@@ -591,6 +773,7 @@ export default function Nodex() {
         setTabs(prevTabs => prevTabs.map(t =>
           t.id === activeTabIdRef.current ? { ...t, fileHandle: handle } : t
         ));
+        dirtyRef.current = false;
         return;
       } catch (err) {
         if (err.name === 'AbortError') return;
@@ -598,6 +781,7 @@ export default function Nodex() {
     }
 
     downloadJson(data);
+    dirtyRef.current = false;
   };
 
   // Project = every open tab in a single file
@@ -617,6 +801,7 @@ export default function Nodex() {
     if (projectHandleRef.current) {
       try {
         await writeToHandle(projectHandleRef.current, data);
+        dirtyRef.current = false;
         return;
       } catch (err) {
         if (err.name === 'AbortError' || err.name === 'NotAllowedError') return;
@@ -632,6 +817,7 @@ export default function Nodex() {
         });
         await writeToHandle(handle, data);
         setProjectHandle(handle);
+        dirtyRef.current = false;
         return;
       } catch (err) {
         if (err.name === 'AbortError') return;
@@ -645,6 +831,7 @@ export default function Nodex() {
     a.download = 'nodex-project.json';
     a.click();
     URL.revokeObjectURL(url);
+    dirtyRef.current = false;
   };
 
   // A workspace we can silently replace: one unlinked tab with nothing drawn
@@ -728,49 +915,76 @@ export default function Nodex() {
     e.target.value = '';
   };
 
-  // Drag and drop file handling — only react to actual files being dragged
-  // in; dragging selected text/nodes must not trigger the drop overlay
-  const isFileDrag = (e) => {
-    const types = e.dataTransfer?.types;
-    return types && Array.from(types).includes('Files');
-  };
+  // Drag-and-drop file handling. Window-level with a depth counter: the
+  // per-element version flickered (entering the overlay fired dragleave on
+  // the canvas) and a drop landing on the toolbar/sidebar hit the browser
+  // default, opening the JSON as a page. Only reacts to real file drags —
+  // dragging selected text must not trigger the overlay.
+  useEffect(() => {
+    let depth = 0;
+    const isFileDrag = (e) => Array.from(e.dataTransfer?.types || []).includes('Files');
 
-  const handleFileDragOver = (e) => {
-    if (!isFileDrag(e)) return;
-    e.preventDefault();
-    e.stopPropagation();
-    setIsDraggingFile(true);
-  };
+    const onDragEnter = (e) => {
+      if (!isFileDrag(e)) return;
+      e.preventDefault();
+      depth++;
+      setIsDraggingFile(true);
+    };
+    const onDragOver = (e) => {
+      if (!isFileDrag(e)) return;
+      e.preventDefault();
+    };
+    const onDragLeave = (e) => {
+      if (!isFileDrag(e)) return;
+      depth = Math.max(0, depth - 1);
+      if (depth === 0) setIsDraggingFile(false);
+    };
+    const onDrop = (e) => {
+      if (!isFileDrag(e)) return;
+      e.preventDefault();
+      depth = 0;
+      setIsDraggingFile(false);
 
-  const handleFileDragLeave = (e) => {
-    e.preventDefault();
-    e.stopPropagation();
-    setIsDraggingFile(false);
-  };
+      const file = e.dataTransfer.files?.[0];
+      if (!file) return;
+      if (!file.name.endsWith('.json')) {
+        alert('Please drop a .json file');
+        return;
+      }
+      const reader = new FileReader();
+      reader.onload = (event) => {
+        try {
+          loadFileData(JSON.parse(event.target.result), file.name);
+        } catch (err) {
+          alert('Failed to load file: Invalid format');
+        }
+      };
+      reader.readAsText(file);
+    };
 
-  const handleFileDrop = (e) => {
-    e.preventDefault();
-    e.stopPropagation();
-    setIsDraggingFile(false);
+    window.addEventListener('dragenter', onDragEnter);
+    window.addEventListener('dragover', onDragOver);
+    window.addEventListener('dragleave', onDragLeave);
+    window.addEventListener('drop', onDrop);
+    return () => {
+      window.removeEventListener('dragenter', onDragEnter);
+      window.removeEventListener('dragover', onDragOver);
+      window.removeEventListener('dragleave', onDragLeave);
+      window.removeEventListener('drop', onDrop);
+    };
+  }, []);
 
-    const file = e.dataTransfer.files?.[0];
-    if (!file) return;
-    if (!file.name.endsWith('.json')) {
-      alert('Please drop a .json file');
-      return;
-    }
-    
-    const reader = new FileReader();
-    reader.onload = (event) => {
-      try {
-        const data = JSON.parse(event.target.result);
-        loadFileData(data, file.name);
-      } catch (err) {
-        alert('Failed to load file: Invalid format');
+  // Warn before leaving the page with unsaved changes
+  useEffect(() => {
+    const handler = (e) => {
+      if (dirtyRef.current) {
+        e.preventDefault();
+        e.returnValue = '';
       }
     };
-    reader.readAsText(file);
-  };
+    window.addEventListener('beforeunload', handler);
+    return () => window.removeEventListener('beforeunload', handler);
+  }, []);
 
   // Bounding box (world coordinates) of everything in the current diagram —
   // exports must cover all content, not just what's scrolled into view
@@ -789,10 +1003,17 @@ export default function Nodex() {
       // Label below the hexagon — generous width since text size is unknown here
       include(p.x, p.y + HEX_SIZE + 22, 8 + n.label.length * 4);
     });
-    zones.forEach(z => z.cells.forEach(c => {
-      const p = axialToPixel(c.q, c.r);
-      include(p.x, p.y, HEX_SIZE);
-    }));
+    zones.forEach(z => {
+      z.cells.forEach(c => {
+        const p = axialToPixel(c.q, c.r);
+        include(p.x, p.y, HEX_SIZE);
+      });
+      // Zone labels can sit outside the cells — cover them too
+      if (z.label && z.cells.length > 0) {
+        const layout = getZoneLabelLayout(z);
+        include(layout.x, layout.y, 12 + z.label.length * 4.5);
+      }
+    });
 
     if (minX === Infinity) return null;
     const margin = 30;
@@ -825,6 +1046,9 @@ export default function Nodex() {
     // Neutralize the pan/zoom transform — the viewBox does the framing now
     const rootGroup = clone.querySelector('g');
     if (rootGroup) rootGroup.removeAttribute('transform');
+
+    // Interaction-only elements (resize handles etc.) don't belong in exports
+    clone.querySelectorAll('.ui-overlay').forEach(el => el.remove());
 
     // Background
     const bg = document.createElementNS(SVG_NS, 'rect');
@@ -912,52 +1136,95 @@ export default function Nodex() {
   };
 
   // Copy-paste functionality — read through refs so the keyboard shortcut
-  // handler (registered once) never operates on stale state
-  const copyNode = () => {
-    const node = selectedNodeRef.current;
-    if (node) {
-      setClipboard({ type: 'node', data: { ...node } });
-    }
-  };
-
-  const pasteNode = () => {
-    const clip = clipboardRef.current;
-    if (!clip || clip.type !== 'node') return;
-
-    const nodeData = clip.data;
-    const currentNodes = nodesRef.current;
-
-    // Find a non-overlapping position, spiralling outward ring by ring
-    let newQ = nodeData.q + 1;
-    let newR = nodeData.r;
-    const directions = [
-      { q: 1, r: 0 }, { q: 0, r: 1 }, { q: -1, r: 1 },
-      { q: -1, r: 0 }, { q: 0, r: -1 }, { q: 1, r: -1 }
-    ];
-    outer:
-    for (let ring = 1; ring <= 10; ring++) {
-      for (const dir of directions) {
-        const q = nodeData.q + dir.q * ring;
-        const r = nodeData.r + dir.r * ring;
-        if (!currentNodes.some(n => n.q === q && n.r === r)) {
-          newQ = q;
-          newR = r;
-          break outer;
-        }
+  // handler (registered once) never operates on stale state. Copying a
+  // multi-selection also captures the connections between its members.
+  const buildClipFromSelection = () => {
+    const ids = selectedNodeIdsRef.current;
+    const sel = nodesRef.current.filter(n => ids.includes(n.id));
+    if (sel.length === 0) return null;
+    if (sel.length === 1) return { type: 'node', data: { ...sel[0] } };
+    const idSet = new Set(sel.map(n => n.id));
+    const internalConns = connectionsRef.current.filter(c => idSet.has(c.from) && idSet.has(c.to));
+    return {
+      type: 'nodes',
+      data: {
+        nodes: sel.map(n => ({ ...n })),
+        connections: internalConns.map(c => ({ ...c }))
       }
+    };
+  };
+
+  const copyNode = () => {
+    const clip = buildClipFromSelection();
+    if (clip) setClipboard(clip);
+  };
+
+  const pasteClip = (clip) => {
+    if (!clip) return;
+
+    const currentNodes = nodesRef.current;
+    const occupied = new Set(currentNodes.map(n => `${n.q},${n.r}`));
+    // Candidate offsets, spiralling outward ring by ring
+    const deltas = buildHexRingCells(0, 0, 12).slice(1);
+
+    if (clip.type === 'node') {
+      const nodeData = clip.data;
+      const delta = deltas.find(d => !occupied.has(`${nodeData.q + d.q},${nodeData.r + d.r}`)) || { q: 1, r: 0 };
+
+      // "Server 2" → "Server 3"; labels without a trailing number are kept as-is.
+      // Keeps bumping past numbers already taken so repeated pastes don't collide.
+      let label = nodeData.label;
+      const numMatch = label.match(/^(.*?)(\d+)(\s*)$/);
+      if (numMatch) {
+        const [, prefix, num, trail] = numMatch;
+        let next = parseInt(num, 10) + 1;
+        while (currentNodes.some(n => n.label === `${prefix}${next}${trail}`)) next++;
+        label = `${prefix}${next}${trail}`;
+      }
+
+      const newNode = {
+        ...nodeData,
+        id: genId(),
+        q: nodeData.q + delta.q,
+        r: nodeData.r + delta.r,
+        label
+      };
+      setNodes(prev => [...prev, newNode]);
+      setSelectedNodeIds([newNode.id]);
+      return;
     }
 
-    const newNode = {
-      ...nodeData,
-      id: genId(),
-      q: newQ,
-      r: newR,
-      label: `${nodeData.label} (copy)`
-    };
+    if (clip.type === 'nodes') {
+      const { nodes: members, connections: memberConns } = clip.data;
+      // Shift the whole group by one offset that leaves every member on a
+      // free cell, preserving the group's internal layout
+      const delta = deltas.find(d =>
+        members.every(m => !occupied.has(`${m.q + d.q},${m.r + d.r}`))
+      ) || { q: 1, r: 0 };
 
-    setNodes(prev => [...prev, newNode]);
-    setSelectedNode(newNode);
+      const idMap = {};
+      const newNodes = members.map(m => {
+        const nid = genId();
+        idMap[m.id] = nid;
+        return { ...m, id: nid, q: m.q + delta.q, r: m.r + delta.r };
+      });
+      const newConns = memberConns.map(c => ({
+        ...c,
+        id: genId(),
+        from: idMap[c.from],
+        to: idMap[c.to]
+      }));
+
+      setNodes(prev => [...prev, ...newNodes]);
+      if (newConns.length > 0) setConnections(prev => [...prev, ...newConns]);
+      setSelectedNodeIds(newNodes.map(n => n.id));
+    }
   };
+
+  const pasteNode = () => pasteClip(clipboardRef.current);
+
+  // Ctrl+D: copy + paste in one step, without touching the clipboard
+  const duplicateSelection = () => pasteClip(buildClipFromSelection());
 
   // Zoom controls
   const zoomIn = () => setZoom(prev => Math.min(prev * 1.2, 3));
@@ -1109,7 +1376,9 @@ export default function Nodex() {
     setNewZoneData({
       label: zone.label,
       color: zone.color,
-      cells: zone.cells
+      cells: zone.cells,
+      labelSide: zone.labelSide || 'center',
+      labelPlacement: zone.labelPlacement || 'inside'
     });
     setEditingZone(zone);
     setShowZoneCreator(true);
@@ -1120,7 +1389,9 @@ export default function Nodex() {
       setNewZoneData({
         label: '',
         color: '#3b82f6',
-        cells: selectedZoneCells
+        cells: selectedZoneCells,
+        labelSide: 'center',
+        labelPlacement: 'inside'
       });
       setShowZoneCreator(true);
     }
@@ -1128,9 +1399,16 @@ export default function Nodex() {
 
   const createOrUpdateZone = () => {
     if (editingZone) {
-      setZones(zones.map(z => 
-        z.id === editingZone.id 
-          ? { ...z, label: newZoneData.label, color: newZoneData.color, cells: newZoneData.cells }
+      setZones(zones.map(z =>
+        z.id === editingZone.id
+          ? {
+              ...z,
+              label: newZoneData.label,
+              color: newZoneData.color,
+              cells: newZoneData.cells,
+              labelSide: newZoneData.labelSide,
+              labelPlacement: newZoneData.labelPlacement
+            }
           : z
       ));
     } else {
@@ -1138,7 +1416,10 @@ export default function Nodex() {
         id: genId(),
         label: newZoneData.label,
         color: newZoneData.color,
-        cells: selectedZoneCells
+        cells: selectedZoneCells,
+        shape: zoneShape,
+        labelSide: newZoneData.labelSide,
+        labelPlacement: newZoneData.labelPlacement
       };
       setZones([...zones, newZone]);
     }
@@ -1146,7 +1427,7 @@ export default function Nodex() {
     setShowZoneCreator(false);
     setIsCreatingZone(false);
     setSelectedZoneCells([]);
-    setNewZoneData({ label: '', color: '#3b82f6', cells: [] });
+    setNewZoneData({ label: '', color: '#3b82f6', cells: [], labelSide: 'center', labelPlacement: 'inside' });
     setEditingZone(null);
   };
 
@@ -1168,21 +1449,29 @@ export default function Nodex() {
   const handleCanvasMouseDown = (e) => {
     if (e.target.closest('.node-element')) return;
 
+    const rect = canvasRef.current.getBoundingClientRect();
+    const worldX = (e.clientX - rect.left - viewOffset.x) / zoom;
+    const worldY = (e.clientY - rect.top - viewOffset.y) / zoom;
+    didMarqueeRef.current = false;
+
     if (e.button === 1 || (e.button === 0 && e.shiftKey && !isCreatingZone)) {
       setIsPanning(true);
       setPanStart({ x: e.clientX - viewOffset.x, y: e.clientY - viewOffset.y });
       e.preventDefault();
     } else if (isCreatingZone && e.button === 0) {
-      const rect = canvasRef.current.getBoundingClientRect();
-      const screenX = e.clientX - rect.left;
-      const screenY = e.clientY - rect.top;
-      const worldX = (screenX - viewOffset.x) / zoom;
-      const worldY = (screenY - viewOffset.y) / zoom;
-      const { q, r } = pixelToAxial(worldX, worldY);
-      
-      setZoneSelectionStart({ q, r });
+      setZoneSelectionStart(pixelToAxial(worldX, worldY));
+    } else if (e.button === 0) {
+      // Marquee (box) selection — Ctrl held keeps the existing selection
+      const additive = e.ctrlKey || e.metaKey;
+      if (!additive) {
+        setSelectedNodeIds([]);
+        setSelectedZone(null);
+        setConnectingFrom(null);
+      }
+      setMarquee({ start: { x: worldX, y: worldY }, end: { x: worldX, y: worldY }, additive });
+      e.preventDefault();
     } else {
-      setSelectedNode(null);
+      setSelectedNodeIds([]);
       setSelectedZone(null);
       setConnectingFrom(null);
     }
@@ -1198,6 +1487,38 @@ export default function Nodex() {
     const worldY = (screenY - viewOffset.y) / zoom;
     
     setMousePos({ x: worldX, y: worldY });
+
+    // Marquee selection drag
+    if (marquee) {
+      setMarquee(prev => prev ? { ...prev, end: { x: worldX, y: worldY } } : prev);
+    }
+
+    // Zone resize drag — rebuild the zone's cells from its shape + anchor
+    if (resizingZone) {
+      const cell = pixelToAxial(worldX, worldY);
+      let cells;
+      if (resizingZone.shape === 'rectangle') {
+        cells = [];
+        const minQ = Math.min(resizingZone.anchor.q, cell.q);
+        const maxQ = Math.max(resizingZone.anchor.q, cell.q);
+        const minR = Math.min(resizingZone.anchor.r, cell.r);
+        const maxR = Math.max(resizingZone.anchor.r, cell.r);
+        for (let qi = minQ; qi <= maxQ; qi++) {
+          for (let ri = minR; ri <= maxR; ri++) {
+            cells.push({ q: qi, r: ri });
+          }
+        }
+      } else {
+        const radius = Math.max(1, hexDistance(resizingZone.anchor.q, resizingZone.anchor.r, cell.q, cell.r));
+        const builder = resizingZone.shape === 'hexagon' ? buildHexRingCells : buildCircularCells;
+        cells = builder(resizingZone.anchor.q, resizingZone.anchor.r, radius);
+      }
+      setZones(prev => prev.map(z =>
+        z.id === resizingZone.id ? { ...z, cells, shape: resizingZone.shape } : z
+      ));
+      setHoveredCell(null);
+      return;
+    }
 
     // Zone selection drag
     if (isCreatingZone && zoneSelectionStart) {
@@ -1236,7 +1557,7 @@ export default function Nodex() {
     }
 
     // Check hover over empty cells (skip if hovering a connection)
-    if (!draggingNode && !isPanning && !connectingFrom && !isCreatingZone && !hoveredConnection) {
+    if (!draggingNode && !isPanning && !connectingFrom && !isCreatingZone && !hoveredConnection && !marquee) {
       const { q, r } = pixelToAxial(worldX, worldY);
       const hasNode = nodes.some(n => n.q === q && n.r === r);
       
@@ -1255,10 +1576,18 @@ export default function Nodex() {
         y: e.clientY - panStart.y
       });
     } else if (draggingNode) {
+      // Group drag: move every node captured at drag start by the same
+      // axial delta, preserving relative layout
       const { q, r } = pixelToAxial(worldX - dragOffset.x, worldY - dragOffset.y);
-      setNodes(nodes.map(n => 
-        n.id === draggingNode.id ? { ...n, q, r } : n
-      ));
+      const group = dragGroupRef.current;
+      if (group) {
+        const dq = q - group.anchor.q;
+        const dr = r - group.anchor.r;
+        setNodes(prev => prev.map(n => {
+          const start = group.positions[n.id];
+          return start ? { ...n, q: start.q + dq, r: start.r + dr } : n;
+        }));
+      }
     }
   };
 
@@ -1270,7 +1599,30 @@ export default function Nodex() {
   const handleCanvasMouseUp = () => {
     setIsPanning(false);
     setDraggingNode(null);
-    
+    dragGroupRef.current = null;
+    setResizingZone(null);
+
+    // Finish marquee selection: pick every node whose center is in the box.
+    // A near-zero box is just a click — keep the click's clear behavior.
+    if (marquee) {
+      const moved = Math.abs(marquee.end.x - marquee.start.x) > 5 || Math.abs(marquee.end.y - marquee.start.y) > 5;
+      if (moved) {
+        didMarqueeRef.current = true;
+        const x1 = Math.min(marquee.start.x, marquee.end.x);
+        const x2 = Math.max(marquee.start.x, marquee.end.x);
+        const y1 = Math.min(marquee.start.y, marquee.end.y);
+        const y2 = Math.max(marquee.start.y, marquee.end.y);
+        const ids = nodes
+          .filter(n => {
+            const p = axialToPixel(n.q, n.r);
+            return p.x >= x1 && p.x <= x2 && p.y >= y1 && p.y <= y2;
+          })
+          .map(n => n.id);
+        setSelectedNodeIds(prev => marquee.additive ? [...new Set([...prev, ...ids])] : ids);
+      }
+      setMarquee(null);
+    }
+
     if (isCreatingZone && zoneSelectionStart && selectedZoneCells.length > 0) {
       finishZoneCreation();
     }
@@ -1296,19 +1648,39 @@ export default function Nodex() {
       return;
     }
 
+    // Ctrl/Cmd+click toggles the node in/out of the multi-selection (no drag)
+    if (e.ctrlKey || e.metaKey) {
+      setSelectedNodeIds(prev =>
+        prev.includes(node.id) ? prev.filter(id => id !== node.id) : [...prev, node.id]
+      );
+      setSelectedZone(null);
+      return;
+    }
+
     const rect = canvasRef.current.getBoundingClientRect();
     const screenX = e.clientX - rect.left;
     const screenY = e.clientY - rect.top;
     const worldX = (screenX - viewOffset.x) / zoom;
     const worldY = (screenY - viewOffset.y) / zoom;
     const nodePos = axialToPixel(node.q, node.r);
-    
+
+    // Clicking a member of the current selection drags the whole group;
+    // clicking anything else selects (and drags) just that node
+    const ids = selectedNodeIdsRef.current.includes(node.id)
+      ? selectedNodeIdsRef.current
+      : [node.id];
+    const positions = {};
+    nodesRef.current.forEach(n => {
+      if (ids.includes(n.id)) positions[n.id] = { q: n.q, r: n.r };
+    });
+    dragGroupRef.current = { positions, anchor: { q: node.q, r: node.r } };
+
     setDragOffset({
       x: worldX - nodePos.x,
       y: worldY - nodePos.y
     });
     setDraggingNode(node);
-    setSelectedNode(node);
+    setSelectedNodeIds(ids);
     setSelectedZone(null);
     setHoveredCell(null);
   };
@@ -1351,32 +1723,37 @@ export default function Nodex() {
 
   const handleZoneClick = (e, zone) => {
     e.stopPropagation();
+    // A marquee drag that ended on this zone fires a click — ignore it
+    if (didMarqueeRef.current) return;
     setSelectedZone(zone);
     setSelectedNode(null);
   };
 
-  const deleteSelectedNode = () => {
-    const node = selectedNodeRef.current;
-    if (!node) return;
-    
+  // Deletes every selected node (single or bulk), their connections, and
+  // their nested diagrams
+  const deleteSelectedNodes = () => {
+    const ids = selectedNodeIdsRef.current;
+    if (ids.length === 0) return;
+    const idSet = new Set(ids);
     const pathKey = currentPathRef.current.join('/');
-    const nestedPathKey = [...currentPathRef.current, node.id.toString()].join('/');
-    
+
     setDiagrams(prev => {
       const currentDiag = prev[pathKey] || { nodes: [], connections: [], zones: [] };
       const newDiagrams = {
         ...prev,
         [pathKey]: {
           ...currentDiag,
-          nodes: currentDiag.nodes.filter(n => n.id !== node.id),
-          connections: currentDiag.connections.filter(c => c.from !== node.id && c.to !== node.id)
+          nodes: currentDiag.nodes.filter(n => !idSet.has(n.id)),
+          connections: currentDiag.connections.filter(c => !idSet.has(c.from) && !idSet.has(c.to))
         }
       };
-      delete newDiagrams[nestedPathKey];
+      ids.forEach(id => {
+        delete newDiagrams[[...currentPathRef.current, id.toString()].join('/')];
+      });
       return newDiagrams;
     });
-    
-    setSelectedNode(null);
+
+    setSelectedNodeIds([]);
   };
 
   const deleteConnection = (connectionId) => {
@@ -1409,31 +1786,63 @@ export default function Nodex() {
         }
         return;
       }
-      // Copy-paste — skip when typing in a field
       const inField = e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA';
-      if ((e.ctrlKey || e.metaKey) && e.key === 'c' && selectedNodeRef.current && !showNodeCreator && !showZoneCreator && !inField) {
+      const inModal = showNodeCreator || showZoneCreator || showConnectionEditor;
+
+      // Undo / redo
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z' && !inField && !inModal) {
+        e.preventDefault();
+        if (e.shiftKey) {
+          redo();
+        } else {
+          undo();
+        }
+        return;
+      }
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'y' && !inField && !inModal) {
+        e.preventDefault();
+        redo();
+        return;
+      }
+
+      // Select all nodes
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'a' && !inField && !inModal) {
+        e.preventDefault();
+        setSelectedNodeIds(nodesRef.current.map(n => n.id));
+        return;
+      }
+
+      // Copy-paste — skip when typing in a field
+      if ((e.ctrlKey || e.metaKey) && e.key === 'c' && selectedNodeIdsRef.current.length > 0 && !inModal && !inField) {
         e.preventDefault();
         copyNode();
       }
-      if ((e.ctrlKey || e.metaKey) && e.key === 'v' && clipboardRef.current && !showNodeCreator && !showZoneCreator && !inField) {
+      if ((e.ctrlKey || e.metaKey) && e.key === 'v' && clipboardRef.current && !inModal && !inField) {
         e.preventDefault();
         pasteNode();
       }
-
-      if ((e.key === 'Delete' || e.key === 'Backspace') && !showNodeCreator && !showZoneCreator && !showConnectionEditor) {
-        // Don't prevent default if we're in an input field
-        if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+      // Duplicate selection (also blocks the browser's bookmark dialog)
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'd' && !inModal && !inField) {
         e.preventDefault();
-        if (selectedNodeRef.current) {
-          deleteSelectedNode();
+        if (selectedNodeIdsRef.current.length > 0) duplicateSelection();
+      }
+
+      if ((e.key === 'Delete' || e.key === 'Backspace') && !inModal) {
+        // Don't prevent default if we're in an input field
+        if (inField) return;
+        e.preventDefault();
+        if (selectedNodeIdsRef.current.length > 0) {
+          deleteSelectedNodes();
         } else if (selectedZoneRef.current) {
           deleteZone(selectedZoneRef.current.id);
         }
       }
       if (e.key === 'Escape') {
         setConnectingFrom(null);
-        setSelectedNode(null);
+        setSelectedNodeIds([]);
         setSelectedZone(null);
+        setMarquee(null);
+        setResizingZone(null);
         if (showNodeCreator) {
           setShowNodeCreator(false);
           resetNodeForm();
@@ -1584,10 +1993,26 @@ export default function Nodex() {
             <Plus size={18} />
           </button>
           <button
-            onClick={copyNode}
-            disabled={!selectedNode}
+            onClick={undo}
+            disabled={!canUndo}
             className="p-2 hover:bg-slate-700 rounded transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
-            title="Copy Node (Ctrl+C)"
+            title="Undo (Ctrl+Z)"
+          >
+            <Undo size={18} />
+          </button>
+          <button
+            onClick={redo}
+            disabled={!canRedo}
+            className="p-2 hover:bg-slate-700 rounded transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
+            title="Redo (Ctrl+Y)"
+          >
+            <Redo size={18} />
+          </button>
+          <button
+            onClick={copyNode}
+            disabled={selectedNodes.length === 0}
+            className="p-2 hover:bg-slate-700 rounded transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
+            title="Copy Selection (Ctrl+C)"
           >
             <Copy size={18} />
           </button>
@@ -1595,13 +2020,13 @@ export default function Nodex() {
             onClick={pasteNode}
             disabled={!clipboard}
             className="p-2 hover:bg-slate-700 rounded transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
-            title="Paste Node (Ctrl+V)"
+            title="Paste (Ctrl+V)"
           >
             <Clipboard size={18} />
           </button>
           <button
-            onClick={deleteSelectedNode}
-            disabled={!selectedNode}
+            onClick={deleteSelectedNodes}
+            disabled={selectedNodes.length === 0}
             className="p-2 hover:bg-slate-700 rounded transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
             title="Delete Selected"
           >
@@ -1636,8 +2061,13 @@ export default function Nodex() {
           {connectingFrom && (
             <span className="text-amber-400">Connecting from: {connectingFrom.label}</span>
           )}
+          {selectedNodes.length > 1 && (
+            <span className="text-blue-400">Selected: {selectedNodes.length}</span>
+          )}
           {clipboard && (
-            <span className="text-green-400">Copied: {clipboard.data?.label}</span>
+            <span className="text-green-400">
+              Copied: {clipboard.type === 'nodes' ? `${clipboard.data.nodes.length} nodes` : clipboard.data?.label}
+            </span>
           )}
         </div>
       </div>
@@ -1771,8 +2201,14 @@ export default function Nodex() {
         <div className="mb-6 pt-4 border-t border-slate-700">
           <h3 className="text-sm font-semibold mb-3 text-slate-400">Shortcuts</h3>
           <ul className="text-xs space-y-1 text-slate-300">
-            <li><kbd className="px-1 bg-slate-600 rounded">Ctrl+C</kbd> Copy node</li>
-            <li><kbd className="px-1 bg-slate-600 rounded">Ctrl+V</kbd> Paste node</li>
+            <li><kbd className="px-1 bg-slate-600 rounded">Drag canvas</kbd> Box-select nodes</li>
+            <li><kbd className="px-1 bg-slate-600 rounded">Ctrl+Click</kbd> Add/remove from selection</li>
+            <li><kbd className="px-1 bg-slate-600 rounded">Ctrl+A</kbd> Select all nodes</li>
+            <li><kbd className="px-1 bg-slate-600 rounded">Ctrl+C</kbd> Copy selection</li>
+            <li><kbd className="px-1 bg-slate-600 rounded">Ctrl+V</kbd> Paste</li>
+            <li><kbd className="px-1 bg-slate-600 rounded">Ctrl+D</kbd> Duplicate selection</li>
+            <li><kbd className="px-1 bg-slate-600 rounded">Ctrl+Z</kbd> Undo</li>
+            <li><kbd className="px-1 bg-slate-600 rounded">Ctrl+Y</kbd> Redo</li>
             <li><kbd className="px-1 bg-slate-600 rounded">Ctrl+S</kbd> Save tab</li>
             <li><kbd className="px-1 bg-slate-600 rounded">Ctrl+Shift+S</kbd> Save project</li>
             <li><kbd className="px-1 bg-slate-600 rounded">Shift+Click</kbd> Open nested diagram</li>
@@ -1818,7 +2254,30 @@ export default function Nodex() {
                 Open Diagram
               </button>
               <button
-                onClick={deleteSelectedNode}
+                onClick={deleteSelectedNodes}
+                className="px-3 py-1.5 bg-red-500 hover:bg-red-600 rounded text-sm transition-colors"
+              >
+                <Trash2 size={16} />
+              </button>
+            </div>
+          </div>
+        )}
+
+        {selectedNodes.length > 1 && (
+          <div className="mb-4 p-4 bg-slate-700 rounded-lg">
+            <h3 className="text-sm font-semibold mb-2">{selectedNodes.length} nodes selected</h3>
+            <p className="text-xs text-slate-300 mb-3">
+              Drag any selected node to move the group. Ctrl+Click to add/remove nodes.
+            </p>
+            <div className="flex gap-2">
+              <button
+                onClick={copyNode}
+                className="flex-1 px-3 py-1.5 bg-blue-600 hover:bg-blue-700 rounded text-sm transition-colors"
+              >
+                Copy Group
+              </button>
+              <button
+                onClick={deleteSelectedNodes}
                 className="px-3 py-1.5 bg-red-500 hover:bg-red-600 rounded text-sm transition-colors"
               >
                 <Trash2 size={16} />
@@ -1847,6 +2306,7 @@ export default function Nodex() {
                 <p className="font-medium">{selectedZone.label}</p>
               </div>
               <p className="text-xs text-slate-300">{selectedZone.cells.length} cells</p>
+              <p className="text-xs text-slate-400 mt-1">Drag the round handle on the canvas to resize.</p>
             </div>
             <button
               onClick={() => deleteZone(selectedZone.id)}
@@ -1904,16 +2364,14 @@ export default function Nodex() {
         onMouseLeave={handleCanvasMouseLeave}
         onWheel={handleWheel}
         onContextMenu={(e) => e.preventDefault()}
-        onDragOver={handleFileDragOver}
-        onDragLeave={handleFileDragLeave}
-        onDrop={handleFileDrop}
-        style={{ 
-          cursor: isPanning ? 'grabbing' : isCreatingZone ? 'crosshair' : connectingFrom ? 'crosshair' : 'default'
+        style={{
+          cursor: isPanning ? 'grabbing' : isCreatingZone ? 'crosshair' : connectingFrom ? 'crosshair' : resizingZone ? 'nwse-resize' : 'default'
         }}
       >
-        {/* File drop overlay */}
+        {/* File drop overlay — pointer-events-none so it never steals the
+            drag events that keep it visible */}
         {isDraggingFile && (
-          <div className="absolute inset-0 bg-blue-500 bg-opacity-20 border-4 border-dashed border-blue-400 z-50 flex items-center justify-center">
+          <div className="fixed inset-0 bg-blue-500 bg-opacity-20 border-4 border-dashed border-blue-400 z-50 flex items-center justify-center pointer-events-none">
             <div className="bg-slate-800 px-6 py-4 rounded-lg shadow-lg text-center">
               <FolderOpen size={48} className="mx-auto mb-2 text-blue-400" />
               <p className="text-lg font-medium">Drop .json file to open</p>
@@ -1944,19 +2402,17 @@ export default function Nodex() {
 
             {/* Zone labels */}
             {zones.map(zone => {
-              if (zone.cells.length === 0) return null;
-              const centerQ = zone.cells.reduce((sum, c) => sum + c.q, 0) / zone.cells.length;
-              const centerR = zone.cells.reduce((sum, c) => sum + c.r, 0) / zone.cells.length;
-              const pos = axialToPixel(centerQ, centerR);
+              if (zone.cells.length === 0 || !zone.label) return null;
+              const layout = getZoneLabelLayout(zone);
               return (
                 <text
                   key={`zone-label-${zone.id}`}
-                  x={pos.x}
-                  y={pos.y - HEX_SIZE * 0.8}
+                  x={layout.x}
+                  y={layout.y}
                   fill={zone.color}
                   fontSize="14"
                   fontWeight="bold"
-                  textAnchor="middle"
+                  textAnchor={layout.textAnchor}
                   pointerEvents="none"
                   style={{ textShadow: '0 0 4px rgba(0,0,0,0.8)' }}
                 >
@@ -2070,6 +2526,7 @@ export default function Nodex() {
                     onMouseLeave={() => setHoveredConnection(null)}
                     onClick={(e) => {
                       e.stopPropagation();
+                      if (didMarqueeRef.current) return;
                       setEditingConnection(conn);
                       setShowConnectionEditor(true);
                     }}
@@ -2206,7 +2663,7 @@ export default function Nodex() {
             {nodes.map(node => {
               const pos = axialToPixel(node.q, node.r);
               const Icon = AVAILABLE_ICONS.find(i => i.id === node.iconId)?.icon || Server;
-              const isSelected = selectedNode?.id === node.id;
+              const isSelected = selectedNodeIds.includes(node.id);
               const isConnectingSource = connectingFrom?.id === node.id;
               const isConnectingTarget = connectingFrom && hoveredNode === node.id && connectingFrom.id !== node.id;
               const hasNested = hasNestedDiagram(node.id);
@@ -2279,6 +2736,62 @@ export default function Nodex() {
                 </g>
               );
             })}
+
+            {/* Marquee selection box */}
+            {marquee && (
+              <rect
+                x={Math.min(marquee.start.x, marquee.end.x)}
+                y={Math.min(marquee.start.y, marquee.end.y)}
+                width={Math.abs(marquee.end.x - marquee.start.x)}
+                height={Math.abs(marquee.end.y - marquee.start.y)}
+                fill="#3b82f6"
+                fillOpacity="0.08"
+                stroke="#3b82f6"
+                strokeWidth="1"
+                strokeDasharray="6,4"
+                pointerEvents="none"
+              />
+            )}
+
+            {/* Zone resize handle — corner for rectangles, radius for hex/circular */}
+            {selectedZone && !isCreatingZone && (() => {
+              const zone = zones.find(z => z.id === selectedZone.id);
+              if (!zone || zone.cells.length === 0) return null;
+              const shape = inferZoneShape(zone);
+              let handlePos, anchor;
+              if (shape === 'rectangle') {
+                const qs = zone.cells.map(c => c.q);
+                const rs = zone.cells.map(c => c.r);
+                anchor = { q: Math.min(...qs), r: Math.min(...rs) };
+                handlePos = axialToPixel(Math.max(...qs), Math.max(...rs));
+              } else {
+                const center = zoneCenterCell(zone);
+                const radius = Math.max(1, Math.max(...zone.cells.map(c => hexDistance(center.q, center.r, c.q, c.r))));
+                anchor = center;
+                handlePos = axialToPixel(center.q + radius, center.r);
+              }
+              return (
+                <g
+                  className="ui-overlay"
+                  transform={`translate(${handlePos.x}, ${handlePos.y})`}
+                  onMouseDown={(e) => {
+                    e.stopPropagation();
+                    e.preventDefault();
+                    setResizingZone({ id: zone.id, shape, anchor });
+                  }}
+                  style={{ cursor: 'nwse-resize' }}
+                >
+                  <circle r="9" fill="#0f172a" stroke={zone.color} strokeWidth="2" />
+                  <path
+                    d="M -3.5 3.5 L 3.5 -3.5 M -3.5 3.5 L -3.5 0.5 M -3.5 3.5 L -0.5 3.5 M 3.5 -3.5 L 3.5 -0.5 M 3.5 -3.5 L 0.5 -3.5"
+                    stroke={zone.color}
+                    strokeWidth="1.5"
+                    strokeLinecap="round"
+                    fill="none"
+                  />
+                </g>
+              );
+            })()}
 
             <defs>
               <marker
@@ -2452,6 +2965,50 @@ export default function Nodex() {
                       style={{ backgroundColor: color }}
                       title={label}
                     />
+                  ))}
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium mb-2">Label Position</label>
+                <div className="flex flex-wrap gap-2 mb-2">
+                  {[
+                    { id: 'center', label: 'Center' },
+                    { id: 'top', label: 'Top' },
+                    { id: 'bottom', label: 'Bottom' },
+                    { id: 'left', label: 'Left' },
+                    { id: 'right', label: 'Right' }
+                  ].map(side => (
+                    <button
+                      key={side.id}
+                      onClick={() => setNewZoneData({ ...newZoneData, labelSide: side.id })}
+                      className={`px-3 py-1.5 rounded text-sm transition-all ${
+                        newZoneData.labelSide === side.id
+                          ? 'bg-emerald-600 ring-2 ring-emerald-400'
+                          : 'bg-slate-700 hover:bg-slate-600'
+                      }`}
+                    >
+                      {side.label}
+                    </button>
+                  ))}
+                </div>
+                <div className="flex gap-2">
+                  {[
+                    { id: 'inside', label: 'Inside' },
+                    { id: 'outside', label: 'Outside' }
+                  ].map(place => (
+                    <button
+                      key={place.id}
+                      onClick={() => setNewZoneData({ ...newZoneData, labelPlacement: place.id })}
+                      disabled={newZoneData.labelSide === 'center'}
+                      className={`px-3 py-1.5 rounded text-sm transition-all disabled:opacity-30 disabled:cursor-not-allowed ${
+                        newZoneData.labelPlacement === place.id && newZoneData.labelSide !== 'center'
+                          ? 'bg-emerald-600 ring-2 ring-emerald-400'
+                          : 'bg-slate-700 hover:bg-slate-600'
+                      }`}
+                    >
+                      {place.label}
+                    </button>
                   ))}
                 </div>
               </div>
