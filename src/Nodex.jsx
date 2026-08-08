@@ -289,6 +289,78 @@ const zoneBoundaryPoint = (zone, fromPt, anchorPt) => {
   };
 };
 
+// Neighbor direction → index of the hex vertex pair forming the shared
+// edge (flat-top: vertex i sits at 60°·i). Shared by the zone outline
+// renderer and the silhouette geometry below so they can never disagree.
+const HEX_EDGE_DIRS = [
+  { dq: 1, dr: 0, vi: 0 },
+  { dq: 0, dr: 1, vi: 1 },
+  { dq: -1, dr: 1, vi: 2 },
+  { dq: -1, dr: 0, vi: 3 },
+  { dq: 0, dr: -1, vi: 4 },
+  { dq: 1, dr: -1, vi: 5 }
+];
+
+// Outer silhouette of a zone blob as line segments — exactly the edges the
+// zone outline draws (cell edges not shared with another cell of the zone)
+const zoneSilhouetteEdges = (zone) => {
+  const cellSet = new Set(zone.cells.map(c => `${c.q},${c.r}`));
+  const edges = [];
+  zone.cells.forEach(cell => {
+    const p = axialToPixel(cell.q, cell.r);
+    HEX_EDGE_DIRS.forEach(d => {
+      if (cellSet.has(`${cell.q + d.dq},${cell.r + d.dr}`)) return;
+      const a1 = (Math.PI / 3) * d.vi;
+      const a2 = (Math.PI / 3) * (d.vi + 1);
+      edges.push({
+        x1: p.x + HEX_SIZE * Math.cos(a1), y1: p.y + HEX_SIZE * Math.sin(a1),
+        x2: p.x + HEX_SIZE * Math.cos(a2), y2: p.y + HEX_SIZE * Math.sin(a2)
+      });
+    });
+  });
+  return edges;
+};
+
+const closestPointOnSegment = (px, py, x1, y1, x2, y2) => {
+  const dx = x2 - x1, dy = y2 - y1;
+  const L2 = dx * dx + dy * dy;
+  const t = L2 === 0 ? 0 : Math.max(0, Math.min(1, ((px - x1) * dx + (py - y1) * dy) / L2));
+  return { x: x1 + dx * t, y: y1 + dy * t };
+};
+
+// Nearest point on a silhouette to an outside point
+const closestSilhouettePointTo = (edges, p) => {
+  let best = null, bd = Infinity;
+  edges.forEach(e => {
+    const c = closestPointOnSegment(p.x, p.y, e.x1, e.y1, e.x2, e.y2);
+    const d = Math.hypot(c.x - p.x, c.y - p.y);
+    if (d < bd) { bd = d; best = c; }
+  });
+  return best;
+};
+
+// Closest pair of points between two silhouettes. For non-crossing
+// polygon boundaries the minimum is always achieved at a vertex of one
+// projected onto a segment of the other, so checking vertex↔segment both
+// ways is exact.
+const closestSilhouettePoints = (edgesA, edgesB) => {
+  if (edgesA.length === 0 || edgesB.length === 0) return null;
+  let best = null, bd = Infinity;
+  const consider = (pa, pb) => {
+    const d = Math.hypot(pb.x - pa.x, pb.y - pa.y);
+    if (d < bd) { bd = d; best = { a: pa, b: pb, dist: d }; }
+  };
+  edgesA.forEach(ea => {
+    edgesB.forEach(eb => {
+      consider({ x: ea.x1, y: ea.y1 }, closestPointOnSegment(ea.x1, ea.y1, eb.x1, eb.y1, eb.x2, eb.y2));
+      consider({ x: ea.x2, y: ea.y2 }, closestPointOnSegment(ea.x2, ea.y2, eb.x1, eb.y1, eb.x2, eb.y2));
+      consider(closestPointOnSegment(eb.x1, eb.y1, ea.x1, ea.y1, ea.x2, ea.y2), { x: eb.x1, y: eb.y1 });
+      consider(closestPointOnSegment(eb.x2, eb.y2, ea.x1, ea.y1, ea.x2, ea.y2), { x: eb.x2, y: eb.y2 });
+    });
+  });
+  return best;
+};
+
 // Walk hex rings around a center cell, out to `radius`
 const buildHexRingCells = (cq, cr, radius) => {
   const cells = [{ q: cq, r: cr }];
@@ -2512,6 +2584,7 @@ export default function Nodex() {
   // A connection is a polyline: 2 points for direct routing, 3 for angled
   // (horizontal from the source, right-angle bend, vertical into the target).
   const connGeoms = {};
+  const zoneEdgeCache = {}; // zone id → silhouette edges, shared across connections this render
   connections.forEach(conn => {
     // Endpoints can be nodes or zones. A zone endpoint anchors to its cell
     // nearest the other endpoint, which is a hex center — so all the node
@@ -2552,13 +2625,18 @@ export default function Nodex() {
     const epTo = resolveCenter(conn.to, conn.toType || 'node');
     if (!epFrom || !epTo) return;
 
-    // Center-to-center style: the line runs as if drawn between the entity
-    // centers (node center / zone centroid) and is trimmed where it crosses
-    // each silhouette. Falls back to the nearest cell when a concave zone's
-    // centroid lies outside the blob and the center ray misses it entirely.
+    // Closest-points style: a direct zone connection is the shortest
+    // connector between the two silhouettes (or node edge ↔ silhouette),
+    // so it always meets each boundary at its natural facing point — the
+    // way a hand-drawn line between two blobs would. Center-to-center ray
+    // trimming looked right on paper but crossed big/concave zones at
+    // spots skewed by where the centroid happened to sit.
     const a = { x: epFrom.x, y: epFrom.y };
     const b = { x: epTo.x, y: epTo.y };
     if (a.x === b.x && a.y === b.y) return;
+
+    const silEdges = (zone) =>
+      zoneEdgeCache[zone.id] || (zoneEdgeCache[zone.id] = zoneSilhouetteEdges(zone));
 
     const zoneEnd = (zoneEp, fromPt) => {
       const center = { x: zoneEp.x, y: zoneEp.y };
@@ -2587,8 +2665,23 @@ export default function Nodex() {
       if (!trimmed) return;
       pts = [trimmed.from, trimmed.to];
     } else {
-      const start = epFrom.type === 'zone' ? zoneEnd(epFrom, b) : nodeEdgePoint(a, b);
-      const end = epTo.type === 'zone' ? zoneEnd(epTo, a) : nodeEdgePoint(b, a);
+      let start = null, end = null;
+      if (epFrom.type === 'zone' && epTo.type === 'zone') {
+        const cp = closestSilhouettePoints(silEdges(epFrom.zone), silEdges(epTo.zone));
+        if (cp && cp.dist >= 4) { start = cp.a; end = cp.b; }
+      } else if (epFrom.type === 'zone') {
+        const pz = closestSilhouettePointTo(silEdges(epFrom.zone), b);
+        if (pz) { start = pz; end = nodeEdgePoint(b, pz); }
+      } else {
+        const pz = closestSilhouettePointTo(silEdges(epTo.zone), a);
+        if (pz) { start = nodeEdgePoint(a, pz); end = pz; }
+      }
+      if (!start || !end) {
+        // Silhouettes touch/overlap — trim the center-to-center ray
+        // instead so the connection stays visible and clickable
+        start = epFrom.type === 'zone' ? zoneEnd(epFrom, b) : nodeEdgePoint(a, b);
+        end = epTo.type === 'zone' ? zoneEnd(epTo, a) : nodeEdgePoint(b, a);
+      }
       if (Math.hypot(end.x - start.x, end.y - start.y) < 2) return;
       pts = [start, end];
     }
@@ -3381,16 +3474,7 @@ export default function Nodex() {
                 const isConnectTarget = connectingFrom && hoveredZone === zone.id &&
                   !(connectingFrom.kind === 'zone' && connectingFrom.id === zone.id);
                 const isZoneSelected = selectedZone?.id === zone.id;
-                // Neighbor direction → index of the hex vertex pair forming
-                // the shared edge (flat-top: vertex i sits at 60°·i)
-                const EDGE_DIRS = [
-                  { dq: 1, dr: 0, vi: 0 },
-                  { dq: 0, dr: 1, vi: 1 },
-                  { dq: -1, dr: 1, vi: 2 },
-                  { dq: -1, dr: 0, vi: 3 },
-                  { dq: 0, dr: -1, vi: 4 },
-                  { dq: 1, dr: -1, vi: 5 }
-                ];
+                const EDGE_DIRS = HEX_EDGE_DIRS;
                 return (
                   <g
                     key={`zone-${zone.id}`}
