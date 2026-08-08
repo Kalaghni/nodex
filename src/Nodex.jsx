@@ -227,6 +227,7 @@ const segmentRectIntersection = (a, b, box) => {
 // six edges). Returns the [t0,t1] parameter interval inside the hex, or null.
 const segmentHexIntersection = (p0, p1, cx, cy, size) => {
   const d = { x: p1.x - p0.x, y: p1.y - p0.y };
+  const dLen = Math.hypot(d.x, d.y) || 1;
   let t0 = 0;
   let t1 = 1;
   for (let i = 0; i < 6; i++) {
@@ -243,8 +244,15 @@ const segmentHexIntersection = (p0, p1, cx, cy, size) => {
     }
     const denom = nx * d.x + ny * d.y;
     const num = nx * (v1.x - p0.x) + ny * (v1.y - p0.y);
-    if (Math.abs(denom) < 1e-9) {
-      if (num < 0) return null;
+    // Parallel case: p0 is inside this edge's slab iff n·(p0−v1) ≥ 0,
+    // i.e. num ≤ 0 — reject only when strictly outside (the original
+    // `num < 0` test was inverted, so a segment running exactly along
+    // cell edges — perfectly aligned zone centers — rejected every cell
+    // and the line fell through to the center untrimmed). Grazing along
+    // an edge counts as touching; tolerances are relative.
+    const nLen = size; // |n| equals the edge length
+    if (Math.abs(denom) < 1e-9 * nLen * dLen) {
+      if (num > 1e-6 * nLen) return null;
     } else {
       const t = num / denom;
       if (denom > 0) {
