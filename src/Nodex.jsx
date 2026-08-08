@@ -844,6 +844,7 @@ export default function Nodex() {
   const [hoveredNode, setHoveredNode] = useState(null);
   const [hoveredZone, setHoveredZone] = useState(null);
   const [showShortcuts, setShowShortcuts] = useState(false);
+  const [tabMenu, setTabMenu] = useState(null); // { x, y, tabId } | null
   const [zoom, setZoom] = useState(1);
   const [isCreatingZone, setIsCreatingZone] = useState(false);
   const [zoneShape, setZoneShape] = useState('rectangle'); // 'rectangle', 'hexagon', or 'circular'
@@ -918,6 +919,9 @@ export default function Nodex() {
       const data = JSON.parse(await file.text());
       loadFileData(data, file.name, entry.handle);
       addRecent(file.name, Array.isArray(data.tabs) ? 'project' : 'diagram', entry.handle);
+      // Reopened work should keep saving itself — the handle is linked,
+      // so autosave has somewhere to write
+      setAutosave(true);
     } catch (err) {
       alert('Could not open this file — it may have been moved or deleted.');
       removeRecent(entry.id);
@@ -1076,20 +1080,15 @@ export default function Nodex() {
     accept: { 'application/json': ['.json'] }
   }];
 
-  const getSaveData = () => {
-    const tab = tabsRef.current.find(t => t.id === activeTabIdRef.current) || tabsRef.current[0];
-    return {
-      version: 1,
-      name: tab.name,
-      diagrams: tab.diagrams,
-      currentPath: tab.currentPath
-    };
-  };
+  const getTabSaveData = (tab) => ({
+    version: 1,
+    name: tab.name,
+    diagrams: tab.diagrams,
+    currentPath: tab.currentPath
+  });
 
-  const suggestedFileName = () => {
-    const tab = tabsRef.current.find(t => t.id === activeTabIdRef.current) || tabsRef.current[0];
-    return `${tab.name.replace(/[^a-z0-9]/gi, '-').toLowerCase() || 'nodex-diagram'}.json`;
-  };
+  const tabFileName = (tab) =>
+    `${tab.name.replace(/[^a-z0-9]/gi, '-').toLowerCase() || 'nodex-diagram'}.json`;
 
   const writeToHandle = async (handle, data) => {
     const writable = await handle.createWritable();
@@ -1097,24 +1096,25 @@ export default function Nodex() {
     await writable.close();
   };
 
-  const downloadJson = (data) => {
+  const downloadJson = (data, fileName) => {
     const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = suggestedFileName();
+    a.download = fileName;
     a.click();
     URL.revokeObjectURL(url);
   };
 
-  // Save: writes back to the tab's on-device file when one is linked,
+  // Save one tab: writes back to its on-device file when one is linked,
   // otherwise prompts for a location (File System Access API) and links it.
   // Falls back to a plain download in browsers without the API.
-  const saveToFile = async () => {
-    const data = getSaveData();
-    const tab = tabsRef.current.find(t => t.id === activeTabIdRef.current);
+  const saveTabToFile = async (tabId) => {
+    const tab = tabsRef.current.find(t => t.id === tabId);
+    if (!tab) return;
+    const data = getTabSaveData(tab);
 
-    if (tab?.fileHandle) {
+    if (tab.fileHandle) {
       try {
         await writeToHandle(tab.fileHandle, data);
         dirtyRef.current = false;
@@ -1128,12 +1128,12 @@ export default function Nodex() {
     if (window.showSaveFilePicker) {
       try {
         const handle = await window.showSaveFilePicker({
-          suggestedName: suggestedFileName(),
+          suggestedName: tabFileName(tab),
           types: FILE_PICKER_TYPES
         });
         await writeToHandle(handle, data);
         setTabs(prevTabs => prevTabs.map(t =>
-          t.id === activeTabIdRef.current ? { ...t, fileHandle: handle } : t
+          t.id === tabId ? { ...t, fileHandle: handle } : t
         ));
         dirtyRef.current = false;
         addRecent(handle.name, 'diagram', handle);
@@ -1143,9 +1143,11 @@ export default function Nodex() {
       }
     }
 
-    downloadJson(data);
+    downloadJson(data, tabFileName(tab));
     dirtyRef.current = false;
   };
+
+  const saveToFile = () => saveTabToFile(activeTabIdRef.current);
 
   // Project = every open tab in a single file
   const getProjectData = () => ({
@@ -1225,7 +1227,11 @@ export default function Nodex() {
       setSelectedZone(null);
       setViewOffset({ x: 400, y: 300 });
       setZoom(1);
-      if (fileHandle) setProjectHandle(fileHandle);
+      if (fileHandle) {
+        setProjectHandle(fileHandle);
+        // Opening a project always turns autosave on
+        setAutosave(true);
+      }
       return;
     }
 
@@ -2736,13 +2742,6 @@ export default function Nodex() {
             )}
           </div>
           <button
-            onClick={saveToFile}
-            className="p-2 hover:bg-slate-700 rounded transition-colors"
-            title={activeTab.fileHandle ? `Save to ${activeTab.fileHandle.name} (Ctrl+S)` : 'Save Tab (Ctrl+S)'}
-          >
-            <Save size={18} />
-          </button>
-          <button
             onClick={saveProject}
             className="p-2 hover:bg-slate-700 rounded transition-colors"
             title={projectHandle ? `Save project to ${projectHandle.name} (Ctrl+Shift+S)` : 'Save Project — all tabs in one file (Ctrl+Shift+S)'}
@@ -2921,6 +2920,10 @@ export default function Nodex() {
                 : 'bg-slate-900 text-slate-400 hover:bg-slate-800 hover:text-slate-200'
             }`}
             onClick={() => setActiveTabId(tab.id)}
+            onContextMenu={(e) => {
+              e.preventDefault();
+              setTabMenu({ x: e.clientX, y: e.clientY, tabId: tab.id });
+            }}
           >
             <span
               className="max-w-32 truncate"
@@ -2953,6 +2956,48 @@ export default function Nodex() {
           <Plus size={16} />
         </button>
       </div>
+
+      {/* Tab context menu */}
+      {tabMenu && (() => {
+        const menuTab = tabs.find(t => t.id === tabMenu.tabId);
+        if (!menuTab) return null;
+        return (
+          <>
+            <div
+              className="fixed inset-0 z-40"
+              onClick={() => setTabMenu(null)}
+              onContextMenu={(e) => { e.preventDefault(); setTabMenu(null); }}
+            />
+            <div
+              className="fixed z-50 w-48 bg-slate-800 border border-slate-600 rounded-lg shadow-2xl py-1"
+              style={{ left: tabMenu.x, top: tabMenu.y }}
+            >
+              <button
+                onClick={() => {
+                  setTabMenu(null);
+                  const newName = prompt('Rename tab:', menuTab.name);
+                  if (newName) renameTab(menuTab.id, newName);
+                }}
+                className="w-full flex items-center gap-2 px-3 py-1.5 text-sm text-left hover:bg-slate-700 transition-colors"
+              >
+                <Edit2 size={14} />
+                Rename
+              </button>
+              <button
+                onClick={() => {
+                  setTabMenu(null);
+                  saveTabToFile(menuTab.id);
+                }}
+                className="w-full flex items-center gap-2 px-3 py-1.5 text-sm text-left hover:bg-slate-700 transition-colors"
+                title={menuTab.fileHandle ? `Save to ${menuTab.fileHandle.name}` : 'Save this tab to a file'}
+              >
+                <Save size={14} />
+                Save Page
+              </button>
+            </div>
+          </>
+        );
+      })()}
 
       <div className="flex flex-1 overflow-hidden">
       {/* Sidebar */}
