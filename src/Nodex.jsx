@@ -277,21 +277,8 @@ const zoneEntryT = (zone, p0, p1) => {
   return bestT;
 };
 
-// Where the ray fromPt→anchorPt first enters the zone. Trimming against
-// only the anchor cell put arrowheads inside the zone whenever the line
-// crossed another cell first.
-const zoneBoundaryPoint = (zone, fromPt, anchorPt) => {
-  const bestT = zoneEntryT(zone, fromPt, anchorPt);
-  if (bestT === null || bestT <= 0) return anchorPt;
-  return {
-    x: fromPt.x + (anchorPt.x - fromPt.x) * bestT,
-    y: fromPt.y + (anchorPt.y - fromPt.y) * bestT
-  };
-};
-
 // Neighbor direction → index of the hex vertex pair forming the shared
-// edge (flat-top: vertex i sits at 60°·i). Shared by the zone outline
-// renderer and the silhouette geometry below so they can never disagree.
+// edge (flat-top: vertex i sits at 60°·i)
 const HEX_EDGE_DIRS = [
   { dq: 1, dr: 0, vi: 0 },
   { dq: 0, dr: 1, vi: 1 },
@@ -300,85 +287,6 @@ const HEX_EDGE_DIRS = [
   { dq: 0, dr: -1, vi: 4 },
   { dq: 1, dr: -1, vi: 5 }
 ];
-
-// Outer silhouette of a zone blob as line segments — exactly the edges the
-// zone outline draws (cell edges not shared with another cell of the zone)
-const zoneSilhouetteEdges = (zone) => {
-  const cellSet = new Set(zone.cells.map(c => `${c.q},${c.r}`));
-  const edges = [];
-  zone.cells.forEach(cell => {
-    const p = axialToPixel(cell.q, cell.r);
-    HEX_EDGE_DIRS.forEach(d => {
-      if (cellSet.has(`${cell.q + d.dq},${cell.r + d.dr}`)) return;
-      const a1 = (Math.PI / 3) * d.vi;
-      const a2 = (Math.PI / 3) * (d.vi + 1);
-      edges.push({
-        x1: p.x + HEX_SIZE * Math.cos(a1), y1: p.y + HEX_SIZE * Math.sin(a1),
-        x2: p.x + HEX_SIZE * Math.cos(a2), y2: p.y + HEX_SIZE * Math.sin(a2)
-      });
-    });
-  });
-  return edges;
-};
-
-const closestPointOnSegment = (px, py, x1, y1, x2, y2) => {
-  const dx = x2 - x1, dy = y2 - y1;
-  const L2 = dx * dx + dy * dy;
-  const t = L2 === 0 ? 0 : Math.max(0, Math.min(1, ((px - x1) * dx + (py - y1) * dy) / L2));
-  return { x: x1 + dx * t, y: y1 + dy * t };
-};
-
-// Nearest point on a silhouette to an outside point
-const closestSilhouettePointTo = (edges, p) => {
-  let best = null, bd = Infinity;
-  edges.forEach(e => {
-    const c = closestPointOnSegment(p.x, p.y, e.x1, e.y1, e.x2, e.y2);
-    const d = Math.hypot(c.x - p.x, c.y - p.y);
-    if (d < bd) { bd = d; best = c; }
-  });
-  return best;
-};
-
-// Closest pair of points between two silhouettes. For non-crossing
-// polygon boundaries the minimum is always achieved at a vertex of one
-// projected onto a segment of the other, so checking vertex↔segment both
-// ways is exact. On a hex grid the minimum is usually massively tied —
-// two zones face each other across a corridor of parallel staircase
-// boundaries, and every step of the staircase is an equally-shortest
-// connector. Keeping the first winner anchored lines at an arbitrary end
-// of the corridor (and broke left/right symmetry), so the tie region is
-// averaged and re-projected onto each silhouette to center the line.
-const closestSilhouettePoints = (edgesA, edgesB) => {
-  if (edgesA.length === 0 || edgesB.length === 0) return null;
-  let bd = Infinity;
-  const pairs = [];
-  const consider = (pa, pb) => {
-    const d = Math.hypot(pb.x - pa.x, pb.y - pa.y);
-    if (d < bd) bd = d;
-    pairs.push({ pa, pb, d });
-  };
-  edgesA.forEach(ea => {
-    edgesB.forEach(eb => {
-      consider({ x: ea.x1, y: ea.y1 }, closestPointOnSegment(ea.x1, ea.y1, eb.x1, eb.y1, eb.x2, eb.y2));
-      consider({ x: ea.x2, y: ea.y2 }, closestPointOnSegment(ea.x2, ea.y2, eb.x1, eb.y1, eb.x2, eb.y2));
-      consider(closestPointOnSegment(eb.x1, eb.y1, ea.x1, ea.y1, ea.x2, ea.y2), { x: eb.x1, y: eb.y1 });
-      consider(closestPointOnSegment(eb.x2, eb.y2, ea.x1, ea.y1, ea.x2, ea.y2), { x: eb.x2, y: eb.y2 });
-    });
-  });
-  if (bd === Infinity) return null;
-  let sx = 0, sy = 0, n = 0;
-  pairs.forEach(({ pa, pb, d }) => {
-    if (d <= bd + 0.5) {
-      sx += (pa.x + pb.x) / 2;
-      sy += (pa.y + pb.y) / 2;
-      n++;
-    }
-  });
-  const M = { x: sx / n, y: sy / n };
-  const a = closestSilhouettePointTo(edgesA, M);
-  const b = closestSilhouettePointTo(edgesB, M);
-  return { a, b, dist: Math.hypot(b.x - a.x, b.y - a.y) };
-};
 
 // Walk hex rings around a center cell, out to `radius`
 const buildHexRingCells = (cq, cr, radius) => {
@@ -2603,11 +2511,12 @@ export default function Nodex() {
   // A connection is a polyline: 2 points for direct routing, 3 for angled
   // (horizontal from the source, right-angle bend, vertical into the target).
   const connGeoms = {};
-  const zoneEdgeCache = {}; // zone id → silhouette edges, shared across connections this render
   connections.forEach(conn => {
-    // Endpoints can be nodes or zones. A zone endpoint anchors to its cell
-    // nearest the other endpoint, which is a hex center — so all the node
-    // trimming/routing logic below applies unchanged.
+    // Endpoints can be nodes or zones. A zone's center is its cell
+    // centroid, snapped to the nearest cell when a concave blob pushes
+    // the centroid outside its own cells — every center is guaranteed to
+    // lie inside its entity, so the center-to-center segment always
+    // crosses each silhouette and can be trimmed without leaving the axis.
     const resolveCenter = (id, type) => {
       if (type === 'zone') {
         const z = zones.find(zz => zz.id === id);
@@ -2618,91 +2527,89 @@ export default function Nodex() {
           sx += p.x;
           sy += p.y;
         });
-        return { type: 'zone', zone: z, x: sx / z.cells.length, y: sy / z.cells.length };
+        let cx = sx / z.cells.length;
+        let cy = sy / z.cells.length;
+        const cc = pixelToAxial(cx, cy);
+        if (!z.cells.some(c => c.q === cc.q && c.r === cc.r)) {
+          let bd = Infinity;
+          z.cells.forEach(c => {
+            const p = axialToPixel(c.q, c.r);
+            const d = Math.hypot(p.x - cx, p.y - cy);
+            if (d < bd) { bd = d; cx = p.x; cy = p.y; }
+          });
+        }
+        return { type: 'zone', zone: z, x: cx, y: cy };
       }
       const n = nodes.find(nn => nn.id === id);
       if (!n) return null;
       const p = axialToPixel(n.q, n.r);
       return { type: 'node', x: p.x, y: p.y };
     };
-    const nearestCellTo = (ep, toward) => {
-      if (ep.type !== 'zone') return { x: ep.x, y: ep.y };
-      let best = { x: ep.x, y: ep.y };
-      let bd = Infinity;
-      ep.zone.cells.forEach(c => {
-        const p = axialToPixel(c.q, c.r);
-        const d = Math.hypot(p.x - toward.x, p.y - toward.y);
-        if (d < bd) {
-          bd = d;
-          best = p;
-        }
-      });
-      return best;
-    };
 
     const epFrom = resolveCenter(conn.from, conn.fromType || 'node');
     const epTo = resolveCenter(conn.to, conn.toType || 'node');
     if (!epFrom || !epTo) return;
 
-    // Closest-points style: a direct zone connection is the shortest
-    // connector between the two silhouettes (or node edge ↔ silhouette),
-    // so it always meets each boundary at its natural facing point — the
-    // way a hand-drawn line between two blobs would. Center-to-center ray
-    // trimming looked right on paper but crossed big/concave zones at
-    // spots skewed by where the centroid happened to sit.
+    // Center-to-center style: the arrow is a sub-segment of the exact
+    // line between the entity centers — each end only slides along that
+    // axis to its silhouette crossing, never off it. (Earlier attempts —
+    // closest-cell anchors, silhouette closest-pair — all bent the line
+    // away from the center axis somewhere and read as misaimed.)
     const a = { x: epFrom.x, y: epFrom.y };
     const b = { x: epTo.x, y: epTo.y };
     if (a.x === b.x && a.y === b.y) return;
 
-    const silEdges = (zone) =>
-      zoneEdgeCache[zone.id] || (zoneEdgeCache[zone.id] = zoneSilhouetteEdges(zone));
-
-    const zoneEnd = (zoneEp, fromPt) => {
-      const center = { x: zoneEp.x, y: zoneEp.y };
-      const t = zoneEntryT(zoneEp.zone, fromPt, center);
-      if (t !== null && t > 0) {
-        return {
-          x: fromPt.x + (center.x - fromPt.x) * t,
-          y: fromPt.y + (center.y - fromPt.y) * t
-        };
+    // Cut a polyline where it last leaves `zone` approaching its first
+    // point: walk segments outward from the zone end and return the
+    // polyline from the silhouette crossing on. Points stay ON the
+    // polyline, so trimming never bends the line off the center axis.
+    // Returns null when the whole polyline lies inside the zone.
+    const trimPolyToZone = (poly, zone) => {
+      for (let i = 1; i < poly.length; i++) {
+        const t = zoneEntryT(zone, poly[i], poly[i - 1]);
+        if (t !== null && t > 0) {
+          return [{
+            x: poly[i].x + (poly[i - 1].x - poly[i].x) * t,
+            y: poly[i].y + (poly[i - 1].y - poly[i].y) * t
+          }, ...poly.slice(i)];
+        }
+        // t === 0 → poly[i] is itself inside the zone; keep walking out
       }
-      const cell = nearestCellTo(zoneEp, fromPt);
-      return zoneBoundaryPoint(zoneEp.zone, fromPt, cell);
+      return null;
     };
 
     const routing = conn.routing || 'direct';
+    const useElbow = routing === 'angled' &&
+      Math.abs(b.x - a.x) > HEX_SIZE && Math.abs(b.y - a.y) > HEX_SIZE;
     let pts;
 
-    if (routing === 'angled' && Math.abs(b.x - a.x) > HEX_SIZE && Math.abs(b.y - a.y) > HEX_SIZE) {
-      const corner = { x: b.x, y: a.y };
-      const start = epFrom.type === 'zone' ? zoneEnd(epFrom, corner) : nodeEdgePoint(a, corner);
-      const end = epTo.type === 'zone' ? zoneEnd(epTo, corner) : nodeEdgePoint(b, corner);
-      pts = [start, corner, end];
-    } else if (epFrom.type === 'node' && epTo.type === 'node') {
-      // Direct node-node — also the fallback when too aligned for an elbow
-      const trimmed = trimSegmentToHexEdges(a, b, HEX_SIZE);
-      if (!trimmed) return;
-      pts = [trimmed.from, trimmed.to];
-    } else {
-      let start = null, end = null;
-      if (epFrom.type === 'zone' && epTo.type === 'zone') {
-        const cp = closestSilhouettePoints(silEdges(epFrom.zone), silEdges(epTo.zone));
-        if (cp && cp.dist >= 4) { start = cp.a; end = cp.b; }
-      } else if (epFrom.type === 'zone') {
-        const pz = closestSilhouettePointTo(silEdges(epFrom.zone), b);
-        if (pz) { start = pz; end = nodeEdgePoint(b, pz); }
+    if (epFrom.type === 'node' && epTo.type === 'node') {
+      if (useElbow) {
+        const corner = { x: b.x, y: a.y };
+        pts = [nodeEdgePoint(a, corner), corner, nodeEdgePoint(b, corner)];
       } else {
-        const pz = closestSilhouettePointTo(silEdges(epTo.zone), a);
-        if (pz) { start = nodeEdgePoint(a, pz); end = pz; }
+        const trimmed = trimSegmentToHexEdges(a, b, HEX_SIZE);
+        if (!trimmed) return;
+        pts = [trimmed.from, trimmed.to];
       }
-      if (!start || !end) {
-        // Silhouettes touch/overlap — trim the center-to-center ray
-        // instead so the connection stays visible and clickable
-        start = epFrom.type === 'zone' ? zoneEnd(epFrom, b) : nodeEdgePoint(a, b);
-        end = epTo.type === 'zone' ? zoneEnd(epTo, a) : nodeEdgePoint(b, a);
+    } else {
+      const basePoly = () => useElbow ? [a, { x: b.x, y: a.y }, b] : [a, b];
+      // Trim the from-end, then flip and trim the to-end the same way.
+      // Falling back to the untrimmed polyline (overlapping zones, where
+      // no crossing exists) keeps the connection visible and clickable.
+      let poly = epFrom.type === 'zone'
+        ? (trimPolyToZone(basePoly(), epFrom.zone) || basePoly())
+        : (() => { const p = basePoly(); p[0] = nodeEdgePoint(a, p[1]); return p; })();
+      let rev = [...poly].reverse();
+      rev = epTo.type === 'zone'
+        ? (trimPolyToZone(rev, epTo.zone) || rev)
+        : [nodeEdgePoint(b, rev[1]), ...rev.slice(1)];
+      pts = rev.reverse();
+      let len = 0;
+      for (let i = 0; i < pts.length - 1; i++) {
+        len += Math.hypot(pts[i + 1].x - pts[i].x, pts[i + 1].y - pts[i].y);
       }
-      if (Math.hypot(end.x - start.x, end.y - start.y) < 2) return;
-      pts = [start, end];
+      if (len < 2) return;
     }
 
     // Arc-length midpoint: where the label and delete button live
@@ -3897,31 +3804,45 @@ export default function Nodex() {
 
             {/* Temporary connection line */}
             {connectingFrom && (() => {
-              let start;
+              let x1, y1;
               if (connectingFrom.kind === 'zone') {
                 const z = zones.find(zz => zz.id === connectingFrom.id);
                 if (!z || z.cells.length === 0) return null;
-                // Track the zone cell nearest the cursor, like the final line will
-                let bd = Infinity;
+                // Match the final line: run from the zone's center (snapped
+                // into the blob) and trim at the silhouette crossing
+                let sx = 0, sy = 0;
                 z.cells.forEach(c => {
                   const p = axialToPixel(c.q, c.r);
-                  const d = Math.hypot(p.x - mousePos.x, p.y - mousePos.y);
-                  if (d < bd) {
-                    bd = d;
-                    start = p;
-                  }
+                  sx += p.x;
+                  sy += p.y;
                 });
+                let cx = sx / z.cells.length, cy = sy / z.cells.length;
+                const cc = pixelToAxial(cx, cy);
+                if (!z.cells.some(c => c.q === cc.q && c.r === cc.r)) {
+                  let bd = Infinity;
+                  z.cells.forEach(c => {
+                    const p = axialToPixel(c.q, c.r);
+                    const d = Math.hypot(p.x - cx, p.y - cy);
+                    if (d < bd) { bd = d; cx = p.x; cy = p.y; }
+                  });
+                }
+                x1 = cx; y1 = cy;
+                const t = zoneEntryT(z, mousePos, { x: cx, y: cy });
+                if (t !== null && t > 0) {
+                  x1 = mousePos.x + (cx - mousePos.x) * t;
+                  y1 = mousePos.y + (cy - mousePos.y) * t;
+                }
               } else {
-                start = axialToPixel(connectingFrom.q, connectingFrom.r);
-              }
-              const dist = Math.hypot(mousePos.x - start.x, mousePos.y - start.y);
-              // Start from the hexagon edge once the cursor has left it
-              let x1 = start.x, y1 = start.y;
-              if (dist > HEX_SIZE) {
-                const angle = Math.atan2(mousePos.y - start.y, mousePos.x - start.x);
-                const trim = hexBoundaryDistance(HEX_SIZE, angle);
-                x1 = start.x + Math.cos(angle) * trim;
-                y1 = start.y + Math.sin(angle) * trim;
+                const start = axialToPixel(connectingFrom.q, connectingFrom.r);
+                x1 = start.x; y1 = start.y;
+                const dist = Math.hypot(mousePos.x - start.x, mousePos.y - start.y);
+                // Start from the hexagon edge once the cursor has left it
+                if (dist > HEX_SIZE) {
+                  const angle = Math.atan2(mousePos.y - start.y, mousePos.x - start.x);
+                  const trim = hexBoundaryDistance(HEX_SIZE, angle);
+                  x1 = start.x + Math.cos(angle) * trim;
+                  y1 = start.y + Math.sin(angle) * trim;
+                }
               }
               return (
                 <line
@@ -3932,6 +3853,7 @@ export default function Nodex() {
                   stroke="#f59e0b"
                   strokeWidth="2"
                   strokeDasharray="5,5"
+                  pointerEvents="none"
                 />
               );
             })()}
