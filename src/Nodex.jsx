@@ -843,6 +843,7 @@ export default function Nodex() {
   const [hoveredCell, setHoveredCell] = useState(null);
   const [hoveredNode, setHoveredNode] = useState(null);
   const [hoveredZone, setHoveredZone] = useState(null);
+  const [showShortcuts, setShowShortcuts] = useState(false);
   const [zoom, setZoom] = useState(1);
   const [isCreatingZone, setIsCreatingZone] = useState(false);
   const [zoneShape, setZoneShape] = useState('rectangle'); // 'rectangle', 'hexagon', or 'circular'
@@ -3035,8 +3036,18 @@ export default function Nodex() {
         )}
 
         <div className="mb-6 pt-4 border-t border-slate-700">
-          <h3 className="text-sm font-semibold mb-3 text-slate-400">Shortcuts</h3>
-          <ul className="text-xs space-y-1 text-slate-300">
+          <button
+            onClick={() => setShowShortcuts(s => !s)}
+            className="w-full flex items-center gap-1 text-sm font-semibold text-slate-400 hover:text-slate-200 transition-colors"
+          >
+            <ChevronRight
+              size={14}
+              className={`transition-transform ${showShortcuts ? 'rotate-90' : ''}`}
+            />
+            Shortcuts
+          </button>
+          {showShortcuts && (
+          <ul className="text-xs space-y-1 text-slate-300 mt-3">
             <li><kbd className="px-1 bg-slate-600 rounded">Drag canvas</kbd> Box-select nodes</li>
             <li><kbd className="px-1 bg-slate-600 rounded">Ctrl+Click</kbd> Add/remove from selection</li>
             <li><kbd className="px-1 bg-slate-600 rounded">Ctrl+A</kbd> Select all nodes</li>
@@ -3055,6 +3066,7 @@ export default function Nodex() {
             <li><kbd className="px-1 bg-slate-600 rounded">Shift+Drag</kbd> Pan canvas</li>
             <li><kbd className="px-1 bg-slate-600 rounded">Esc</kbd> Cancel action</li>
           </ul>
+          )}
         </div>
 
         {selectedNode && (
