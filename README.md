@@ -34,10 +34,10 @@ Architecture diagramming on a hexagonal grid. Nodex is a single-page React app f
 - **Undo/redo** per tab (a whole drag is one step)
 
 ### Files
-- **Tabs** — each tab is an independent diagram document
+- **Tabs** — each tab is an independent diagram document; right-click a tab for **Rename** and **Save Page** (Ctrl+S still saves the active tab)
 - **Work directly on device files** (File System Access API): Open links the file to the tab, Save writes straight back to it. Falls back to download/upload in browsers without the API
 - **Projects**: save every tab into a single `nodex-project.json`; opening one restores all tabs
-- **Autosave** toggle: changes are debounced and written to every linked file
+- **Autosave** toggle: changes are debounced and written to every linked file — turns on automatically when you open a project or a recent file
 - **Open Recent**: last 10 opened/saved files, reopenable in one click (file handles persisted in IndexedDB)
 - **Drag & drop** a `.json` anywhere on the page to open it
 - Unsaved changes trigger a leave-page warning
