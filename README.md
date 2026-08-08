@@ -17,7 +17,7 @@ Architecture diagramming on a hexagonal grid. Nodex is a single-page React app f
 ### Connections
 - Double-click a node **or zone** to start a connection; click another node or zone to finish — node→node, node→zone, and zone→zone all work
 - Mid-connection, click an **empty cell** to create a new node pre-wired to the source
-- Lines terminate at hexagon edges; zone connections run along the shortest path between the two boundaries, anchored where the outlines face each other
+- Lines terminate at hexagon edges; a zone connection lies exactly on the line between the two centers, trimmed where it crosses each zone's outline
 - Per-connection options, edited in a live side drawer:
   - **Route**: direct or angled (right-angle elbow)
   - **Pointer per end**: none / arrow / open / circle / diamond
