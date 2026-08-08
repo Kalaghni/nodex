@@ -342,13 +342,20 @@ const closestSilhouettePointTo = (edges, p) => {
 // Closest pair of points between two silhouettes. For non-crossing
 // polygon boundaries the minimum is always achieved at a vertex of one
 // projected onto a segment of the other, so checking vertex↔segment both
-// ways is exact.
+// ways is exact. On a hex grid the minimum is usually massively tied —
+// two zones face each other across a corridor of parallel staircase
+// boundaries, and every step of the staircase is an equally-shortest
+// connector. Keeping the first winner anchored lines at an arbitrary end
+// of the corridor (and broke left/right symmetry), so the tie region is
+// averaged and re-projected onto each silhouette to center the line.
 const closestSilhouettePoints = (edgesA, edgesB) => {
   if (edgesA.length === 0 || edgesB.length === 0) return null;
-  let best = null, bd = Infinity;
+  let bd = Infinity;
+  const pairs = [];
   const consider = (pa, pb) => {
     const d = Math.hypot(pb.x - pa.x, pb.y - pa.y);
-    if (d < bd) { bd = d; best = { a: pa, b: pb, dist: d }; }
+    if (d < bd) bd = d;
+    pairs.push({ pa, pb, d });
   };
   edgesA.forEach(ea => {
     edgesB.forEach(eb => {
@@ -358,7 +365,19 @@ const closestSilhouettePoints = (edgesA, edgesB) => {
       consider(closestPointOnSegment(eb.x2, eb.y2, ea.x1, ea.y1, ea.x2, ea.y2), { x: eb.x2, y: eb.y2 });
     });
   });
-  return best;
+  if (bd === Infinity) return null;
+  let sx = 0, sy = 0, n = 0;
+  pairs.forEach(({ pa, pb, d }) => {
+    if (d <= bd + 0.5) {
+      sx += (pa.x + pb.x) / 2;
+      sy += (pa.y + pb.y) / 2;
+      n++;
+    }
+  });
+  const M = { x: sx / n, y: sy / n };
+  const a = closestSilhouettePointTo(edgesA, M);
+  const b = closestSilhouettePointTo(edgesB, M);
+  return { a, b, dist: Math.hypot(b.x - a.x, b.y - a.y) };
 };
 
 // Walk hex rings around a center cell, out to `radius`
