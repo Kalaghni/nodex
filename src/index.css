@@ -58,3 +58,36 @@ html, body, #root {
 .scrollbar-thin::-webkit-scrollbar-thumb:hover {
   background: #64748b;
 }
+
+/* ---- Traffic isolation + outage simulation ---- */
+
+/* Particles marching along a connection in its traffic direction */
+@keyframes nx-flow {
+  to { stroke-dashoffset: -28; }
+}
+@keyframes nx-flow-rev {
+  to { stroke-dashoffset: 28; }
+}
+.nx-flow { animation: nx-flow 0.9s linear infinite; }
+.nx-flow-rev { animation: nx-flow-rev 0.9s linear infinite; }
+
+/* Failover arcs */
+@keyframes nx-march {
+  to { stroke-dashoffset: -24; }
+}
+.nx-march { animation: nx-march 1.2s linear infinite; }
+
+/* Pulsing ring on a failed component */
+@keyframes nx-pulse {
+  0% { transform: scale(1); opacity: 0.9; }
+  100% { transform: scale(2.2); opacity: 0; }
+}
+.nx-pulse {
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: nx-pulse 1.6s ease-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .nx-flow, .nx-flow-rev, .nx-march, .nx-pulse { animation: none; }
+}

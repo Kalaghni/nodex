@@ -27,6 +27,41 @@ Architecture diagramming on a hexagonal grid. Nodex is a single-page React app f
 - **Bulk connection editing**: Ctrl+Click lines (or marquee over them) to select many, then apply color/style/route/pointers to all at once from the sidebar
 - **Channels**: named, colored flows defined per diagram. Connections subscribe to any subset and render one parallel strand per channel — so a flow can **split and converge** across the graph (e.g. public + internal traffic share the ingress line, split at the load balancer, and re-converge at the destination) while keeping its color everywhere. Managed in the sidebar; toggled per connection in the drawer or across a whole selection
 
+### Traffic channel isolation
+- **Trace bar** floating over the canvas: click channels to isolate one or more flows; hover a chip to preview a channel on its own. Channel rows in the sidebar toggle isolation the same way
+- Everything the isolated flows pass through stays lit — nodes, connections, and the zones they enter — while unrelated infrastructure fades back. On connections shared by several channels, only the isolated strands stay bright
+- Active strands animate in the **direction traffic flows**; failover peers that aren't carrying traffic show as *standby* (dashed), and channel links that never complete a route show as *stranded*
+- **Hover a node** to narrow the view to just the paths that pass through it
+- The sidebar shows an **end-to-end trace** per isolated channel: entry points → hops → destinations, stage by stage (click a hop to center on it)
+
+### Outage simulation
+- Toggle **Simulate** in the toolbar, then click nodes, connections, or whole zones to fail them (click again to restore). It's a what-if view — the diagram, undo history, and saved files are never touched; scenarios are kept per tab and nesting level
+- Every component is rated **healthy**, **degraded**, or **unavailable**, distinguishing injected failures (power-off icon) from collateral damage (dashed red). Hover anything for the reason
+- **Per-flow impact**: each channel reports healthy / degraded / down with explanations — *“edge-lb1 failed over to edge-lb2”*, *“web (2) down → rerouted via web (1)”*, *“Can’t reach wordpress_prod”*. Entry points whose traffic can't get through are marked *cut off*; destinations nothing reaches any more are marked *unreachable*
+- Amber **failover arcs** show who took over for whom (failover peer, floating VIP holder, promoted standby)
+- **Single-point-of-failure scan**: lists every component whose failure — on top of the current ones — would take a flow down; click one to simulate it
+- Combine with isolation to watch one flow re-route around failures in real time
+
+### Availability semantics
+The simulation understands redundancy through a few optional properties:
+
+| Where | Setting | Meaning |
+|-------|---------|---------|
+| Zone | **Redundant pool** (default) | Load-balanced replicas — up while any member is up |
+| Zone | **Active / standby** | One active member (pick the primary); a standby is promoted when it fails |
+| Zone | **Quorum** | Needs a strict majority; members stop serving when quorum is lost |
+| Zone | **At least N** / **All required** | Minimum capacity / no redundancy |
+| Connection | **Traffic** (default) | Carries requests from → to (toward the arrowhead; *Reverse direction* flips it) |
+| Connection | **Required dependency** | The source fails when the target is unavailable (cache, auth, …) |
+| Connection | **Peer → Failover** | keepalived / VRRP: peers take over a failed member's address and role |
+| Connection | **Peer → Quorum** | Galera / etcd / Raft: members need a majority — network partitions included |
+| Connection | **Peer → Failover + quorum** | Patroni, Swarm managers: leader election inside a consensus cluster |
+| Node | **Floating VIP** role | A virtual address with no capacity of its own, held by one failover peer at a time |
+
+Nodes on a zone's cells are its members, and traffic aimed at a zone is spread across them. A node that can no longer forward any of its channel traffic (an LB with no healthy backends) becomes unavailable too. Unclassified links without channels — monitoring, management — never cascade failures.
+
+Try it with [`examples/ha-web-stack.json`](examples/ha-web-stack.json): edge LBs with keepalived, a MaxScale VIP trio in front of a Galera quorum, a Patroni cluster, and four traffic channels.
+
 ### Editing
 - **Multi-select**: marquee (drag on empty canvas), Ctrl+Click to toggle, Ctrl+A for all
 - **Group drag** preserves relative layout; **bulk delete** removes nodes, their connections, and nested diagrams
@@ -52,7 +87,9 @@ Plain JSON, two flavors, auto-detected on open:
 | Diagram | `{ "version": 1, "name", "diagrams", "currentPath" }` |
 | Project | `{ "version": 2, "type": "nodex-project", "tabs": [{ "name", "diagrams", "currentPath" }] }` |
 
-`diagrams` is a flat map keyed by nesting path (`"root"`, `"root/<nodeId>"`, …), each entry holding `nodes`, `connections`, and `zones`.
+`diagrams` is a flat map keyed by nesting path (`"root"`, `"root/<nodeId>"`, …), each entry holding `nodes`, `connections`, `zones`, and `channels`.
+
+Availability settings are optional fields, so older files load unchanged: `zone.policy = { mode, min, primaryId }`, `connection.kind = "peer"` with `connection.peerMode` (`failover` / `quorum` / `both` / `replica`), `connection.required`, and `node.role = "vip"`.
 
 ## Keyboard shortcuts
 
@@ -81,9 +118,10 @@ Plain JSON, two flavors, auto-detected on open:
 npm install
 npm run dev        # Vite dev server (port 3030)
 npm run build      # production build to dist/
+npm test           # analysis engine tests (node's built-in runner)
 ```
 
-Stack: React 18, Vite 5, Tailwind CSS 3, [lucide-react](https://lucide.dev) icons. The whole app lives in `src/Nodex.jsx`.
+Stack: React 18, Vite 5, Tailwind CSS 3, [lucide-react](https://lucide.dev) icons. The UI lives in `src/Nodex.jsx`; the availability / flow analysis behind isolation and simulation is a pure module in `src/analysis.js` (tests in `src/analysis.test.js`).
 
 ## Deployment
 
