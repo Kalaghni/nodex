@@ -1,5 +1,34 @@
-import React, { useState, useRef, useEffect } from 'react';
-import { Database, Server, Cloud, Zap, Box, Globe, Lock, HardDrive, Cpu, Network, Shield, Wifi, Code, Container, FileText, Users, Settings, Activity, Mail, Phone, CheckCircle, XCircle, AlertCircle, Plus, Edit2, X, ChevronRight, Hexagon, Trash2, Save, FolderOpen, Download, FilePlus, ZoomIn, ZoomOut, Maximize, Undo, Redo, Copy, Clipboard, Grid, Eye, EyeOff, Home, Building, Factory, Warehouse, ShoppingCart, CreditCard, DollarSign, PieChart, BarChart, LineChart, TrendingUp, Clock, Calendar, Bell, MessageSquare, Send, Upload, Link, Layers, Package, Archive, Folder, Search, Filter, Terminal, GitBranch, Github, Smartphone, Tablet, Monitor, Printer, Camera, Mic, Video, Play, Pause, Square, Circle, Triangle, Star, Heart, ThumbsUp, ThumbsDown, Flag, Bookmark, Tag, Hash, AtSign, MapPin, Navigation, Compass, Map, Truck, Plane, Ship, Train, Car, Bike, Footprints, Key, Unlock, UserCheck, UserX, UserPlus, User, Bot, Cog, Wrench, Hammer, Lightbulb, Flame, Droplet, Wind, Sun, Moon, CloudRain, Snowflake, Thermometer, History } from 'lucide-react';
+import React, { useState, useRef, useEffect, useMemo } from 'react';
+import { Database, Server, Cloud, Zap, Box, Globe, Lock, HardDrive, Cpu, Network, Shield, Wifi, Code, Container, FileText, Users, Settings, Activity, Mail, Phone, CheckCircle, XCircle, AlertCircle, Plus, Edit2, X, ChevronRight, Hexagon, Trash2, Save, FolderOpen, Download, FilePlus, ZoomIn, ZoomOut, Maximize, Undo, Redo, Copy, Clipboard, Grid, Eye, EyeOff, Home, Building, Factory, Warehouse, ShoppingCart, CreditCard, DollarSign, PieChart, BarChart, LineChart, TrendingUp, Clock, Calendar, Bell, MessageSquare, Send, Upload, Link, Layers, Package, Archive, Folder, Search, Filter, Terminal, GitBranch, Github, Smartphone, Tablet, Monitor, Printer, Camera, Mic, Video, Play, Pause, Square, Circle, Triangle, Star, Heart, ThumbsUp, ThumbsDown, Flag, Bookmark, Tag, Hash, AtSign, MapPin, Navigation, Compass, Map as MapIcon, Truck, Plane, Ship, Train, Car, Bike, Footprints, Key, Unlock, UserCheck, UserX, UserPlus, User, Bot, Cog, Wrench, Hammer, Lightbulb, Flame, Droplet, Wind, Sun, Moon, CloudRain, Snowflake, Thermometer, History, FlaskConical, PowerOff, RotateCcw, ShieldAlert, Focus, ArrowLeftRight, Workflow, LocateFixed } from 'lucide-react';
+import {
+  evaluate,
+  findSinglePointsOfFailure,
+  flowStages,
+  traceThrough,
+  getConnEndStyles,
+  connFlowReversed,
+  getZonePolicy,
+  nodeKey,
+  zoneKey,
+  connKey,
+  ZONE_POLICIES,
+  PEER_MODES
+} from './analysis.js';
+import {
+  CHECK_TYPES,
+  loadMonitorSettings,
+  saveMonitorSettings,
+  validateAddress,
+  checkType,
+  endpointLabel,
+  endpointKey,
+  collectTargets,
+  probeTargets,
+  agentHealth,
+  applyResults,
+  nodeLiveStatus,
+  uptimePercent
+} from './monitor.js';
 
 // Hexagon grid calculations
 const HEX_SIZE = 40;
@@ -179,21 +208,6 @@ const getConnLabelBox = (conn, cx, cy, channelCount = 0) => {
   };
 };
 
-// Pointer style for each end of a connection: 'none' | 'arrow' | 'open' |
-// 'circle' | 'diamond'. Falls back to the legacy arrowHead/arrowStyle pair
-// (whose default was a filled arrow on the target end).
-const getConnEndStyles = (conn) => {
-  if (conn.startStyle !== undefined || conn.endStyle !== undefined) {
-    return { start: conn.startStyle || 'none', end: conn.endStyle || 'none' };
-  }
-  const style = conn.arrowStyle || 'arrow';
-  const head = conn.arrowHead || 'end';
-  return {
-    start: head === 'start' || head === 'both' ? style : 'none',
-    end: head === 'end' || head === 'both' ? style : 'none'
-  };
-};
-
 // t-interval [t0,t1] where the segment a→b crosses a rotated rectangle, or
 // null if it misses entirely (slab test in the rect's local frame)
 const segmentRectIntersection = (a, b, box) => {
@@ -271,6 +285,48 @@ const nodeEdgePoint = (center, toward) => {
   const ang = Math.atan2(toward.y - center.y, toward.x - center.x);
   const t = hexBoundaryDistance(HEX_SIZE, ang);
   return { x: center.x + Math.cos(ang) * t, y: center.y + Math.sin(ang) * t };
+};
+
+// A zone's anchor point: its cell centroid, snapped to the nearest cell
+// when a concave blob pushes the centroid outside its own cells — so the
+// anchor always lies inside the zone
+const zoneAnchorPoint = (zone) => {
+  let sx = 0, sy = 0;
+  zone.cells.forEach(c => {
+    const p = axialToPixel(c.q, c.r);
+    sx += p.x;
+    sy += p.y;
+  });
+  let cx = sx / zone.cells.length;
+  let cy = sy / zone.cells.length;
+  const cc = pixelToAxial(cx, cy);
+  if (!zone.cells.some(c => c.q === cc.q && c.r === cc.r)) {
+    let bd = Infinity;
+    zone.cells.forEach(c => {
+      const p = axialToPixel(c.q, c.r);
+      const d = Math.hypot(p.x - cx, p.y - cy);
+      if (d < bd) { bd = d; cx = p.x; cy = p.y; }
+    });
+  }
+  return { x: cx, y: cy };
+};
+
+// Stable empty list — keeps memoized analysis from recomputing every render
+const EMPTY_LIST = [];
+
+// Status palette shared by the outage simulation visuals
+const STATUS_COLORS = { healthy: '#22c55e', degraded: '#f59e0b', down: '#ef4444' };
+const STATUS_LABELS = { healthy: 'Healthy', degraded: 'Degraded', down: 'Unavailable' };
+// Live check result per node (the small dot at a node's lower left)
+const LIVE_COLORS = { up: '#22c55e', partial: '#f59e0b', down: '#ef4444', pending: '#64748b', unknown: '#475569' };
+const LIVE_LABELS = { up: 'Up', partial: 'Partly up', down: 'Down', pending: 'Checking…', unknown: 'Can’t check' };
+
+const CHANNEL_STATUS = {
+  healthy: { label: 'Healthy', color: '#22c55e' },
+  degraded: { label: 'Degraded', color: '#f59e0b' },
+  down: { label: 'Down', color: '#ef4444' },
+  broken: { label: 'No route', color: '#f97316' },
+  unused: { label: 'Unused', color: '#64748b' }
 };
 
 // Earliest parameter t where segment p0→p1 enters any cell of the zone
@@ -507,7 +563,7 @@ const AVAILABLE_ICONS = [
   { id: 'video', icon: Video, label: 'Video' },
   // Location
   { id: 'mappin', icon: MapPin, label: 'Location' },
-  { id: 'map', icon: Map, label: 'Map' },
+  { id: 'map', icon: MapIcon, label: 'Map' },
   { id: 'compass', icon: Compass, label: 'Compass' },
   // Transport
   { id: 'truck', icon: Truck, label: 'Truck' },
@@ -719,6 +775,195 @@ export default function Nodex() {
   const zones = currentDiagram.zones;
   const channels = currentDiagram.channels || [];
 
+  // ---- Traffic isolation + outage simulation ----
+  // Both are view state, not document state: they never touch the diagram,
+  // undo history, or saved files. Kept per tab + nesting level so switching
+  // away and back restores the scenario you were looking at.
+  const viewKey = `${activeTabId}|${currentPath.join('/')}`;
+  const [simMode, setSimMode] = useState(false);
+  const simModeRef = useRef(false);
+  simModeRef.current = simMode;
+  const [simFailuresByView, setSimFailuresByView] = useState({});
+  const [isolationByView, setIsolationByView] = useState({});
+  const [hoverChannelId, setHoverChannelId] = useState(null);
+  const [showSpof, setShowSpof] = useState(false);
+  // Left-drag pans in simulation mode; a drag must not also toggle the
+  // component it started on
+  const simPanRef = useRef({ x: 0, y: 0, moved: false });
+
+  const simFailureList = simFailuresByView[viewKey] || EMPTY_LIST;
+  const simFailures = useMemo(() => new Set(simFailureList), [simFailureList]);
+  const isolatedIds = (isolationByView[viewKey] || []).filter(id => channels.some(ch => ch.id === id));
+  // Hovering a channel chip previews it on its own
+  const focusChannelIds = hoverChannelId != null && channels.some(ch => ch.id === hoverChannelId)
+    ? [hoverChannelId]
+    : isolatedIds;
+
+  // ---- Live monitoring of the real addresses on nodes ----
+  // Endpoints live in the diagram (node.endpoints); where to check them from
+  // (agent URL, token, interval) is per-viewer and kept in localStorage.
+  const [monitorSettings, setMonitorSettingsState] = useState(loadMonitorSettings);
+  const monitorSettingsRef = useRef(monitorSettings);
+  monitorSettingsRef.current = monitorSettings;
+  const setMonitorSettings = (next) => {
+    setMonitorSettingsState(next);
+    saveMonitorSettings(next);
+  };
+  const [liveEnabled, setLiveEnabled] = useState(false);
+  const [liveState, setLiveState] = useState(() => new Map());
+  const [liveError, setLiveError] = useState(null);
+  const [liveLastRun, setLiveLastRun] = useState(null);
+  const [liveChecking, setLiveChecking] = useState(false);
+  const [showMonitorSettings, setShowMonitorSettings] = useState(false);
+  const [monitorHealth, setMonitorHealth] = useState(null);
+  // In simulation, start from what's really down (on by default)
+  const [simIncludeLive, setSimIncludeLive] = useState(true);
+  const liveInFlightRef = useRef(false);
+
+  const liveTargets = useMemo(() => collectTargets(nodes), [nodes]);
+  const liveTargetsRef = useRef(liveTargets);
+  liveTargetsRef.current = liveTargets;
+  const liveTargetsSig = liveTargets.map(t => `${t.key}=${t.check}/${t.address}/${t.port}/${t.path}`).join('|');
+
+  const runLiveChecks = async () => {
+    if (liveInFlightRef.current) return;
+    const targets = liveTargetsRef.current;
+    if (targets.length === 0) {
+      setLiveState(new Map());
+      setLiveError(null);
+      setLiveLastRun(Date.now());
+      return;
+    }
+    liveInFlightRef.current = true;
+    setLiveChecking(true);
+    try {
+      const settings = monitorSettingsRef.current;
+      const results = await probeTargets(settings, targets);
+      // Drop the round if the endpoints changed while it was in flight
+      if (liveTargetsRef.current === targets) {
+        setLiveState(prev => applyResults(prev, targets, results, Date.now(), settings.failAfter));
+      }
+      setLiveError(null);
+    } catch (err) {
+      setLiveError(err.message);
+    } finally {
+      liveInFlightRef.current = false;
+      setLiveChecking(false);
+      setLiveLastRun(Date.now());
+    }
+  };
+
+  useEffect(() => {
+    if (!liveEnabled) return undefined;
+    runLiveChecks();
+    const timer = setInterval(runLiveChecks, Math.max(5, Number(monitorSettings.intervalSec) || 15) * 1000);
+    return () => clearInterval(timer);
+  }, [liveEnabled, monitorSettings.intervalSec, monitorSettings.source, monitorSettings.agentUrl, monitorSettings.token, monitorSettings.timeoutMs, viewKey, liveTargetsSig]);
+
+  const liveNodeStatus = useMemo(() => {
+    const m = new Map();
+    if (!liveEnabled) return m;
+    nodes.forEach(n => {
+      const st = nodeLiveStatus(n, liveState);
+      if (st) m.set(n.id, st);
+    });
+    return m;
+  }, [liveEnabled, nodes, liveState]);
+
+  // Nodes really down right now. While the agent itself is unreachable we
+  // know nothing new — never treat that as every host being down.
+  const liveDownList = useMemo(() => {
+    if (!liveEnabled || liveError) return EMPTY_LIST;
+    const list = [];
+    liveNodeStatus.forEach((st, id) => { if (st.status === 'down') list.push(nodeKey(id)); });
+    return list.length ? list : EMPTY_LIST;
+  }, [liveEnabled, liveError, liveNodeStatus]);
+  const liveDownSet = useMemo(() => new Set(liveDownList), [liveDownList]);
+  const liveImpact = liveDownSet.size > 0;
+  // Status visuals (health badges, dead links, failover arcs) show during a
+  // simulation and whenever monitoring finds a real outage
+  const statusView = simMode || liveImpact;
+
+  const effectiveFailures = useMemo(() => {
+    const all = new Set(simMode ? simFailures : []);
+    if (!simMode || simIncludeLive) liveDownSet.forEach(k => all.add(k));
+    return all;
+  }, [simMode, simFailures, simIncludeLive, liveDownSet]);
+
+  const analysisNeeded = statusView || focusChannelIds.length > 0;
+  const analysis = useMemo(
+    () => (analysisNeeded ? evaluate(currentDiagram, effectiveFailures) : null),
+    [analysisNeeded, currentDiagram, effectiveFailures]
+  );
+  const spofs = useMemo(
+    () => (simMode && showSpof && analysis ? findSinglePointsOfFailure(analysis) : null),
+    [simMode, showSpof, analysis]
+  );
+
+  const toggleFailure = (key) => {
+    setSimFailuresByView(prev => {
+      const list = prev[viewKey] || [];
+      return {
+        ...prev,
+        [viewKey]: list.includes(key) ? list.filter(k => k !== key) : [...list, key]
+      };
+    });
+  };
+  const resetFailures = () => setSimFailuresByView(prev => ({ ...prev, [viewKey]: [] }));
+
+  const toggleIsolation = (channelId) => {
+    setIsolationByView(prev => {
+      const list = (prev[viewKey] || []).filter(id => channels.some(ch => ch.id === id));
+      return {
+        ...prev,
+        [viewKey]: list.includes(channelId) ? list.filter(i => i !== channelId) : [...list, channelId]
+      };
+    });
+  };
+  const clearIsolation = () => setIsolationByView(prev => ({ ...prev, [viewKey]: [] }));
+
+  // Simulation is a viewing mode: editing gestures are suspended, so any
+  // in-flight edit state is dropped on the way in
+  const toggleSimMode = () => {
+    if (simModeRef.current) {
+      setSimMode(false);
+      return;
+    }
+    setSimMode(true);
+    setSelectedNodeIds([]);
+    setSelectedConnectionIds([]);
+    setSelectedZone(null);
+    setConnectingFrom(null);
+    setShowConnectionEditor(false);
+    setEditingConnectionId(null);
+    setIsCreatingZone(false);
+    setSelectedZoneCells([]);
+    setHoveredCell(null);
+  };
+
+  // World position of a node/zone key, for centering the view on it
+  const entityCenter = (key) => {
+    if (key.startsWith('n:')) {
+      const n = nodes.find(nn => nodeKey(nn.id) === key);
+      return n ? axialToPixel(n.q, n.r) : null;
+    }
+    if (key.startsWith('z:')) {
+      const z = zones.find(zz => zoneKey(zz.id) === key);
+      return z && z.cells.length ? zoneAnchorPoint(z) : null;
+    }
+    if (key.startsWith('c:')) {
+      const g = connGeomsRef.current[key.slice(2)];
+      return g ? g.mid : null;
+    }
+    return null;
+  };
+  const centerOn = (key) => {
+    const p = entityCenter(key);
+    if (!p) return;
+    setViewOffset({ x: canvasSize.width / 2 - p.x * zoom, y: canvasSize.height / 2 - p.y * zoom });
+  };
+  const connGeomsRef = useRef({});
+
   // Clipboard state for copy-paste
   const [clipboard, setClipboard] = useState(null);
   const clipboardRef = useRef(null);
@@ -737,7 +982,9 @@ export default function Nodex() {
     label: '',
     description: '',
     iconId: 'server',
-    color: '#3b82f6'
+    color: '#3b82f6',
+    role: 'standard',
+    endpoints: []
   });
   const [newZoneData, setNewZoneData] = useState({
     label: '',
@@ -806,6 +1053,21 @@ export default function Nodex() {
   const updateEditingConnection = (patch) => {
     if (editingConnectionId == null) return;
     setConnections(prev => prev.map(c => c.id === editingConnectionId ? { ...c, ...patch } : c));
+  };
+
+  // Flip which end is the source: swaps endpoints and their pointer styles,
+  // so the drawing looks the same but traffic analysis runs the other way
+  const reverseConnection = (conn) => {
+    const cur = getConnEndStyles(conn);
+    setConnections(prev => prev.map(c => c.id === conn.id ? {
+      ...c,
+      from: conn.to,
+      fromType: conn.toType || 'node',
+      to: conn.from,
+      toType: conn.fromType || 'node',
+      startStyle: cur.end,
+      endStyle: cur.start
+    } : c));
   };
 
   // Bulk connection editing — apply a patch to every selected connection
@@ -1401,7 +1663,8 @@ export default function Nodex() {
   // pulled out of their <foreignObject> wrappers (foreignObject HTML doesn't
   // render outside the app because it relies on Tailwind classes/XHTML)
   const prepareExportSvg = () => {
-    const svgElement = canvasRef.current?.querySelector('svg');
+    // The diagram itself — overlays (trace bar, legend) contain icon SVGs too
+    const svgElement = canvasRef.current?.querySelector('svg.nx-canvas');
     const bounds = getContentBounds();
     if (!svgElement || !bounds) return null;
 
@@ -1714,7 +1977,9 @@ export default function Nodex() {
       label: '',
       description: '',
       iconId: 'server',
-      color: '#3b82f6'
+      color: '#3b82f6',
+      role: 'standard',
+      endpoints: []
     });
     setEditingNode(null);
     pendingConnectFromRef.current = null;
@@ -1733,10 +1998,46 @@ export default function Nodex() {
       label: node.label,
       description: node.description || '',
       iconId: node.iconId,
-      color: node.color
+      color: node.color,
+      role: node.role === 'vip' ? 'vip' : 'standard',
+      endpoints: (node.endpoints || []).map(ep => ({ ...ep }))
     });
     setEditingNode(node);
     setShowNodeCreator(true);
+  };
+
+  // Endpoints as saved: blank rows dropped, addresses trimmed, ports
+  // numeric; `undefined` (field omitted) when none are left
+  const cleanEndpoints = (eps) => {
+    const out = (eps || [])
+      .filter(ep => ep.address && ep.address.trim())
+      .map(ep => {
+        const ct = checkType(ep.check);
+        const port = parseInt(ep.port, 10);
+        return {
+          id: ep.id,
+          address: ep.address.trim(),
+          check: ct.id,
+          ...(ct.port && Number.isInteger(port) && port !== ct.defaultPort ? { port } : {}),
+          ...(ct.path && ep.path && ep.path !== '/' ? { path: ep.path } : {}),
+          ...(ct.id === 'https' && ep.insecure ? { insecure: true } : {})
+        };
+      });
+    return out.length ? out : undefined;
+  };
+
+  // One-off check from the node editor
+  const [endpointTests, setEndpointTests] = useState({});
+  const testEndpoint = async (ep) => {
+    const [target] = collectTargets([{ id: 'test', endpoints: [ep] }]);
+    if (!target) return;
+    setEndpointTests(prev => ({ ...prev, [ep.id]: { pending: true } }));
+    try {
+      const [r] = await probeTargets(monitorSettingsRef.current, [target]);
+      setEndpointTests(prev => ({ ...prev, [ep.id]: r }));
+    } catch (err) {
+      setEndpointTests(prev => ({ ...prev, [ep.id]: { up: null, error: err.message } }));
+    }
   };
 
   const createOrUpdateNode = () => {
@@ -1745,7 +2046,7 @@ export default function Nodex() {
     if (editingNode) {
       setNodes(nodes.map(n => 
         n.id === editingNode.id 
-          ? { ...n, label: newNodeData.label, description: newNodeData.description, iconId: newNodeData.iconId, color: newNodeData.color }
+          ? { ...n, label: newNodeData.label, description: newNodeData.description, iconId: newNodeData.iconId, color: newNodeData.color, role: newNodeData.role === 'vip' ? 'vip' : undefined, endpoints: cleanEndpoints(newNodeData.endpoints) }
           : n
       ));
     } else {
@@ -1767,6 +2068,8 @@ export default function Nodex() {
         description: newNodeData.description,
         iconId: newNodeData.iconId,
         color: newNodeData.color,
+        ...(newNodeData.role === 'vip' ? { role: 'vip' } : {}),
+        ...(cleanEndpoints(newNodeData.endpoints) ? { endpoints: cleanEndpoints(newNodeData.endpoints) } : {}),
         q: coords.q,
         r: coords.r
       };
@@ -1816,7 +2119,8 @@ export default function Nodex() {
       color: zone.color,
       cells: zone.cells,
       labelSide: zone.labelSide || 'center',
-      labelPlacement: zone.labelPlacement || 'inside'
+      labelPlacement: zone.labelPlacement || 'inside',
+      policy: getZonePolicy(zone)
     });
     setEditingZone(zone);
     setShowZoneCreator(true);
@@ -1845,7 +2149,8 @@ export default function Nodex() {
               color: newZoneData.color,
               cells: newZoneData.cells,
               labelSide: newZoneData.labelSide,
-              labelPlacement: newZoneData.labelPlacement
+              labelPlacement: newZoneData.labelPlacement,
+              policy: newZoneData.policy || getZonePolicy(z)
             }
           : z
       ));
@@ -1857,7 +2162,8 @@ export default function Nodex() {
         cells: selectedZoneCells,
         shape: zoneShape,
         labelSide: newZoneData.labelSide,
-        labelPlacement: newZoneData.labelPlacement
+        labelPlacement: newZoneData.labelPlacement,
+        policy: newZoneData.policy || getZonePolicy({})
       };
       setZones([...zones, newZone]);
     }
@@ -1892,6 +2198,16 @@ export default function Nodex() {
     const worldX = (e.clientX - rect.left - viewOffset.x) / zoom;
     const worldY = (e.clientY - rect.top - viewOffset.y) / zoom;
     didMarqueeRef.current = false;
+
+    // Simulation is a viewing mode: left-drag anywhere pans (clicks on
+    // components toggle failures in their own handlers)
+    if (simModeRef.current && (e.button === 0 || e.button === 1)) {
+      simPanRef.current = { x: e.clientX, y: e.clientY, moved: false };
+      setIsPanning(true);
+      setPanStart({ x: e.clientX - viewOffset.x, y: e.clientY - viewOffset.y });
+      e.preventDefault();
+      return;
+    }
 
     if (e.button === 1 || (e.button === 0 && e.shiftKey && !isCreatingZone)) {
       setIsPanning(true);
@@ -2057,6 +2373,9 @@ export default function Nodex() {
     }
 
     if (isPanning) {
+      if (Math.hypot(e.clientX - simPanRef.current.x, e.clientY - simPanRef.current.y) > 4) {
+        simPanRef.current.moved = true;
+      }
       setViewOffset({
         x: e.clientX - panStart.x,
         y: e.clientY - panStart.y
@@ -2173,6 +2492,12 @@ export default function Nodex() {
     // selects labels, and double-click selects the node's label text
     e.preventDefault();
 
+    // Nodes don't move during a simulation; Shift+Click still descends
+    if (simModeRef.current) {
+      if (e.shiftKey) navigateToNode(node);
+      return;
+    }
+
     // Shift+click to navigate into nested diagram
     if (e.shiftKey) {
       navigateToNode(node);
@@ -2218,6 +2543,10 @@ export default function Nodex() {
 
   const handleNodeClick = (e, node) => {
     e.stopPropagation();
+    if (simModeRef.current) {
+      if (!e.shiftKey) toggleFailure(nodeKey(node.id));
+      return;
+    }
     if (connectingFrom) {
       const isSelf = connectingFrom.kind === 'node' && connectingFrom.id === node.id;
       if (!isSelf) {
@@ -2249,6 +2578,7 @@ export default function Nodex() {
 
   const handleNodeDoubleClick = (e, node) => {
     e.stopPropagation();
+    if (simModeRef.current) return;
     // Set initial mouse position to node position so the line doesn't jump to (0,0)
     const nodePos = axialToPixel(node.q, node.r);
     setMousePos({ x: nodePos.x, y: nodePos.y });
@@ -2257,6 +2587,10 @@ export default function Nodex() {
 
   const handleZoneClick = (e, zone) => {
     e.stopPropagation();
+    if (simModeRef.current) {
+      if (!simPanRef.current.moved) toggleFailure(zoneKey(zone.id));
+      return;
+    }
     // A marquee drag that ended on this zone fires a click — ignore it
     if (didMarqueeRef.current) return;
     // Same for the click that follows a zone move
@@ -2300,6 +2634,7 @@ export default function Nodex() {
 
   const handleZoneDoubleClick = (e, zone) => {
     e.stopPropagation();
+    if (simModeRef.current) return;
     setConnectingFrom({ kind: 'zone', id: zone.id, label: zone.label || 'Zone' });
   };
 
@@ -2333,7 +2668,7 @@ export default function Nodex() {
 
   const handleZoneMouseDown = (e, zone) => {
     if (e.button !== 1) return;
-    if (isCreatingZone) return;
+    if (isCreatingZone || simModeRef.current) return;
     // Only a selected zone moves — middle-drag on unselected zones pans
     if (selectedZoneRef.current?.id !== zone.id) return;
     startZoneDrag(e, zone);
@@ -2456,19 +2791,19 @@ export default function Nodex() {
         e.preventDefault();
         copyNode();
       }
-      if ((e.ctrlKey || e.metaKey) && e.key === 'v' && clipboardRef.current && !inModal && !inField) {
+      if ((e.ctrlKey || e.metaKey) && e.key === 'v' && clipboardRef.current && !inModal && !inField && !simModeRef.current) {
         e.preventDefault();
         pasteNode();
       }
       // Duplicate selection (also blocks the browser's bookmark dialog)
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'd' && !inModal && !inField) {
         e.preventDefault();
-        if (selectedNodeIdsRef.current.length > 0) duplicateSelection();
+        if (selectedNodeIdsRef.current.length > 0 && !simModeRef.current) duplicateSelection();
       }
 
       if ((e.key === 'Delete' || e.key === 'Backspace') && !inModal) {
         // Don't prevent default if we're in an input field
-        if (inField) return;
+        if (inField || simModeRef.current) return;
         e.preventDefault();
         if (selectedNodeIdsRef.current.length > 0 || selectedConnectionIdsRef.current.length > 0) {
           if (selectedNodeIdsRef.current.length > 0) deleteSelectedNodes();
@@ -2478,6 +2813,7 @@ export default function Nodex() {
         }
       }
       if (e.key === 'Escape') {
+        setShowMonitorSettings(false);
         setConnectingFrom(null);
         setSelectedNodeIds([]);
         setSelectedConnectionIds([]);
@@ -2536,23 +2872,7 @@ export default function Nodex() {
       if (type === 'zone') {
         const z = zones.find(zz => zz.id === id);
         if (!z || z.cells.length === 0) return null;
-        let sx = 0, sy = 0;
-        z.cells.forEach(c => {
-          const p = axialToPixel(c.q, c.r);
-          sx += p.x;
-          sy += p.y;
-        });
-        let cx = sx / z.cells.length;
-        let cy = sy / z.cells.length;
-        const cc = pixelToAxial(cx, cy);
-        if (!z.cells.some(c => c.q === cc.q && c.r === cc.r)) {
-          let bd = Infinity;
-          z.cells.forEach(c => {
-            const p = axialToPixel(c.q, c.r);
-            const d = Math.hypot(p.x - cx, p.y - cy);
-            if (d < bd) { bd = d; cx = p.x; cy = p.y; }
-          });
-        }
+        const { x: cx, y: cy } = zoneAnchorPoint(z);
         return { type: 'zone', zone: z, x: cx, y: cy };
       }
       const n = nodes.find(nn => nn.id === id);
@@ -2671,6 +2991,511 @@ export default function Nodex() {
       toZone: epTo.type === 'zone' ? epTo.zone : null
     };
   });
+  connGeomsRef.current = connGeoms;
+
+  // ---- Focus: which entities/strands the isolated channels pass through ----
+  // `strands` is keyed connId|channelId so a connection shared by several
+  // channels lights up only the isolated strands. Hovering a node narrows
+  // the focus to the paths that actually pass through it.
+  const flows = analysis ? analysis.cur.flows : null;
+  const focus = (() => {
+    if (!flows || focusChannelIds.length === 0) return null;
+    const collect = (pick) => {
+      const ents = new Set();
+      const conns = new Set();
+      const strands = new Set();
+      focusChannelIds.forEach(chId => {
+        const f = flows.get(chId);
+        if (!f) return;
+        const part = pick(f);
+        if (!part) return;
+        part.entities.forEach(k => ents.add(k));
+        part.conns.forEach(id => {
+          conns.add(id);
+          strands.add(`${id}|${chId}`);
+        });
+      });
+      return { ents, conns, strands };
+    };
+    let sets = collect(f => ({
+      entities: [...f.entityState.keys()],
+      conns: [...f.connOnPath]
+    }));
+    let tracing = null;
+    const hoverKey = hoveredNode != null ? nodeKey(hoveredNode) : null;
+    if (hoverKey && sets.ents.has(hoverKey)) {
+      const traced = collect(f => traceThrough(f, hoverKey));
+      if (traced.ents.size > 0) {
+        sets = traced;
+        tracing = hoverKey;
+      }
+    }
+    // Zones that frame focused nodes stay visible as context
+    const contextZones = new Set();
+    nodes.forEach(n => {
+      if (sets.ents.has(nodeKey(n.id))) {
+        (analysis.model.nodeZones.get(n.id) || []).forEach(zid => contextZones.add(zid));
+      }
+    });
+    return { ...sets, contextZones, tracing };
+  })();
+
+  // Best flow state of an entity across the focused channels
+  const FLOW_RANK = { dead: 0, stranded: 1, standby: 2, active: 3 };
+  const focusFlowState = (key) => {
+    if (!focus) return null;
+    let best = null;
+    focusChannelIds.forEach(chId => {
+      const s = flows.get(chId)?.entityState.get(key);
+      if (s && (best === null || FLOW_RANK[s] > FLOW_RANK[best])) best = s;
+    });
+    return best;
+  };
+  const entityStatus = (key) => (statusView && analysis ? analysis.cur.entities.get(key) : null);
+
+  // ---- Sidebar: outage simulation panel ----
+  const ChannelStatusPill = ({ status }) => {
+    const meta = CHANNEL_STATUS[status] || CHANNEL_STATUS.unused;
+    return (
+      <span
+        className="px-1.5 py-0.5 rounded text-[10px] font-semibold uppercase tracking-wide shrink-0"
+        style={{ color: meta.color, backgroundColor: `${meta.color}22` }}
+      >
+        {meta.label}
+      </span>
+    );
+  };
+
+  const NOTE_STYLES = {
+    down: { color: '#fca5a5', mark: '✕' },
+    reroute: { color: '#93c5fd', mark: '↪' },
+    failover: { color: '#fcd34d', mark: '↻' }
+  };
+
+  const entityIcon = (key) => {
+    if (key.startsWith('z:')) return <Hexagon size={13} className="shrink-0 text-slate-400" />;
+    if (key.startsWith('c:')) return <ArrowLeftRight size={13} className="shrink-0 text-slate-400" />;
+    return <Box size={13} className="shrink-0 text-slate-400" />;
+  };
+
+  const renderSimPanel = () => {
+    if (!analysis) return null;
+    const M = analysis.model;
+    const failures = simFailureList.filter(k =>
+      k.startsWith('c:') ? connections.some(c => connKey(c.id) === k) : M.entities.has(k));
+    const listOf = (status) => [...M.entities.keys()]
+      .filter(k => !simFailures.has(k) && !liveDownSet.has(k) && analysis.cur.entities.get(k).status === status);
+    const unavailable = listOf('down');
+    const degraded = listOf('degraded');
+    const counts = analysis.cur.counts;
+    const EntityRow = ({ k, color }) => {
+      const es = analysis.cur.entities.get(k);
+      return (
+        <button
+          onClick={() => centerOn(k)}
+          className="w-full flex items-start gap-2 px-2 py-1.5 rounded hover:bg-slate-700 text-left group"
+          title="Center on canvas"
+        >
+          <span className="w-2 h-2 rounded-full mt-1.5 shrink-0" style={{ backgroundColor: color }} />
+          <span className="flex-1 min-w-0">
+            <span className="block text-sm truncate">{M.label(k)}</span>
+            {es.reasons[0] && <span className="block text-[11px] text-slate-400">{es.reasons[0]}</span>}
+          </span>
+          <LocateFixed size={13} className="mt-1 text-slate-500 opacity-0 group-hover:opacity-100 shrink-0" />
+        </button>
+      );
+    };
+    return (
+      <div className="space-y-5">
+        <div>
+          <div className="flex items-center justify-between mb-1">
+            <h2 className="text-lg font-bold flex items-center gap-2">
+              <FlaskConical size={18} className="text-red-400" />
+              Outage simulation
+            </h2>
+            <button
+              onClick={toggleSimMode}
+              className="px-2 py-1 rounded text-xs bg-slate-700 hover:bg-slate-600"
+            >
+              Exit
+            </button>
+          </div>
+          <p className="text-xs text-slate-400">
+            Click nodes, links or zones on the canvas to fail them. Nothing in the diagram changes — this is a what-if view.
+          </p>
+        </div>
+
+        {/* Health tiles */}
+        <div className="grid grid-cols-3 gap-2">
+          {['healthy', 'degraded', 'down'].map(st => (
+            <div key={st} className="rounded-lg bg-slate-900/60 border border-slate-700 px-2 py-2 text-center">
+              <div className="text-xl font-bold" style={{ color: STATUS_COLORS[st] }}>{counts[st]}</div>
+              <div className="text-[10px] uppercase tracking-wide text-slate-400">{STATUS_LABELS[st]}</div>
+            </div>
+          ))}
+        </div>
+
+        {/* Injected failures */}
+        <div>
+          <div className="flex items-center justify-between mb-1.5">
+            <h3 className="text-sm font-semibold text-slate-300">Failures ({failures.length})</h3>
+            {failures.length > 0 && (
+              <button onClick={resetFailures} className="flex items-center gap-1 text-xs text-slate-400 hover:text-white">
+                <RotateCcw size={12} /> Reset all
+              </button>
+            )}
+          </div>
+          {liveEnabled && (
+            <label className="flex items-center gap-2 mb-1.5 text-xs text-slate-300 cursor-pointer">
+              <input type="checkbox" checked={simIncludeLive} onChange={(e) => setSimIncludeLive(e.target.checked)} />
+              Start from live outages ({liveDownList.length} down now)
+            </label>
+          )}
+          {liveEnabled && simIncludeLive && liveDownList.length > 0 && (
+            <div className="space-y-1 mb-1">
+              {liveDownList.map(k => (
+                <div key={k} className="flex items-center gap-2 px-2 py-1.5 rounded bg-red-950/40 border border-red-900/60">
+                  <Activity size={13} className="text-red-400 shrink-0" />
+                  <button onClick={() => centerOn(k)} className="flex-1 min-w-0 text-left text-sm truncate hover:text-white text-slate-200">
+                    {M.label(k)}
+                  </button>
+                  <span className="text-[10px] px-1.5 py-0.5 rounded bg-red-900/60 text-red-200" title="Down according to live monitoring">LIVE</span>
+                </div>
+              ))}
+            </div>
+          )}
+          {failures.length === 0 ? (
+            <p className="text-xs text-slate-500">
+              Nothing failed yet. Click a component on the canvas, or run the single-point-of-failure scan below for ideas.
+            </p>
+          ) : (
+            <div className="space-y-1">
+              {failures.map(k => (
+                <div key={k} className="flex items-center gap-2 px-2 py-1.5 rounded bg-red-950/40 border border-red-900/60">
+                  <PowerOff size={13} className="text-red-400 shrink-0" />
+                  <button onClick={() => centerOn(k)} className="flex-1 min-w-0 text-left text-sm truncate hover:text-white text-slate-200">
+                    {M.label(k)}
+                  </button>
+                  <button
+                    onClick={() => toggleFailure(k)}
+                    className="p-1 rounded text-slate-400 hover:text-emerald-300 hover:bg-slate-700"
+                    title="Restore"
+                  >
+                    <RotateCcw size={12} />
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* Traffic flows */}
+        {channels.length > 0 && (
+          <div>
+            <h3 className="text-sm font-semibold text-slate-300 mb-1.5">Traffic flows</h3>
+            <div className="space-y-2">
+              {channels.map(ch => {
+                const sum = analysis.channels.get(ch.id);
+                const on = isolatedIds.includes(ch.id);
+                return (
+                  <div
+                    key={ch.id}
+                    className={`rounded-lg border px-2.5 py-2 ${on ? 'bg-slate-700/70' : 'bg-slate-900/40'}`}
+                    style={{ borderColor: on ? ch.color : '#334155' }}
+                    onMouseEnter={() => setHoverChannelId(ch.id)}
+                    onMouseLeave={() => setHoverChannelId(null)}
+                  >
+                    <div className="flex items-center gap-2">
+                      <span className="w-2.5 h-2.5 rounded-full shrink-0" style={{ backgroundColor: ch.color }} />
+                      <span className="text-sm font-medium flex-1 truncate">{ch.name}</span>
+                      <ChannelStatusPill status={sum?.status} />
+                      <button
+                        onClick={() => toggleIsolation(ch.id)}
+                        className={`p-1 rounded ${on ? 'text-white bg-slate-600' : 'text-slate-400 hover:text-white hover:bg-slate-700'}`}
+                        title={on ? 'Stop isolating' : 'Isolate on canvas'}
+                      >
+                        <Focus size={13} />
+                      </button>
+                    </div>
+                    {sum && <p className="text-[11px] text-slate-400 mt-1">{sum.headline}</p>}
+                    {sum?.notes?.length > 0 && (
+                      <ul className="mt-1 space-y-0.5">
+                        {sum.notes.map((n, i) => (
+                          <li key={i} className="text-[11px] flex gap-1.5" style={{ color: NOTE_STYLES[n.tone]?.color }}>
+                            <span className="shrink-0 w-3 text-center">{NOTE_STYLES[n.tone]?.mark}</span>
+                            <span>{n.text}</span>
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
+
+        {unavailable.length > 0 && (
+          <div>
+            <h3 className="text-sm font-semibold text-red-300 mb-1">Unavailable ({unavailable.length})</h3>
+            <div className="space-y-0.5">
+              {unavailable.map(k => <EntityRow key={k} k={k} color={STATUS_COLORS.down} />)}
+            </div>
+          </div>
+        )}
+        {degraded.length > 0 && (
+          <div>
+            <h3 className="text-sm font-semibold text-amber-300 mb-1">Degraded ({degraded.length})</h3>
+            <div className="space-y-0.5">
+              {degraded.map(k => <EntityRow key={k} k={k} color={STATUS_COLORS.degraded} />)}
+            </div>
+          </div>
+        )}
+
+        {/* Single points of failure */}
+        <div>
+          <div className="flex items-center justify-between mb-1">
+            <h3 className="text-sm font-semibold text-slate-300 flex items-center gap-1.5">
+              <ShieldAlert size={14} className="text-orange-400" />
+              Single points of failure
+            </h3>
+            <button
+              onClick={() => setShowSpof(v => !v)}
+              className="px-2 py-0.5 rounded text-xs bg-slate-700 hover:bg-slate-600"
+            >
+              {showSpof ? 'Hide' : 'Scan'}
+            </button>
+          </div>
+          <p className="text-[11px] text-slate-500 mb-1.5">
+            {failures.length
+              ? 'Components whose failure — on top of the current ones — would take a flow down.'
+              : 'Components whose failure alone would take a flow down.'}
+          </p>
+          {showSpof && spofs && (
+            spofs.length === 0 ? (
+              <p className="text-xs text-emerald-400">No single point of failure — every flow survives any one more failure.</p>
+            ) : (
+              <div className="space-y-0.5">
+                {spofs.map(sp => (
+                  <button
+                    key={sp.key}
+                    onClick={() => toggleFailure(sp.key)}
+                    className="w-full flex items-center gap-2 px-2 py-1.5 rounded hover:bg-slate-700 text-left"
+                    title="Click to simulate this failure"
+                  >
+                    {entityIcon(sp.key)}
+                    <span className="flex-1 min-w-0 text-sm truncate">{sp.label}</span>
+                    <span className="flex gap-1 shrink-0">
+                      {sp.channels.map(chId => {
+                        const ch = channels.find(c => c.id === chId);
+                        return ch ? (
+                          <span key={chId} className="w-2 h-2 rounded-full" style={{ backgroundColor: ch.color }} title={`Breaks ${ch.name}`} />
+                        ) : null;
+                      })}
+                    </span>
+                  </button>
+                ))}
+              </div>
+            )
+          )}
+        </div>
+      </div>
+    );
+  };
+
+
+  // ---- Sidebar: live monitoring panel ----
+  const renderLivePanel = () => {
+    const counts = { up: 0, partial: 0, down: 0, pending: 0, unknown: 0 };
+    liveNodeStatus.forEach(st => { counts[st.status]++; });
+    const problems = nodes
+      .filter(n => ['down', 'partial', 'unknown'].includes(liveNodeStatus.get(n.id)?.status) || liveNodeStatus.get(n.id)?.suspect)
+      .sort((a, b) => ['down', 'partial', 'unknown', 'up'].indexOf(liveNodeStatus.get(a.id).status) -
+        ['down', 'partial', 'unknown', 'up'].indexOf(liveNodeStatus.get(b.id).status));
+    const impacted = liveImpact && analysis
+      ? channels.map(ch => ({ ch, sum: analysis.channels.get(ch.id) })).filter(x => x.sum && x.sum.status !== 'healthy' && x.sum.status !== 'unused')
+      : [];
+    return (
+      <div className="mb-5 p-3 rounded-lg bg-slate-900/60 border border-slate-700">
+        <div className="flex items-center gap-2 mb-1">
+          <Activity size={15} className={liveChecking ? 'text-emerald-400 animate-pulse' : 'text-emerald-400'} />
+          <h3 className="text-sm font-semibold flex-1">Live monitoring</h3>
+          <span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-700 text-slate-300">
+            {monitorSettings.source === 'browser' ? 'Browser' : 'Agent'}
+          </span>
+          <button onClick={runLiveChecks} className="p-1 rounded text-slate-400 hover:text-white hover:bg-slate-700" title="Check now">
+            <RotateCcw size={12} />
+          </button>
+          <button onClick={() => setShowMonitorSettings(true)} className="p-1 rounded text-slate-400 hover:text-white hover:bg-slate-700" title="Settings">
+            <Settings size={12} />
+          </button>
+        </div>
+        <p className="text-[11px] text-slate-500 mb-2">
+          {liveChecking ? 'Checking…' : liveLastRun ? `Last checked ${new Date(liveLastRun).toLocaleTimeString()}` : 'Starting…'}
+          {' · every '}{monitorSettings.intervalSec}s
+        </p>
+        {liveError && (
+          <div className="mb-2 p-2 rounded bg-amber-950/50 border border-amber-800/60 text-[11px] text-amber-200">
+            {liveError}
+          </div>
+        )}
+        {liveTargets.length === 0 ? (
+          <p className="text-xs text-slate-400">
+            No addresses to check yet. Right-click a node → <span className="text-slate-200">Monitoring</span> to attach its IP addresses or URLs.
+          </p>
+        ) : (
+          <>
+            <div className="grid grid-cols-4 gap-1 mb-2 text-center">
+              {[['up', counts.up], ['partial', counts.partial], ['down', counts.down], ['pending', counts.pending + counts.unknown]].map(([k, v]) => (
+                <div key={k} className="rounded bg-slate-800 py-1">
+                  <div className="text-sm font-bold" style={{ color: LIVE_COLORS[k] }}>{v}</div>
+                  <div className="text-[9px] uppercase tracking-wide text-slate-500">{k === 'pending' ? 'other' : LIVE_LABELS[k]}</div>
+                </div>
+              ))}
+            </div>
+            {problems.length === 0 && !liveError && counts.up > 0 && (
+              <p className="text-xs text-emerald-400">All monitored nodes are answering.</p>
+            )}
+            <div className="space-y-0.5">
+              {problems.map(n => {
+                const st = liveNodeStatus.get(n.id);
+                const bad = st.endpoints.find(r => r.st && r.st.status !== 'up') || st.endpoints.find(r => r.st?.suspect);
+                return (
+                  <button
+                    key={n.id}
+                    onClick={() => centerOn(nodeKey(n.id))}
+                    className="w-full flex items-start gap-2 px-1.5 py-1 rounded hover:bg-slate-700 text-left"
+                    title="Center on canvas"
+                  >
+                    <span className="w-2 h-2 rounded-full mt-1.5 shrink-0" style={{ backgroundColor: LIVE_COLORS[st.status] }} />
+                    <span className="flex-1 min-w-0">
+                      <span className="block text-sm truncate">
+                        {n.label}
+                        {st.suspect && st.status === 'up' && <span className="text-[10px] text-amber-400"> · missed a check</span>}
+                      </span>
+                      {bad && (
+                        <span className="block text-[11px] text-slate-400 truncate">
+                          {endpointLabel(bad.ep)} — {bad.st?.last?.error || LIVE_LABELS[bad.st?.status || 'pending']}
+                        </span>
+                      )}
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+            {impacted.length > 0 && (
+              <div className="mt-2 pt-2 border-t border-slate-700">
+                <p className="text-[11px] font-semibold text-slate-300 mb-1">Traffic impact</p>
+                {impacted.map(({ ch, sum }) => (
+                  <div key={ch.id} className="flex items-center gap-2 py-0.5">
+                    <span className="w-2 h-2 rounded-full shrink-0" style={{ backgroundColor: ch.color }} />
+                    <span className="text-xs flex-1 truncate" title={sum.headline}>{ch.name}</span>
+                    <ChannelStatusPill status={sum.status} />
+                  </div>
+                ))}
+              </div>
+            )}
+            {liveImpact && (
+              <button
+                onClick={toggleSimMode}
+                className="mt-2 w-full flex items-center justify-center gap-1.5 px-2 py-1.5 rounded text-xs bg-slate-700 hover:bg-slate-600"
+                title="Open the simulation with the live outages already applied"
+              >
+                <FlaskConical size={12} />
+                Explore impact & what-ifs
+              </button>
+            )}
+          </>
+        )}
+      </div>
+    );
+  };
+
+  // ---- Sidebar: end-to-end trace of the isolated channels ----
+  const FLOW_STATE_STYLES = {
+    active: { opacity: 1, label: 'carrying traffic' },
+    standby: { opacity: 0.55, label: 'standby' },
+    stranded: { opacity: 0.4, label: 'stranded — no complete route' },
+    dead: { opacity: 1, label: 'down' }
+  };
+
+  const renderTracePanel = () => {
+    if (!analysis || isolatedIds.length === 0) return null;
+    const M = analysis.model;
+    return (
+      <div className="mt-3 space-y-3">
+        {isolatedIds.map(chId => {
+          const ch = channels.find(c => c.id === chId);
+          const flow = analysis.cur.flows.get(chId);
+          const sum = analysis.channels.get(chId);
+          if (!ch) return null;
+          if (!flow) {
+            return (
+              <div key={chId} className="rounded-lg bg-slate-900/50 border border-slate-700 p-2.5 text-xs text-slate-400">
+                <span className="font-medium" style={{ color: ch.color }}>{ch.name}</span> isn’t on any connection yet.
+              </div>
+            );
+          }
+          const stages = flowStages(flow);
+          return (
+            <div key={chId} className="rounded-lg bg-slate-900/50 border p-2.5" style={{ borderColor: `${ch.color}66` }}>
+              <div className="flex items-center gap-2 mb-1">
+                <span className="w-2.5 h-2.5 rounded-full" style={{ backgroundColor: ch.color }} />
+                <span className="text-sm font-medium flex-1 truncate">{ch.name}</span>
+                {sum && sum.status !== 'healthy' && <ChannelStatusPill status={sum.status} />}
+              </div>
+              <p className="text-[11px] text-slate-400 mb-2">
+                {flow.sources.length} entry point{flow.sources.length === 1 ? '' : 's'} → {flow.sinks.length} destination{flow.sinks.length === 1 ? '' : 's'} · {Math.max(0, stages.length - 1)} hop{stages.length === 2 ? '' : 's'}
+              </p>
+              {sum?.status === 'broken' && (
+                <p className="text-[11px] text-orange-300 mb-2">
+                  {sum.headline}. Check the arrow directions — traffic follows them (use Reverse in the connection drawer).
+                </p>
+              )}
+              <ol className="relative space-y-1.5">
+                {stages.map((stage, i) => (
+                  <li key={i} className="flex gap-2">
+                    <span className="flex flex-col items-center shrink-0">
+                      <span
+                        className="w-5 h-5 rounded-full text-[10px] flex items-center justify-center font-semibold"
+                        style={{ backgroundColor: `${ch.color}33`, color: ch.color }}
+                      >
+                        {i + 1}
+                      </span>
+                      {i < stages.length - 1 && <span className="w-px flex-1 mt-0.5" style={{ backgroundColor: `${ch.color}55` }} />}
+                    </span>
+                    <span className="flex flex-wrap gap-1 pb-0.5">
+                      {stage.map(k => {
+                        const st = flow.entityState.get(k) || 'active';
+                        const es = statusView ? analysis.cur.entities.get(k) : null;
+                        const dotColor = es ? STATUS_COLORS[es.status] : ch.color;
+                        return (
+                          <button
+                            key={k}
+                            onClick={() => centerOn(k)}
+                            className={`flex items-center gap-1 px-1.5 py-0.5 rounded text-[11px] bg-slate-700 hover:bg-slate-600 ${st === 'dead' ? 'line-through text-red-300' : ''}`}
+                            style={{ opacity: FLOW_STATE_STYLES[st]?.opacity }}
+                            title={`${M.label(k)} — ${FLOW_STATE_STYLES[st]?.label}`}
+                          >
+                            {k.startsWith('z:')
+                              ? <Hexagon size={10} style={{ color: dotColor }} />
+                              : <span className="w-1.5 h-1.5 rounded-full" style={{ backgroundColor: dotColor }} />}
+                            {M.label(k)}
+                          </button>
+                        );
+                      })}
+                    </span>
+                  </li>
+                ))}
+              </ol>
+            </div>
+          );
+        })}
+        <p className="text-[11px] text-slate-500">Hover a node on the canvas to trace only the paths through it. Click a hop to center on it.</p>
+      </div>
+    );
+  };
+
 
   return (
     <div className="flex flex-col h-screen bg-slate-900 text-white">
@@ -2868,6 +3693,61 @@ export default function Nodex() {
           </button>
         </div>
 
+        {/* Outage simulation */}
+        <div className="flex items-center gap-1 pr-2 border-r border-slate-600">
+          <button
+            onClick={toggleSimMode}
+            className={`px-2 py-1.5 rounded transition-colors text-xs flex items-center gap-1.5 ${
+              simMode
+                ? 'bg-red-600 text-white hover:bg-red-500'
+                : 'hover:bg-slate-700 text-slate-200'
+            }`}
+            title={simMode
+              ? 'Exit outage simulation'
+              : 'Outage simulation — fail nodes, links or zones and see what breaks'}
+          >
+            <FlaskConical size={16} />
+            <span>{simMode ? 'Simulating' : 'Simulate'}</span>
+            {simMode && simFailureList.length > 0 && (
+              <span className="px-1.5 rounded-full bg-white/20 text-[10px]">{simFailureList.length}</span>
+            )}
+          </button>
+          {(() => {
+            const total = liveNodeStatus.size;
+            const downCount = liveDownList.length;
+            const dot = !liveEnabled ? null
+              : liveError ? STATUS_COLORS.degraded
+              : downCount > 0 ? STATUS_COLORS.down
+              : [...liveNodeStatus.values()].some(st => st.status === 'partial') ? STATUS_COLORS.degraded
+              : total > 0 ? STATUS_COLORS.healthy : '#64748b';
+            return (
+              <button
+                onClick={() => setLiveEnabled(v => !v)}
+                className={`px-2 py-1.5 rounded transition-colors text-xs flex items-center gap-1.5 ${
+                  liveEnabled ? 'bg-slate-700 text-white hover:bg-slate-600' : 'hover:bg-slate-700 text-slate-200'
+                }`}
+                title={liveEnabled
+                  ? (liveError || `Live monitoring on — ${total} monitored node${total === 1 ? '' : 's'}, ${downCount} down`)
+                  : 'Live monitoring — check the real addresses attached to nodes'}
+              >
+                <Activity size={16} className={liveChecking ? 'animate-pulse' : undefined} />
+                <span>Live</span>
+                {dot && <span className="w-2 h-2 rounded-full" style={{ backgroundColor: dot }} />}
+                {liveEnabled && downCount > 0 && (
+                  <span className="px-1.5 rounded-full bg-red-600 text-white text-[10px]">{downCount}</span>
+                )}
+              </button>
+            );
+          })()}
+          <button
+            onClick={() => setShowMonitorSettings(true)}
+            className="p-1.5 hover:bg-slate-700 rounded transition-colors text-slate-400 hover:text-white"
+            title="Monitoring settings"
+          >
+            <Settings size={15} />
+          </button>
+        </div>
+
         {/* Breadcrumb in toolbar */}
         {currentPath.length > 1 && (
           <div className="flex items-center gap-1 ml-2 text-sm">
@@ -3002,7 +3882,9 @@ export default function Nodex() {
       <div className="flex flex-1 overflow-hidden">
       {/* Sidebar */}
       <div className="w-80 bg-slate-800 p-4 border-r border-slate-700 overflow-y-auto scrollbar-thin">
+        {simMode ? renderSimPanel() : (<>
         <h2 className="text-xl font-bold mb-4">Nodex</h2>
+        {liveEnabled && renderLivePanel()}
         
         <button
           onClick={() => openNodeCreator()}
@@ -3139,6 +4021,50 @@ export default function Nodex() {
               {selectedNode.description && (
                 <p className="text-xs text-slate-300 mb-2">{selectedNode.description}</p>
               )}
+              {(selectedNode.endpoints || []).length > 0 && (
+                <div className="mt-2 space-y-1">
+                  {selectedNode.endpoints.map(ep => {
+                    const st = liveEnabled ? liveState.get(endpointKey(selectedNode.id, ep)) : null;
+                    const up = uptimePercent(st);
+                    return (
+                      <div key={ep.id} className="flex items-center gap-2 text-xs">
+                        <span
+                          className="w-2 h-2 rounded-full shrink-0"
+                          style={{ backgroundColor: st ? LIVE_COLORS[st.status] : '#475569' }}
+                          title={st ? LIVE_LABELS[st.status] : 'Live monitoring is off'}
+                        />
+                        <span className="text-slate-400 shrink-0">{checkType(ep.check).label}</span>
+                        <span className="font-mono truncate flex-1" title={endpointLabel(ep)}>{endpointLabel(ep)}</span>
+                        {st?.last && (
+                          <span className="text-slate-400 shrink-0" title={st.last.error || st.last.detail || ''}>
+                            {st.last.up ? `${Math.round(st.last.latencyMs ?? 0)} ms` : st.last.up === false ? 'down' : '?'}
+                            {up != null && ` · ${up}%`}
+                          </span>
+                        )}
+                      </div>
+                    );
+                  })}
+                  {/* Recent check history, newest on the right */}
+                  {liveEnabled && (() => {
+                    const hist = selectedNode.endpoints
+                      .map(ep => liveState.get(endpointKey(selectedNode.id, ep))?.history || []);
+                    const len = Math.max(0, ...hist.map(h => h.length));
+                    if (len === 0) return null;
+                    const cols = Array.from({ length: len }, (_, i) => hist.map(h => h[h.length - len + i]).filter(Boolean));
+                    return (
+                      <div className="flex gap-px pt-1" title="Recent checks (all addresses)">
+                        {cols.map((col, i) => {
+                          const known = col.filter(c => c.up !== null);
+                          const color = known.length === 0 ? LIVE_COLORS.unknown
+                            : known.every(c => c.up) ? LIVE_COLORS.up
+                            : known.some(c => c.up) ? LIVE_COLORS.partial : LIVE_COLORS.down;
+                          return <span key={i} className="h-3 flex-1 rounded-sm" style={{ backgroundColor: color, opacity: 0.85 }} />;
+                        })}
+                      </div>
+                    );
+                  })()}
+                </div>
+              )}
             </div>
             <div className="flex gap-2">
               <button
@@ -3261,6 +4187,36 @@ export default function Nodex() {
                   ))}
                 </select>
               </div>
+              <div>
+                <p className="text-xs text-slate-400 mb-1">Link type</p>
+                <div className="flex gap-1 mb-1">
+                  <button
+                    onClick={() => updateSelectedConnections({ kind: undefined, required: undefined })}
+                    className="flex-1 px-2 py-1 rounded text-xs bg-slate-600 hover:bg-slate-500 transition-colors"
+                    title="Plain traffic links (not required, not peer)"
+                  >
+                    Traffic
+                  </button>
+                  <button
+                    onClick={() => updateSelectedConnections({ required: true, kind: undefined })}
+                    className="flex-1 px-2 py-1 rounded text-xs bg-slate-600 hover:bg-slate-500 transition-colors"
+                    title="Traffic links where the source requires the target"
+                  >
+                    Required
+                  </button>
+                </div>
+                <select
+                  onChange={(e) => {
+                    if (e.target.value) updateSelectedConnections({ kind: 'peer', peerMode: e.target.value });
+                    e.target.value = '';
+                  }}
+                  defaultValue=""
+                  className="w-full px-2 py-1 bg-slate-600 rounded text-xs"
+                >
+                  <option value="" disabled>Make peer links…</option>
+                  {PEER_MODES.map(m => <option key={m.id} value={m.id}>Peer — {m.label}</option>)}
+                </select>
+              </div>
               {channels.length > 0 && (
                 <div>
                   <p className="text-xs text-slate-400 mb-1">Channels (toggle on all)</p>
@@ -3307,7 +4263,9 @@ export default function Nodex() {
                 />
                 <p className="font-medium">{selectedZone.label}</p>
               </div>
-              <p className="text-xs text-slate-300">{selectedZone.cells.length} cells</p>
+              <p className="text-xs text-slate-300">
+                {selectedZone.cells.length} cells · {ZONE_POLICIES.find(p => p.id === getZonePolicy(selectedZone).mode)?.label}
+              </p>
               <p className="text-xs text-slate-400 mt-1">Middle-drag this selected zone to move it (nodes on it come along). Drag the round handle to resize.</p>
             </div>
             <button
@@ -3364,25 +4322,37 @@ export default function Nodex() {
             </p>
           )}
           <div className="space-y-1">
-            {channels.map(ch => (
-              <div key={ch.id} className="flex items-center gap-2 p-2 rounded hover:bg-slate-700 group text-sm">
+            {channels.map(ch => {
+              const on = isolatedIds.includes(ch.id);
+              return (
+              <div
+                key={ch.id}
+                className={`flex items-center gap-2 p-2 rounded group text-sm cursor-pointer ${on ? 'bg-slate-700' : 'hover:bg-slate-700'}`}
+                onClick={() => toggleIsolation(ch.id)}
+                onMouseEnter={() => setHoverChannelId(ch.id)}
+                onMouseLeave={() => setHoverChannelId(null)}
+                title={on ? 'Click to stop isolating' : 'Click to isolate this flow on the canvas'}
+              >
                 <div className="w-3 h-3 rounded-full shrink-0" style={{ backgroundColor: ch.color }} />
                 <span className="flex-1 truncate">{ch.name}</span>
+                <Focus size={13} className={on ? 'text-white' : 'text-slate-500 opacity-0 group-hover:opacity-100'} />
                 <button
-                  onClick={() => setChannelForm({ id: ch.id, name: ch.name, color: ch.color })}
+                  onClick={(e) => { e.stopPropagation(); setChannelForm({ id: ch.id, name: ch.name, color: ch.color }); }}
                   className="opacity-0 group-hover:opacity-100 text-blue-400 hover:text-blue-300 transition-opacity"
                 >
                   <Edit2 size={13} />
                 </button>
                 <button
-                  onClick={() => deleteChannel(ch.id)}
+                  onClick={(e) => { e.stopPropagation(); deleteChannel(ch.id); }}
                   className="opacity-0 group-hover:opacity-100 text-red-400 hover:text-red-300 transition-opacity"
                 >
                   <Trash2 size={13} />
                 </button>
               </div>
-            ))}
+              );
+            })}
           </div>
+          {renderTracePanel()}
           {channelForm && (
             <div className="mt-2 p-3 bg-slate-700 rounded-lg space-y-2">
               <input
@@ -3431,6 +4401,7 @@ export default function Nodex() {
             Clear All
           </button>
         )}
+        </>)}
       </div>
 
       {/* Canvas */}
@@ -3443,7 +4414,7 @@ export default function Nodex() {
         onWheel={handleWheel}
         onContextMenu={(e) => e.preventDefault()}
         style={{
-          cursor: isPanning || isDraggingZone ? 'grabbing' : isCreatingZone ? 'crosshair' : connectingFrom ? 'crosshair' : resizingZone ? 'nwse-resize' : 'default'
+          cursor: isPanning || isDraggingZone ? 'grabbing' : simMode ? 'grab' : isCreatingZone ? 'crosshair' : connectingFrom ? 'crosshair' : resizingZone ? 'nwse-resize' : 'default'
         }}
       >
         {/* File drop overlay — pointer-events-none so it never steals the
@@ -3456,7 +4427,239 @@ export default function Nodex() {
             </div>
           </div>
         )}
-        <svg className="w-full h-full">
+        {/* Channel trace bar — click to isolate one or more flows, hover to
+            preview one on its own */}
+        {channels.length > 0 && !isCreatingZone && (
+          <div
+            className="absolute top-3 left-1/2 -translate-x-1/2 z-20 flex items-center gap-1 px-2 py-1 rounded-full bg-slate-800/90 backdrop-blur border border-slate-600 shadow-xl max-w-[calc(100%-2rem)] overflow-x-auto scrollbar-thin"
+            onMouseDown={(e) => e.stopPropagation()}
+            onMouseLeave={() => setHoverChannelId(null)}
+          >
+            <span className="flex items-center gap-1 pl-1 pr-2 text-xs text-slate-400 shrink-0" title="Isolate traffic channels">
+              <Workflow size={14} />
+              Trace
+            </span>
+            {channels.map(ch => {
+              const on = isolatedIds.includes(ch.id);
+              const chStatus = statusView && analysis ? analysis.channels.get(ch.id)?.status : null;
+              return (
+                <button
+                  key={ch.id}
+                  onClick={() => toggleIsolation(ch.id)}
+                  onMouseEnter={() => setHoverChannelId(ch.id)}
+                  onMouseLeave={() => setHoverChannelId(null)}
+                  className={`flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs shrink-0 transition-colors border ${
+                    on ? 'text-white' : 'text-slate-300 border-transparent hover:bg-slate-700'
+                  }`}
+                  style={on ? { backgroundColor: `${ch.color}33`, borderColor: ch.color } : undefined}
+                  title={on ? `Stop isolating ${ch.name}` : `Isolate ${ch.name}`}
+                >
+                  <span className="w-2.5 h-2.5 rounded-full" style={{ backgroundColor: ch.color }} />
+                  {ch.name}
+                  {chStatus && chStatus !== 'healthy' && (
+                    <span
+                      className="w-1.5 h-1.5 rounded-full"
+                      style={{ backgroundColor: CHANNEL_STATUS[chStatus]?.color }}
+                      title={CHANNEL_STATUS[chStatus]?.label}
+                    />
+                  )}
+                </button>
+              );
+            })}
+            {isolatedIds.length > 0 && (
+              <button
+                onClick={clearIsolation}
+                className="ml-1 p-1 rounded-full text-slate-400 hover:text-white hover:bg-slate-700 shrink-0"
+                title="Show all traffic"
+              >
+                <X size={14} />
+              </button>
+            )}
+          </div>
+        )}
+
+        {/* Simulation strip */}
+        {simMode && (
+          <div
+            className="absolute bottom-4 left-1/2 -translate-x-1/2 z-20 flex items-center gap-3 pl-3 pr-1.5 py-1.5 rounded-full bg-slate-800/95 backdrop-blur border border-red-500/60 shadow-xl text-xs whitespace-nowrap"
+            onMouseDown={(e) => e.stopPropagation()}
+          >
+            <span className="flex items-center gap-1.5 text-red-300 font-semibold">
+              <FlaskConical size={14} />
+              Outage simulation
+            </span>
+            <span className="text-slate-400 hidden md:inline">Click nodes, links or zones to fail / restore</span>
+            {analysis && (
+              <span className="flex items-center gap-2 text-slate-300">
+                {['healthy', 'degraded', 'down'].map(st => (
+                  <span key={st} className="flex items-center gap-1" title={`${STATUS_LABELS[st]} components`}>
+                    <span className="w-2 h-2 rounded-full" style={{ backgroundColor: STATUS_COLORS[st] }} />
+                    {analysis.cur.counts[st]}
+                  </span>
+                ))}
+              </span>
+            )}
+            <button
+              onClick={resetFailures}
+              disabled={simFailureList.length === 0}
+              className="flex items-center gap-1 px-2 py-1 rounded-full bg-slate-700 hover:bg-slate-600 disabled:opacity-40 disabled:cursor-not-allowed"
+            >
+              <RotateCcw size={12} />
+              Reset
+            </button>
+            <button
+              onClick={toggleSimMode}
+              className="px-2.5 py-1 rounded-full bg-red-600 hover:bg-red-500 text-white"
+            >
+              Exit
+            </button>
+          </div>
+        )}
+
+        {/* Legend */}
+        {(statusView || focus || liveEnabled) && (
+          <div className="absolute bottom-4 left-4 z-10 px-3 py-2 rounded-lg bg-slate-800/90 backdrop-blur border border-slate-700 text-[11px] text-slate-300 space-y-1 pointer-events-none">
+            {liveEnabled && (
+              <div className="flex items-center gap-2 pb-0.5">
+                <span className="relative flex items-center justify-center w-2.5 h-2.5">
+                  <span className="w-2.5 h-2.5 rounded-full border-2" style={{ borderColor: LIVE_COLORS.up, backgroundColor: '#0f172a' }} />
+                </span>
+                Live check (bottom-left dot)
+              </div>
+            )}
+            {statusView && (
+              <>
+                {['healthy', 'degraded', 'down'].map(st => (
+                  <div key={st} className="flex items-center gap-2">
+                    <span className="w-2.5 h-2.5 rounded-full" style={{ backgroundColor: STATUS_COLORS[st] }} />
+                    {STATUS_LABELS[st]}
+                  </div>
+                ))}
+                <div className="flex items-center gap-2">
+                  <PowerOff size={11} className="text-red-400" />
+                  {simMode ? 'Failed (injected or live)' : 'Down (live check)'}
+                </div>
+                <div className="flex items-center gap-2">
+                  <span className="text-amber-400 font-bold w-2.5 text-center">↻</span>
+                  Covered by failover
+                </div>
+              </>
+            )}
+            {focus && (
+              <>
+                <div className="flex items-center gap-2">
+                  <svg width="22" height="6"><line x1="0" y1="3" x2="22" y2="3" stroke="#e2e8f0" strokeWidth="2" /><line className="nx-flow" x1="0" y1="3" x2="22" y2="3" stroke="#e2e8f0" strokeWidth="4" strokeLinecap="round" strokeDasharray="0.5 13.5" /></svg>
+                  Carrying traffic
+                </div>
+                <div className="flex items-center gap-2">
+                  <svg width="22" height="6"><line x1="0" y1="3" x2="22" y2="3" stroke="#e2e8f0" strokeWidth="2" strokeDasharray="6,5" opacity="0.5" /></svg>
+                  Standby
+                </div>
+                <div className="flex items-center gap-2">
+                  <svg width="22" height="6"><line x1="0" y1="3" x2="22" y2="3" stroke="#e2e8f0" strokeWidth="2" strokeDasharray="2,4" opacity="0.4" /></svg>
+                  Stranded (no complete route)
+                </div>
+                <div className="text-slate-500 pt-0.5">Hover a node to trace paths through it</div>
+              </>
+            )}
+          </div>
+        )}
+
+        {/* Hover card — a component's status and why (simulation / live
+            impact), plus the live check result of each of its addresses */}
+        {(simMode || liveEnabled) && (() => {
+          let key = null;
+          let kind = null;
+          if (hoveredNode != null) { key = nodeKey(hoveredNode); kind = 'Node'; }
+          else if (hoveredConnection != null) { key = connKey(hoveredConnection); kind = 'Link'; }
+          else if (hoveredZone != null) { key = zoneKey(hoveredZone); kind = 'Zone'; }
+          if (!key) return null;
+          const live = kind === 'Node' ? liveNodeStatus.get(hoveredNode) : null;
+          const showStatus = statusView && analysis;
+          if (!showStatus && !live) return null;
+
+          let title = kind === 'Node' ? nodes.find(n => n.id === hoveredNode)?.label : '';
+          let status = null;
+          let reasons = [];
+          let failed = simFailures.has(key);
+          const liveDown = liveDownSet.has(key);
+          let extra = null;
+          if (showStatus) {
+            if (kind === 'Link') {
+              const cs = analysis.cur.conns.get(hoveredConnection);
+              if (!cs) return null;
+              title = analysis.model.connLabel(hoveredConnection);
+              status = cs.status === 'ok' ? 'healthy' : 'down';
+              if (cs.reason) reasons = [cs.reason];
+              const conn = connections.find(c => c.id === hoveredConnection);
+              if (conn?.kind === 'peer') {
+                extra = `Peer link · ${PEER_MODES.find(m => m.id === (conn.peerMode || 'failover'))?.label}`;
+              } else if (conn?.required) {
+                extra = 'Required dependency';
+              }
+            } else {
+              const es = analysis.cur.entities.get(key);
+              if (!es) return null;
+              title = analysis.model.label(key);
+              status = es.status;
+              reasons = es.reasons;
+              failed = es.failed && !liveDown;
+              if (es.coveredBy) extra = `Role taken over by ${analysis.model.label(es.coveredBy)}`;
+              else if (es.holder) extra = `VIP held by ${analysis.model.label(es.holder)}`;
+              if (kind === 'Zone') {
+                const z = zones.find(zz => zoneKey(zz.id) === key);
+                const pol = ZONE_POLICIES.find(p => p.id === getZonePolicy(z).mode);
+                extra = [extra, `Policy: ${pol?.label}`].filter(Boolean).join(' · ');
+              }
+            }
+          }
+          const height = 150 + (live ? live.endpoints.length * 18 : 0);
+          const left = Math.min(mousePos.x * zoom + viewOffset.x + 16, canvasSize.width - 330);
+          const top = Math.min(mousePos.y * zoom + viewOffset.y + 16, canvasSize.height - height);
+          return (
+            <div
+              className="absolute z-30 w-80 px-3 py-2 rounded-lg bg-slate-900/95 border border-slate-600 shadow-2xl text-xs pointer-events-none"
+              style={{ left, top }}
+            >
+              <div className="flex items-center gap-2 mb-1">
+                <span className="text-slate-500 uppercase tracking-wide text-[10px]">{kind}</span>
+                <span className="font-semibold text-slate-100 truncate flex-1">{title}</span>
+              </div>
+              {status && (
+                <div className="flex items-center gap-1.5 mb-1">
+                  <span className="w-2 h-2 rounded-full" style={{ backgroundColor: STATUS_COLORS[status] }} />
+                  <span style={{ color: STATUS_COLORS[status] }} className="font-medium">
+                    {liveDown ? 'Down (live check)' : failed ? 'Failed (injected)' : STATUS_LABELS[status]}
+                  </span>
+                </div>
+              )}
+              {reasons.filter(r => !/^Failed \(simulated|Link failed \(simulated/.test(r)).map((r, i) => (
+                <p key={i} className="text-slate-300">• {r}</p>
+              ))}
+              {extra && <p className="text-amber-300 mt-0.5">{extra}</p>}
+              {live && (
+                <div className={status ? 'mt-1.5 pt-1.5 border-t border-slate-700' : ''}>
+                  <div className="flex items-center gap-1.5 mb-0.5">
+                    <span className="w-2 h-2 rounded-full" style={{ backgroundColor: LIVE_COLORS[live.status] }} />
+                    <span className="font-medium" style={{ color: LIVE_COLORS[live.status] }}>Live: {LIVE_LABELS[live.status]}</span>
+                  </div>
+                  {live.endpoints.map(({ ep, st }) => (
+                    <div key={ep.id} className="flex items-center gap-1.5 text-slate-300">
+                      <span className="w-1.5 h-1.5 rounded-full shrink-0" style={{ backgroundColor: LIVE_COLORS[st?.status || 'pending'] }} />
+                      <span className="font-mono truncate">{checkType(ep.check).label} {endpointLabel(ep)}</span>
+                      <span className="ml-auto shrink-0 text-slate-400">
+                        {st?.last?.up ? `${Math.round(st.last.latencyMs ?? 0)} ms` : <span className="block max-w-[8rem] truncate" title={st?.last?.error}>{st?.last?.error || '…'}</span>}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              )}
+              {simMode && <p className="text-slate-500 mt-1">Click to {failed ? 'restore' : 'fail'}</p>}
+            </div>
+          );
+        })()}
+
+        <svg className="nx-canvas w-full h-full">
           <g transform={`translate(${viewOffset.x}, ${viewOffset.y}) scale(${zoom})`}>
             {/* Zone backgrounds */}
             {zones.map(zone => (
@@ -3466,9 +4669,24 @@ export default function Nodex() {
                   !(connectingFrom.kind === 'zone' && connectingFrom.id === zone.id);
                 const isZoneSelected = selectedZone?.id === zone.id;
                 const EDGE_DIRS = HEX_EDGE_DIRS;
+                const zk = zoneKey(zone.id);
+                const zs = entityStatus(zk);
+                const zoneDimmed = focus && !focus.ents.has(zk) && !focus.contextZones.has(zone.id);
+                const isSimHover = simMode && hoveredZone === zone.id && hoveredNode == null && hoveredConnection == null;
+                let outline = isConnectTarget ? '#22c55e' : zone.color;
+                let outlineWidth = isConnectTarget || isZoneSelected ? 2.5 : 1.5;
+                let outlineDash = null;
+                if (zs && zs.status !== 'healthy') {
+                  outline = STATUS_COLORS[zs.status];
+                  outlineWidth = zs.failed ? 3 : 2.5;
+                  outlineDash = zs.status === 'down' && !zs.failed ? '6,4' : null;
+                }
+                if (isSimHover) outlineWidth += 1;
                 return (
                   <g
                     key={`zone-${zone.id}`}
+                    opacity={zoneDimmed ? 0.25 : 1}
+                    style={{ transition: 'opacity 200ms' }}
                     onClick={(e) => handleZoneClick(e, zone)}
                     onDoubleClick={(e) => handleZoneDoubleClick(e, zone)}
                     onMouseDown={(e) => handleZoneMouseDown(e, zone)}
@@ -3482,8 +4700,20 @@ export default function Nodex() {
                           key={`zone-${zone.id}-${cell.q}-${cell.r}`}
                           points={getHexagonPoints(pos.x, pos.y, HEX_SIZE)}
                           fill={zone.color}
-                          opacity={isConnectTarget ? 0.35 : isZoneSelected ? 0.4 : 0.2}
+                          opacity={isConnectTarget ? 0.35 : isZoneSelected ? 0.4 : isSimHover ? 0.3 : zs?.status === 'down' ? 0.1 : 0.2}
                           className="cursor-pointer transition-opacity"
+                        />
+                      );
+                    })}
+                    {/* Failed zone: red hatch over every cell */}
+                    {zs?.failed && zone.cells.map(cell => {
+                      const pos = axialToPixel(cell.q, cell.r);
+                      return (
+                        <polygon
+                          key={`zhatch-${zone.id}-${cell.q}-${cell.r}`}
+                          points={getHexagonPoints(pos.x, pos.y, HEX_SIZE)}
+                          fill="url(#nx-hatch)"
+                          pointerEvents="none"
                         />
                       );
                     })}
@@ -3505,8 +4735,9 @@ export default function Nodex() {
                               y1={pos.y + HEX_SIZE * Math.sin(a1)}
                               x2={pos.x + HEX_SIZE * Math.cos(a2)}
                               y2={pos.y + HEX_SIZE * Math.sin(a2)}
-                              stroke={isConnectTarget ? '#22c55e' : zone.color}
-                              strokeWidth={isConnectTarget || isZoneSelected ? 2.5 : 1.5}
+                              stroke={outline}
+                              strokeWidth={outlineWidth}
+                              strokeDasharray={outlineDash}
                               opacity="0.9"
                               strokeLinecap="round"
                               pointerEvents="none"
@@ -3523,6 +4754,9 @@ export default function Nodex() {
             {zones.map(zone => {
               if (zone.cells.length === 0 || !zone.label) return null;
               const layout = getZoneLabelLayout(zone);
+              const zk = zoneKey(zone.id);
+              const zs = entityStatus(zk);
+              const dimmed = focus && !focus.ents.has(zk) && !focus.contextZones.has(zone.id);
               return (
                 <text
                   key={`zone-label-${zone.id}`}
@@ -3533,9 +4767,15 @@ export default function Nodex() {
                   fontWeight="bold"
                   textAnchor={layout.textAnchor}
                   pointerEvents="none"
-                  style={{ textShadow: '0 0 4px rgba(0,0,0,0.8)' }}
+                  opacity={dimmed ? 0.25 : 1}
+                  style={{ textShadow: '0 0 4px rgba(0,0,0,0.8)', transition: 'opacity 200ms' }}
                 >
                   {zone.label}
+                  {zs && zs.status !== 'healthy' && (
+                    <tspan fill={STATUS_COLORS[zs.status]} fontSize="11">
+                      {'  '}{zs.failed ? '⏻ FAILED' : zs.status === 'down' ? '● DOWN' : '● DEGRADED'}
+                    </tspan>
+                  )}
                 </text>
               );
             })}
@@ -3568,7 +4808,7 @@ export default function Nodex() {
             ))}
 
             {/* Hovered cell with plus button */}
-            {hoveredCell && !isCreatingZone && (
+            {hoveredCell && !isCreatingZone && !simMode && (
               <g 
                 transform={`translate(${axialToPixel(hoveredCell.q, hoveredCell.r).x}, ${axialToPixel(hoveredCell.q, hoveredCell.r).y})`}
                 onClick={(e) => {
@@ -3637,6 +4877,11 @@ export default function Nodex() {
               const lineColor = conn.color || '#64748b';
               const markerColorKey = lineColor.replace('#', '');
               const isConnSelected = selectedConnectionIds.includes(conn.id);
+              const connSim = statusView && analysis ? analysis.cur.conns.get(conn.id) : null;
+              const connBroken = connSim && connSim.status !== 'ok';
+              const connDimmed = focus && !focus.conns.has(conn.id);
+              // Flow direction for the animated particles
+              const flowReversed = connFlowReversed(conn);
 
               // Visible pieces per polyline segment: [0,1] minus the exact
               // footprint of every label box the segment crosses — its own
@@ -3677,7 +4922,7 @@ export default function Nodex() {
               const pathD = pts.map((p, i) => `${i === 0 ? 'M' : 'L'}${p.x} ${p.y}`).join(' ');
 
               return (
-                <g key={conn.id}>
+                <g key={conn.id} opacity={connDimmed ? 0.08 : 1} style={{ transition: 'opacity 200ms' }}>
                   {/* Wider invisible hit area for hover */}
                   <path
                     d={pathD}
@@ -3692,6 +4937,10 @@ export default function Nodex() {
                     onMouseLeave={() => setHoveredConnection(null)}
                     onClick={(e) => {
                       e.stopPropagation();
+                      if (simMode) {
+                        if (!simPanRef.current.moved) toggleFailure(connKey(conn.id));
+                        return;
+                      }
                       if (didMarqueeRef.current) return;
                       // Ctrl+Click toggles the connection in the bulk selection.
                       // If the single-edit drawer is open, its connection joins
@@ -3765,32 +5014,76 @@ export default function Nodex() {
                       if (geom.fromZone) retrim(0, 1, geom.fromZone);
                       if (geom.toZone) retrim(sPts.length - 1, sPts.length - 2, geom.toZone);
                     }
-                    const strandColor = ch ? ch.color : (isHovered && !conn.color ? '#94a3b8' : lineColor);
-                    const strandKey = (ch ? ch.color : lineColor).replace('#', '');
+                    let strandColor = ch ? ch.color : (isHovered && !conn.color ? '#94a3b8' : lineColor);
+                    let strandDash = strokeDasharray;
+                    let strandOpacity = 1;
+                    let animate = false;
+                    // Flow state of this strand: active / standby / stranded / dead
+                    const flowState = ch && flows ? flows.get(ch.id)?.connState.get(conn.id) : null;
+                    const strandFocused = !focus || (ch
+                      ? focus.strands.has(`${conn.id}|${ch.id}`)
+                      : focus.conns.has(conn.id));
+                    if (connBroken || flowState === 'dead') {
+                      if (statusView) {
+                        strandColor = STATUS_COLORS.down;
+                        strandDash = '5,4';
+                        strandOpacity = connSim?.status === 'failed' ? 0.95 : 0.6;
+                      }
+                    } else if (flowState === 'standby' && (statusView || focus)) {
+                      strandDash = '6,5';
+                      strandOpacity = 0.45;
+                    } else if (flowState === 'stranded' && (statusView || focus)) {
+                      strandDash = '2,4';
+                      strandOpacity = 0.3;
+                    } else if (flowState === 'active') {
+                      animate = !!focus;
+                    }
+                    if (focus && !strandFocused) {
+                      strandOpacity = Math.min(strandOpacity, 0.1);
+                      animate = false;
+                    }
+                    const strandKey = strandColor.replace('#', '');
                     return pieces.map((piece, i) => {
                       const A = sPts[piece.segIdx];
                       const B = sPts[piece.segIdx + 1];
                       const p1 = { x: A.x + (B.x - A.x) * piece.s, y: A.y + (B.y - A.y) * piece.s };
                       const p2 = { x: A.x + (B.x - A.x) * piece.e, y: A.y + (B.y - A.y) * piece.e };
                       return (
-                        <line
-                          key={`${si}-${i}`}
-                          x1={p1.x}
-                          y1={p1.y}
-                          x2={p2.x}
-                          y2={p2.y}
-                          stroke={strandColor}
-                          strokeWidth={isHovered ? 3 : 2}
-                          strokeDasharray={strokeDasharray}
-                          markerStart={piece.atStart && endStyles.start !== 'none' ? `url(#arrow-${endStyles.start}-${strandKey})` : undefined}
-                          markerEnd={piece.atEnd && endStyles.end !== 'none' ? `url(#arrow-${endStyles.end}-${strandKey})` : undefined}
-                          pointerEvents="none"
-                        />
+                        <React.Fragment key={`${si}-${i}`}>
+                          <line
+                            x1={p1.x}
+                            y1={p1.y}
+                            x2={p2.x}
+                            y2={p2.y}
+                            stroke={strandColor}
+                            strokeWidth={isHovered ? 3 : 2}
+                            strokeDasharray={strandDash}
+                            opacity={strandOpacity}
+                            markerStart={piece.atStart && endStyles.start !== 'none' ? `url(#arrow-${endStyles.start}-${strandKey})` : undefined}
+                            markerEnd={piece.atEnd && endStyles.end !== 'none' ? `url(#arrow-${endStyles.end}-${strandKey})` : undefined}
+                            pointerEvents="none"
+                          />
+                          {/* Moving particles show which way traffic flows */}
+                          {animate && (
+                            <line
+                              className={`ui-overlay ${flowReversed ? 'nx-flow-rev' : 'nx-flow'}`}
+                              x1={p1.x}
+                              y1={p1.y}
+                              x2={p2.x}
+                              y2={p2.y}
+                              stroke={strandColor}
+                              strokeWidth="4"
+                              strokeLinecap="round"
+                              strokeDasharray="0.5 13.5"
+                              pointerEvents="none"
+                            />
+                          )}
+                        </React.Fragment>
                       );
                     });
                   })}
                   {/* Label and icon - hidden when hovered */}
-                  {geom.box && !isHovered && (
+                  {geom.box && (!isHovered || simMode) && connSim?.status !== 'failed' && (
                     <g transform={`translate(${mid.x}, ${mid.y}) rotate(${labelRotation})`}>
                       {ConnIcon && (
                         <foreignObject
@@ -3833,8 +5126,15 @@ export default function Nodex() {
                       ))}
                     </g>
                   )}
+                  {/* Simulated link failure marker */}
+                  {connSim?.status === 'failed' && (
+                    <g transform={`translate(${mid.x}, ${mid.y})`} pointerEvents="none">
+                      <circle r="9" fill="#0f172a" stroke={STATUS_COLORS.down} strokeWidth="2" />
+                      <path d="M -3.5 -3.5 L 3.5 3.5 M 3.5 -3.5 L -3.5 3.5" stroke={STATUS_COLORS.down} strokeWidth="2" strokeLinecap="round" />
+                    </g>
+                  )}
                   {/* Delete button - centered on line, only visible on hover */}
-                  {isHovered && (
+                  {isHovered && !simMode && (
                     <>
                       <circle
                         cx={mid.x}
@@ -3863,6 +5163,71 @@ export default function Nodex() {
                       </text>
                     </>
                   )}
+                </g>
+              );
+            })}
+
+            {/* Failover arcs: failed member → peer that took over its role,
+                floating VIP → current holder, primary → promoted standby */}
+            {analysis && (statusView || focus) && analysis.cur.failovers.map(fo => {
+              // VIP holder arcs are informative in the baseline too; the
+              // others only exist once something has failed
+              if (!statusView && fo.kind !== 'vip') return null;
+              const a = entityCenter(fo.from);
+              const b = entityCenter(fo.to);
+              if (!a || !b) return null;
+              const dist = Math.hypot(b.x - a.x, b.y - a.y);
+              if (dist < 1) return null;
+              const bend = Math.max(30, dist * 0.25);
+              const ctrl = {
+                x: (a.x + b.x) / 2 - ((b.y - a.y) / dist) * bend,
+                y: (a.y + b.y) / 2 + ((b.x - a.x) / dist) * bend
+              };
+              const start = fo.from.startsWith('n:') ? nodeEdgePoint(a, ctrl) : a;
+              const end = fo.to.startsWith('n:') ? nodeEdgePoint(b, ctrl) : b;
+              const labelPt = {
+                x: 0.25 * start.x + 0.5 * ctrl.x + 0.25 * end.x,
+                y: 0.25 * start.y + 0.5 * ctrl.y + 0.25 * end.y
+              };
+              const text = fo.kind === 'vip' ? 'VIP' : fo.kind === 'standby' ? 'promoted' : 'failover';
+              const dimmed = focus && !(focus.ents.has(fo.from) || focus.ents.has(fo.to));
+              const color = STATUS_COLORS.degraded;
+              return (
+                <g
+                  key={`fo-${fo.from}-${fo.to}`}
+                  pointerEvents="none"
+                  opacity={dimmed ? 0.12 : 1}
+                  style={{ transition: 'opacity 200ms' }}
+                >
+                  <path
+                    d={`M${start.x} ${start.y} Q${ctrl.x} ${ctrl.y} ${end.x} ${end.y}`}
+                    fill="none"
+                    stroke={color}
+                    strokeWidth="2"
+                    strokeDasharray="7,5"
+                    className={statusView ? 'nx-march' : undefined}
+                    markerEnd={`url(#arrow-arrow-${color.replace('#', '')})`}
+                  />
+                  <rect
+                    x={labelPt.x - (text.length * 3 + 6)}
+                    y={labelPt.y - 8}
+                    width={text.length * 6 + 12}
+                    height="16"
+                    rx="8"
+                    fill="#0f172a"
+                    stroke={color}
+                    strokeWidth="1"
+                  />
+                  <text
+                    x={labelPt.x}
+                    y={labelPt.y + 3.5}
+                    fill={color}
+                    fontSize="10"
+                    fontWeight="600"
+                    textAnchor="middle"
+                  >
+                    {text}
+                  </text>
                 </g>
               );
             })}
@@ -3935,6 +5300,7 @@ export default function Nodex() {
               // Determine stroke style
               let strokeColor = node.color;
               let strokeWidth = 2;
+              let strokeDash = null;
               if (isSelected) {
                 strokeColor = '#fbbf24';
                 strokeWidth = 4;
@@ -3946,30 +5312,66 @@ export default function Nodex() {
                 strokeWidth = 4;
               }
 
+              // Simulation status + isolation focus
+              const nk = nodeKey(node.id);
+              const ns = entityStatus(nk);
+              const isFailedNode = !!ns?.failed;
+              const isDownNode = ns?.status === 'down';
+              if (ns && ns.status !== 'healthy') {
+                strokeColor = STATUS_COLORS[ns.status];
+                strokeWidth = isFailedNode ? 4 : 3;
+                strokeDash = isDownNode && !isFailedNode ? '6,4' : null;
+              }
+              const flowState = focusFlowState(nk);
+              let groupOpacity = 1;
+              if (focus && !focus.ents.has(nk)) groupOpacity = 0.15;
+              else if (focus && !statusView && flowState === 'standby') groupOpacity = 0.6;
+              else if (focus && !statusView && flowState === 'stranded') groupOpacity = 0.4;
+              const isTraceOrigin = focus?.tracing === nk;
+              const isSimHover = simMode && hoveredNode === node.id;
+              const isVipNode = node.role === 'vip';
+              const NodeIcon = isFailedNode ? PowerOff : Icon;
+
               return (
                 <g
                   key={node.id}
                   className="node-element"
                   transform={`translate(${pos.x}, ${pos.y})`}
+                  opacity={groupOpacity}
                   onMouseDown={(e) => handleNodeMouseDown(e, node)}
                   onClick={(e) => handleNodeClick(e, node)}
                   onDoubleClick={(e) => handleNodeDoubleClick(e, node)}
                   onContextMenu={(e) => {
                     e.preventDefault();
                     e.stopPropagation();
+                    if (simMode) return;
                     setSelectedNodeIds([node.id]);
                     openNodeEditor(node);
                   }}
                   onMouseEnter={() => setHoveredNode(node.id)}
                   onMouseLeave={() => setHoveredNode(null)}
-                  style={{ cursor: 'move' }}
+                  style={{ cursor: simMode ? 'pointer' : 'move', transition: 'opacity 200ms' }}
                 >
+                  {/* Trace origin / simulation hover ring */}
+                  {(isTraceOrigin || isSimHover) && (
+                    <polygon
+                      className="ui-overlay"
+                      points={getHexagonPoints(0, 0, HEX_SIZE + 6)}
+                      fill="none"
+                      stroke={isSimHover ? '#e2e8f0' : '#fbbf24'}
+                      strokeWidth="1.5"
+                      strokeDasharray="4,3"
+                      opacity="0.8"
+                      pointerEvents="none"
+                    />
+                  )}
                   <polygon
                     points={getHexagonPoints(0, 0, HEX_SIZE)}
-                    fill={node.color}
+                    fill={isFailedNode ? '#1e293b' : node.color}
                     stroke={strokeColor}
                     strokeWidth={strokeWidth}
-                    opacity="0.9"
+                    strokeDasharray={strokeDash}
+                    opacity={isDownNode && !isFailedNode ? 0.45 : 0.9}
                   />
                   {/* Nested indicator */}
                   {hasNested && (
@@ -3988,17 +5390,74 @@ export default function Nodex() {
                     width={HEX_SIZE}
                     height={HEX_SIZE}
                     pointerEvents="none"
+                    opacity={isDownNode && !isFailedNode ? 0.6 : 1}
                   >
                     <div className="w-full h-full flex items-center justify-center">
-                      <Icon size={24} color="white" />
+                      <NodeIcon size={24} color={isFailedNode ? STATUS_COLORS.down : 'white'} />
                     </div>
                   </foreignObject>
+                  {/* Floating VIP tag */}
+                  {isVipNode && (
+                    <g transform={`translate(0, ${HEX_SIZE * 0.62})`} pointerEvents="none">
+                      <rect x="-12" y="-6" width="24" height="12" rx="6" fill="#0f172a" stroke="#f59e0b" strokeWidth="1" />
+                      <text y="3" fill="#fbbf24" fontSize="8" fontWeight="700" textAnchor="middle">VIP</text>
+                    </g>
+                  )}
+                  {/* Simulation status badge */}
+                  {ns && (simMode || ns.status !== 'healthy') && (
+                    ns.status === 'healthy' ? (
+                      <circle
+                        cx={-HEX_SIZE * 0.6}
+                        cy={-HEX_SIZE * 0.6}
+                        r="4"
+                        fill={STATUS_COLORS.healthy}
+                        stroke="#0f172a"
+                        strokeWidth="1.5"
+                        pointerEvents="none"
+                      />
+                    ) : (
+                      <g
+                        transform={`translate(${-HEX_SIZE * 0.6}, ${-HEX_SIZE * 0.6})`}
+                        pointerEvents="none"
+                      >
+                        {isFailedNode && (
+                          <circle className="nx-pulse ui-overlay" r="8" fill="none" stroke={STATUS_COLORS.down} strokeWidth="2" />
+                        )}
+                        <circle r="8" fill={STATUS_COLORS[ns.status]} stroke="#0f172a" strokeWidth="1.5" />
+                        <text y="3.5" fill="#0f172a" fontSize="10" fontWeight="800" textAnchor="middle">
+                          {ns.status === 'down' ? '×' : '!'}
+                        </text>
+                      </g>
+                    )
+                  )}
+                  {/* Live check result */}
+                  {liveNodeStatus.has(node.id) && (() => {
+                    const ls = liveNodeStatus.get(node.id);
+                    const color = LIVE_COLORS[ls.status];
+                    return (
+                      <g transform={`translate(${-HEX_SIZE * 0.6}, ${HEX_SIZE * 0.6})`} pointerEvents="none">
+                        {ls.status === 'down' && (
+                          <circle className="nx-pulse ui-overlay" r="6" fill="none" stroke={color} strokeWidth="2" />
+                        )}
+                        <circle r="6" fill="#0f172a" stroke={ls.suspect ? STATUS_COLORS.degraded : color} strokeWidth="2" />
+                        <circle r="3" fill={color} />
+                      </g>
+                    );
+                  })()}
+                  {/* Covered by a failover peer */}
+                  {ns?.coveredBy && (
+                    <g transform={`translate(${HEX_SIZE * 0.6}, ${HEX_SIZE * 0.6})`} pointerEvents="none">
+                      <circle r="8" fill="#0f172a" stroke={STATUS_COLORS.degraded} strokeWidth="1.5" />
+                      <text y="3.5" fill={STATUS_COLORS.degraded} fontSize="11" fontWeight="700" textAnchor="middle">↻</text>
+                    </g>
+                  )}
                   <text
                     y={HEX_SIZE + 15}
-                    fill="white"
+                    fill={isDownNode ? '#fca5a5' : 'white'}
                     fontSize="12"
                     textAnchor="middle"
                     fontWeight="500"
+                    textDecoration={isFailedNode ? 'line-through' : undefined}
                     pointerEvents="none"
                   >
                     {node.label}
@@ -4024,7 +5483,7 @@ export default function Nodex() {
             )}
 
             {/* Zone resize handle — corner for rectangles, radius for hex/circular */}
-            {selectedZone && !isCreatingZone && (() => {
+            {selectedZone && !isCreatingZone && !simMode && (() => {
               const zone = zones.find(z => z.id === selectedZone.id);
               if (!zone || zone.cells.length === 0) return null;
               const shape = inferZoneShape(zone);
@@ -4070,6 +5529,10 @@ export default function Nodex() {
             })()}
 
             <defs>
+              <pattern id="nx-hatch" patternUnits="userSpaceOnUse" width="8" height="8" patternTransform="rotate(45)">
+                <rect width="8" height="8" fill="#ef4444" opacity="0.08" />
+                <line x1="0" y1="0" x2="0" y2="8" stroke="#ef4444" strokeWidth="2.5" opacity="0.55" />
+              </pattern>
               {/* Legacy id used by the temporary connect line */}
               <marker id="arrowhead" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
                 <polygon points="0 0, 10 3, 0 6" fill="#64748b" />
@@ -4078,7 +5541,9 @@ export default function Nodex() {
                   auto-start-reverse flips them correctly as markerStart */}
               {[...new Set([
                 ...connections.map(c => c.color || '#64748b'),
-                ...channels.map(ch => ch.color)
+                ...channels.map(ch => ch.color),
+                STATUS_COLORS.down,
+                STATUS_COLORS.degraded
               ])].map(color => {
                 const key = color.replace('#', '');
                 return (
@@ -4189,6 +5654,154 @@ export default function Nodex() {
                 </div>
               </div>
 
+              <div>
+                <label className="block text-sm font-medium mb-2">Resilience role</label>
+                <div className="grid grid-cols-2 gap-2">
+                  {[
+                    { id: 'standard', label: 'Standard', help: 'A real component with its own capacity.' },
+                    { id: 'vip', label: 'Floating VIP', help: 'A virtual address held by one failover peer at a time. Link it to its holders with Peer → Failover links.' }
+                  ].map(opt => (
+                    <button
+                      key={opt.id}
+                      onClick={() => setNewNodeData({ ...newNodeData, role: opt.id })}
+                      className={`text-left px-3 py-2 rounded transition-all ${
+                        (newNodeData.role || 'standard') === opt.id
+                          ? 'bg-blue-600/30 ring-2 ring-blue-400'
+                          : 'bg-slate-700 hover:bg-slate-600'
+                      }`}
+                    >
+                      <span className="block text-sm font-medium">{opt.label}</span>
+                      <span className="block text-xs text-slate-400">{opt.help}</span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div>
+                <div className="flex items-center justify-between mb-1">
+                  <label className="text-sm font-medium flex items-center gap-1.5">
+                    <Activity size={14} className="text-emerald-400" />
+                    Monitoring
+                  </label>
+                  <button
+                    onClick={() => setNewNodeData({
+                      ...newNodeData,
+                      endpoints: [...(newNodeData.endpoints || []), { id: genId(), address: '', check: 'icmp' }]
+                    })}
+                    className="flex items-center gap-1 px-2 py-1 rounded text-xs bg-slate-700 hover:bg-slate-600"
+                  >
+                    <Plus size={12} /> Add address
+                  </button>
+                </div>
+                <p className="text-xs text-slate-400 mb-2">
+                  Real IP addresses or hostnames of this component. Turn on <span className="text-slate-200">Live</span> in the toolbar to check them — outages show on the canvas and in the traffic impact.
+                </p>
+                <div className="space-y-2">
+                  {(newNodeData.endpoints || []).map((ep, i) => {
+                    const ct = checkType(ep.check);
+                    const addrError = ep.address ? validateAddress(ep.address) : null;
+                    const test = endpointTests[ep.id];
+                    const setEp = (patch) => setNewNodeData({
+                      ...newNodeData,
+                      endpoints: newNodeData.endpoints.map((e, j) => (j === i ? { ...e, ...patch } : e))
+                    });
+                    return (
+                      <div key={ep.id} className="p-2 rounded bg-slate-900/60 border border-slate-700">
+                        <div className="flex gap-2">
+                          <select
+                            value={ep.check}
+                            onChange={(e) => setEp({ check: e.target.value, port: undefined })}
+                            className="px-2 py-1.5 bg-slate-700 rounded border border-slate-600 text-sm"
+                            title="How to check it"
+                          >
+                            {CHECK_TYPES.map(c => (
+                              <option key={c.id} value={c.id}>
+                                {c.long}{c.agentOnly && monitorSettings.source === 'browser' ? ' (agent)' : ''}
+                              </option>
+                            ))}
+                          </select>
+                          <input
+                            type="text"
+                            value={ep.address}
+                            onChange={(e) => setEp({ address: e.target.value })}
+                            placeholder="10.0.0.12 or db1.internal"
+                            spellCheck={false}
+                            className={`flex-1 min-w-0 px-2 py-1.5 bg-slate-700 rounded border font-mono text-sm focus:outline-none ${
+                              addrError ? 'border-red-500' : 'border-slate-600 focus:border-blue-500'
+                            }`}
+                          />
+                          {ct.port && (
+                            <input
+                              type="number"
+                              min="1"
+                              max="65535"
+                              value={ep.port ?? ''}
+                              onChange={(e) => setEp({ port: e.target.value })}
+                              placeholder={String(ct.defaultPort)}
+                              className="w-20 px-2 py-1.5 bg-slate-700 rounded border border-slate-600 text-sm focus:outline-none focus:border-blue-500"
+                              title="Port"
+                            />
+                          )}
+                          <button
+                            onClick={() => setNewNodeData({
+                              ...newNodeData,
+                              endpoints: newNodeData.endpoints.filter((_, j) => j !== i)
+                            })}
+                            className="p-1.5 rounded text-slate-400 hover:text-red-400 hover:bg-slate-700"
+                            title="Remove"
+                          >
+                            <Trash2 size={14} />
+                          </button>
+                        </div>
+                        {ct.path && (
+                          <div className="flex items-center gap-2 mt-2">
+                            <input
+                              type="text"
+                              value={ep.path ?? ''}
+                              onChange={(e) => setEp({ path: e.target.value })}
+                              placeholder="/ (path to request, e.g. /health)"
+                              spellCheck={false}
+                              className="flex-1 px-2 py-1 bg-slate-700 rounded border border-slate-600 font-mono text-xs focus:outline-none focus:border-blue-500"
+                            />
+                            {ct.id === 'https' && (
+                              <label className="flex items-center gap-1 text-xs text-slate-400" title="Accept self-signed / internal certificates (agent only)">
+                                <input type="checkbox" checked={!!ep.insecure} onChange={(e) => setEp({ insecure: e.target.checked })} />
+                                Any cert
+                              </label>
+                            )}
+                          </div>
+                        )}
+                        <div className="flex items-center gap-2 mt-1.5 text-xs">
+                          {addrError ? (
+                            <span className="text-red-400">{addrError}</span>
+                          ) : (
+                            <span className="text-slate-500 font-mono truncate">{ep.address ? endpointLabel(ep) : ''}</span>
+                          )}
+                          <span className="ml-auto flex items-center gap-2 shrink-0">
+                            {test && !test.pending && (
+                              <span
+                                className="max-w-[14rem] truncate"
+                                style={{ color: test.up ? LIVE_COLORS.up : test.up === false ? LIVE_COLORS.down : LIVE_COLORS.partial }}
+                                title={test.error || test.detail}
+                              >
+                                {test.up ? `● Up · ${Math.round(test.latencyMs ?? 0)} ms` : `● ${test.error || 'Down'}`}
+                              </span>
+                            )}
+                            <button
+                              onClick={() => testEndpoint(ep)}
+                              disabled={!ep.address || !!addrError || test?.pending}
+                              className="px-2 py-0.5 rounded bg-slate-700 hover:bg-slate-600 disabled:opacity-40"
+                            >
+                              {test?.pending ? 'Testing…' : 'Test'}
+                            </button>
+                          </span>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+
               <div className="flex gap-3 pt-4">
                 <button
                   onClick={createOrUpdateNode}
@@ -4215,7 +5828,7 @@ export default function Nodex() {
       {/* Zone Creator Modal */}
       {showZoneCreator && (
         <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
-          <div className="bg-slate-800 rounded-lg p-6 w-full max-w-md">
+          <div className="bg-slate-800 rounded-lg p-6 w-full max-w-md max-h-[90vh] overflow-y-auto scrollbar-thin">
             <div className="flex items-center justify-between mb-4">
               <h2 className="text-xl font-bold">
                 {editingZone ? 'Edit Zone' : 'Create Zone'}
@@ -4307,6 +5920,64 @@ export default function Nodex() {
                 </div>
               </div>
 
+              {(() => {
+                const policy = newZoneData.policy || getZonePolicy({});
+                const setPolicy = (patch) => setNewZoneData({ ...newZoneData, policy: { ...policy, ...patch } });
+                const zoneCells = new Set((editingZone ? newZoneData.cells : selectedZoneCells).map(c => `${c.q},${c.r}`));
+                const members = nodes.filter(n => zoneCells.has(`${n.q},${n.r}`));
+                return (
+                  <div>
+                    <label className="block text-sm font-medium mb-1">Availability policy</label>
+                    <p className="text-xs text-slate-400 mb-2">
+                      How the {members.length} node{members.length === 1 ? '' : 's'} on this zone back each other up — used by the outage simulation.
+                    </p>
+                    <div className="space-y-1">
+                      {ZONE_POLICIES.map(pol => (
+                        <button
+                          key={pol.id}
+                          onClick={() => setPolicy({ mode: pol.id })}
+                          className={`w-full text-left px-3 py-1.5 rounded transition-all ${
+                            policy.mode === pol.id
+                              ? 'bg-emerald-600/25 ring-2 ring-emerald-400'
+                              : 'bg-slate-700 hover:bg-slate-600'
+                          }`}
+                        >
+                          <span className="block text-sm font-medium">{pol.label}</span>
+                          <span className="block text-xs text-slate-400">{pol.help}</span>
+                        </button>
+                      ))}
+                    </div>
+                    {policy.mode === 'min' && (
+                      <label className="flex items-center gap-2 mt-2 text-sm">
+                        Minimum healthy members
+                        <input
+                          type="number"
+                          min="1"
+                          max={Math.max(1, members.length)}
+                          value={policy.min}
+                          onChange={(e) => setPolicy({ min: Math.max(1, parseInt(e.target.value, 10) || 1) })}
+                          className="w-16 px-2 py-1 bg-slate-700 rounded border border-slate-600 focus:border-emerald-500 focus:outline-none"
+                        />
+                        <span className="text-xs text-slate-400">of {members.length}</span>
+                      </label>
+                    )}
+                    {policy.mode === 'failover' && (
+                      <label className="flex items-center gap-2 mt-2 text-sm">
+                        Primary
+                        <select
+                          value={policy.primaryId ?? ''}
+                          onChange={(e) => setPolicy({ primaryId: e.target.value === '' ? null : Number(e.target.value) })}
+                          className="flex-1 px-2 py-1 bg-slate-700 rounded border border-slate-600 text-sm"
+                        >
+                          <option value="">First member{members[0] ? ` (${members[0].label})` : ''}</option>
+                          {members.map(m => <option key={m.id} value={m.id}>{m.label}</option>)}
+                        </select>
+                      </label>
+                    )}
+                  </div>
+                );
+              })()}
+
               <p className="text-sm text-slate-400">
                 {editingZone ? `${editingZone.cells.length} cells selected` : `${selectedZoneCells.length} cells selected`}
               </p>
@@ -4333,6 +6004,162 @@ export default function Nodex() {
           </div>
         </div>
       )}
+
+
+      {/* Monitoring settings */}
+      {showMonitorSettings && (() => {
+        const st = monitorSettings;
+        const set = (patch) => setMonitorSettings({ ...st, ...patch });
+        return (
+          <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50" onMouseDown={() => setShowMonitorSettings(false)}>
+            <div className="bg-slate-800 rounded-lg p-6 w-full max-w-lg max-h-[90vh] overflow-y-auto scrollbar-thin" onMouseDown={(e) => e.stopPropagation()}>
+              <div className="flex items-center justify-between mb-1">
+                <h2 className="text-xl font-bold flex items-center gap-2">
+                  <Activity size={20} className="text-emerald-400" />
+                  Live monitoring
+                </h2>
+                <button onClick={() => setShowMonitorSettings(false)} className="text-slate-400 hover:text-white">
+                  <X size={22} />
+                </button>
+              </div>
+              <p className="text-xs text-slate-400 mb-4">
+                These settings stay in this browser. The addresses to check are part of the diagram (node editor → Monitoring).
+              </p>
+
+              <label className="block text-sm font-medium mb-2">Check from</label>
+              <div className="grid grid-cols-2 gap-2 mb-4">
+                {[
+                  { id: 'agent', label: 'Monitor agent', help: 'Ping, TCP ports, HTTP(S). Run the small Nodex agent on a machine that can reach your hosts.' },
+                  { id: 'browser', label: 'This browser', help: 'No setup, HTTP(S) only — browsers can’t ping or test raw ports.' }
+                ].map(opt => (
+                  <button
+                    key={opt.id}
+                    onClick={() => { set({ source: opt.id }); setMonitorHealth(null); }}
+                    className={`text-left px-3 py-2 rounded transition-all ${
+                      st.source === opt.id ? 'bg-emerald-600/25 ring-2 ring-emerald-400' : 'bg-slate-700 hover:bg-slate-600'
+                    }`}
+                  >
+                    <span className="block text-sm font-medium">{opt.label}</span>
+                    <span className="block text-xs text-slate-400">{opt.help}</span>
+                  </button>
+                ))}
+              </div>
+
+              {st.source === 'agent' && (
+                <div className="space-y-3 mb-4">
+                  <div>
+                    <label className="block text-sm font-medium mb-1">Agent URL</label>
+                    <input
+                      type="text"
+                      value={st.agentUrl}
+                      onChange={(e) => { set({ agentUrl: e.target.value }); setMonitorHealth(null); }}
+                      spellCheck={false}
+                      className="w-full px-3 py-2 bg-slate-700 rounded border border-slate-600 font-mono text-sm focus:border-emerald-500 focus:outline-none"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-sm font-medium mb-1">Token <span className="text-slate-500 font-normal">(if the agent sets NODEX_MONITOR_TOKEN)</span></label>
+                    <input
+                      type="password"
+                      value={st.token}
+                      onChange={(e) => { set({ token: e.target.value }); setMonitorHealth(null); }}
+                      autoComplete="off"
+                      className="w-full px-3 py-2 bg-slate-700 rounded border border-slate-600 font-mono text-sm focus:border-emerald-500 focus:outline-none"
+                    />
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <button
+                      onClick={async () => {
+                        setMonitorHealth({ pending: true });
+                        setMonitorHealth(await agentHealth(monitorSettingsRef.current));
+                      }}
+                      className="px-3 py-1.5 rounded text-sm bg-slate-700 hover:bg-slate-600"
+                    >
+                      Test connection
+                    </button>
+                    {monitorHealth?.pending && <span className="text-xs text-slate-400">Connecting…</span>}
+                    {monitorHealth && !monitorHealth.pending && (
+                      monitorHealth.ok ? (
+                        <span className="text-xs text-emerald-400">
+                          ● Connected · v{monitorHealth.version} · {monitorHealth.checks?.join(', ')}
+                          {monitorHealth.allowlist ? ' · allowlist on' : ''}
+                        </span>
+                      ) : (
+                        <span className="text-xs text-red-400">● {monitorHealth.error}</span>
+                      )
+                    )}
+                  </div>
+                  {monitorHealth?.ok && !monitorHealth.checks?.includes('icmp') && (
+                    <p className="text-xs text-amber-300">The agent has no ping available — ping checks will show as “can’t check”. Use TCP or HTTP checks, or install ping on the agent host.</p>
+                  )}
+                  <div className="p-3 rounded bg-slate-900/70 text-xs text-slate-300 space-y-1">
+                    <p className="font-medium text-slate-200">Run the agent</p>
+                    <p>From the Nodex folder: <code className="px-1 bg-slate-800 rounded">npm run monitor</code> (listens on localhost:7070)</p>
+                    <p>Or with Docker: <code className="px-1 bg-slate-800 rounded">docker compose up -d</code> (starts it next to Nodex)</p>
+                    <p className="text-slate-400">Restrict what it may probe with <code className="px-1 bg-slate-800 rounded">NODEX_MONITOR_ALLOW=10.0.0.0/8</code> and require <code className="px-1 bg-slate-800 rounded">NODEX_MONITOR_TOKEN</code> if anyone else can reach it.</p>
+                  </div>
+                </div>
+              )}
+
+              <div className="grid grid-cols-3 gap-3">
+                <label className="text-sm">
+                  <span className="block font-medium mb-1">Every (s)</span>
+                  <input
+                    type="number"
+                    min="5"
+                    max="3600"
+                    value={st.intervalSec}
+                    onChange={(e) => set({ intervalSec: Math.max(5, parseInt(e.target.value, 10) || 15) })}
+                    className="w-full px-2 py-1.5 bg-slate-700 rounded border border-slate-600 focus:border-emerald-500 focus:outline-none"
+                  />
+                </label>
+                <label className="text-sm">
+                  <span className="block font-medium mb-1">Timeout (ms)</span>
+                  <input
+                    type="number"
+                    min="500"
+                    max="10000"
+                    step="500"
+                    value={st.timeoutMs}
+                    onChange={(e) => set({ timeoutMs: Math.min(10000, Math.max(500, parseInt(e.target.value, 10) || 3000)) })}
+                    className="w-full px-2 py-1.5 bg-slate-700 rounded border border-slate-600 focus:border-emerald-500 focus:outline-none"
+                  />
+                </label>
+                <label className="text-sm" title="Consecutive failed checks before an address counts as down">
+                  <span className="block font-medium mb-1">Down after</span>
+                  <select
+                    value={st.failAfter}
+                    onChange={(e) => set({ failAfter: parseInt(e.target.value, 10) })}
+                    className="w-full px-2 py-1.5 bg-slate-700 rounded border border-slate-600"
+                  >
+                    {[1, 2, 3, 5].map(n => <option key={n} value={n}>{n} failed check{n > 1 ? 's' : ''}</option>)}
+                  </select>
+                </label>
+              </div>
+
+              <div className="flex gap-3 pt-5">
+                <button
+                  onClick={() => {
+                    setShowMonitorSettings(false);
+                    setLiveEnabled(true);
+                  }}
+                  className="flex-1 px-4 py-2 bg-emerald-600 hover:bg-emerald-700 rounded transition-colors"
+                >
+                  {liveEnabled ? 'Done' : 'Start monitoring'}
+                </button>
+                {liveEnabled && (
+                  <button
+                    onClick={() => { setLiveEnabled(false); setShowMonitorSettings(false); }}
+                    className="px-4 py-2 bg-slate-700 hover:bg-slate-600 rounded transition-colors"
+                  >
+                    Stop
+                  </button>
+                )}
+              </div>
+            </div>
+          </div>
+        );
+      })()}
 
       {/* Connection Editor Drawer — edits apply live (undo covers mistakes) */}
       {showConnectionEditor && editingConnection && (
@@ -4370,6 +6197,79 @@ export default function Nodex() {
                 placeholder="e.g., HTTP, API, Data Flow"
                 className="w-full px-3 py-2 bg-slate-700 rounded border border-slate-600 focus:border-blue-500 focus:outline-none"
               />
+            </div>
+
+            <div>
+              <label className="block text-sm font-medium mb-2">Link type</label>
+              <div className="flex gap-2 mb-2">
+                {[
+                  { id: 'traffic', label: 'Traffic' },
+                  { id: 'peer', label: 'Peer / cluster' }
+                ].map(k => (
+                  <button
+                    key={k.id}
+                    onClick={() => updateEditingConnection(k.id === 'peer'
+                      ? { kind: 'peer', peerMode: editingConnection.peerMode || 'failover' }
+                      : { kind: undefined })}
+                    className={`flex-1 px-3 py-2 rounded text-sm transition-all ${
+                      (editingConnection.kind || 'traffic') === k.id
+                        ? 'bg-blue-600 ring-2 ring-blue-400'
+                        : 'bg-slate-700 hover:bg-slate-600'
+                    }`}
+                  >
+                    {k.label}
+                  </button>
+                ))}
+              </div>
+              {editingConnection.kind === 'peer' ? (
+                <div className="space-y-1">
+                  {PEER_MODES.map(m => (
+                    <button
+                      key={m.id}
+                      onClick={() => updateEditingConnection({ peerMode: m.id })}
+                      className={`w-full text-left px-3 py-1.5 rounded transition-all ${
+                        (editingConnection.peerMode || 'failover') === m.id
+                          ? 'bg-blue-600/25 ring-2 ring-blue-400'
+                          : 'bg-slate-700 hover:bg-slate-600'
+                      }`}
+                    >
+                      <span className="block text-sm font-medium">{m.label}</span>
+                      <span className="block text-xs text-slate-400">{m.help}</span>
+                    </button>
+                  ))}
+                  <p className="text-xs text-slate-400 pt-1">
+                    Peer links carry no traffic. Every entity linked by them forms one cluster.
+                  </p>
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  <label className="flex items-start gap-2 text-sm cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={!!editingConnection.required}
+                      onChange={(e) => updateEditingConnection({ required: e.target.checked || undefined })}
+                      className="mt-1"
+                    />
+                    <span>
+                      Required dependency
+                      <span className="block text-xs text-slate-400">
+                        The source can’t work without the target — if the target goes down, so does the source.
+                      </span>
+                    </span>
+                  </label>
+                  <button
+                    onClick={() => reverseConnection(editingConnection)}
+                    className="w-full flex items-center justify-center gap-2 px-3 py-1.5 rounded text-sm bg-slate-700 hover:bg-slate-600 transition-colors"
+                    title="Swap source and target"
+                  >
+                    <ArrowLeftRight size={14} />
+                    Reverse direction
+                  </button>
+                  <p className="text-xs text-slate-400">
+                    Traffic flows from → to (toward the arrowhead).
+                  </p>
+                </div>
+              )}
             </div>
 
             <div>

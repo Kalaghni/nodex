@@ -6,3 +6,21 @@ services:
     ports:
       - "8080:80"
     restart: unless-stopped
+
+  # Probe agent for live monitoring (ping, TCP, HTTP). Published on
+  # localhost only: the browser running Nodex on this machine reaches it at
+  # http://localhost:7070. To use it from other machines, publish it more
+  # widely AND set NODEX_MONITOR_TOKEN.
+  monitor:
+    build: ./monitor
+    ports:
+      - "127.0.0.1:7070:7070"
+    environment:
+      # Only probe addresses inside these networks (comma-separated CIDRs)
+      - NODEX_MONITOR_ALLOW=${NODEX_MONITOR_ALLOW:-}
+      # Require `Authorization: Bearer <token>` (set the same token in Nodex)
+      - NODEX_MONITOR_TOKEN=${NODEX_MONITOR_TOKEN:-}
+    sysctls:
+      # Unprivileged ping (Docker's default, made explicit)
+      - net.ipv4.ping_group_range=0 2147483647
+    restart: unless-stopped
