@@ -42,6 +42,31 @@ Architecture diagramming on a hexagonal grid. Nodex is a single-page React app f
 - **Single-point-of-failure scan**: lists every component whose failure — on top of the current ones — would take a flow down; click one to simulate it
 - Combine with isolation to watch one flow re-route around failures in real time
 
+### Live monitoring
+- Attach **real addresses** to a node (right-click → *Monitoring*): IP or hostname plus a check — **Ping**, **TCP port open**, **HTTP** or **HTTPS** (with a path, e.g. `/health`). A node can have several; *Test* checks one on the spot
+- Toggle **Live** in the toolbar: every address is checked on an interval and each node gets a live dot — green up, amber partly up (some of its addresses fail), red down, grey can't check. Hover a node for per-address latency and errors; the sidebar lists what's failing and the recent check history of the selected node
+- **Real outages flow into the impact analysis**: a node that's really down is treated like a failure — dependents, failovers, and every affected traffic channel light up exactly as in a simulation. *Explore impact & what-ifs* opens the simulation starting from the live state, so you can ask "and if this fails too?"
+- An address only counts as down after *N* consecutive failed checks (default 2, configurable) so a single lost packet isn't an outage; recovery shows immediately. If the agent itself can't be reached, nothing is marked down — Nodex says the agent is unreachable instead
+
+**Where checks run.** Browsers can't ping or open raw TCP connections, so checks go through a small, dependency-free **monitor agent** (`monitor/server.js`) running somewhere that can reach your hosts:
+
+```bash
+npm run monitor                     # http://localhost:7070
+```
+
+or with Docker (`docker compose up -d` starts it next to Nodex, published on localhost only). Point Nodex at it from the ⚙ next to *Live*; *Test connection* confirms it and lists the checks it supports. Without an agent, choose **This browser** in the settings: HTTP(S) checks only, and an `https://` page can't check `http://` addresses.
+
+The agent probes whatever it's asked to, so lock it down when anyone else can reach it:
+
+| Variable | Default | |
+|---|---|---|
+| `HOST` / `PORT` | `127.0.0.1` / `7070` | Listen address — localhost only by default |
+| `NODEX_MONITOR_TOKEN` | — | Require `Authorization: Bearer <token>` (enter the same token in Nodex) |
+| `NODEX_MONITOR_ALLOW` | — | Comma-separated CIDRs (`10.0.0.0/8,192.168.1.0/24`); hostnames are resolved first and every address must match |
+| `NODEX_MONITOR_ORIGIN` | `*` | CORS origin allowed to call the agent |
+
+Ping uses the system `ping` binary (no shell; the Docker image runs it as an unprivileged user). Where no `ping` is available, ping checks show as *can't check* — use a TCP or HTTP check instead.
+
 ### Availability semantics
 The simulation understands redundancy through a few optional properties:
 
@@ -89,7 +114,7 @@ Plain JSON, two flavors, auto-detected on open:
 
 `diagrams` is a flat map keyed by nesting path (`"root"`, `"root/<nodeId>"`, …), each entry holding `nodes`, `connections`, `zones`, and `channels`.
 
-Availability settings are optional fields, so older files load unchanged: `zone.policy = { mode, min, primaryId }`, `connection.kind = "peer"` with `connection.peerMode` (`failover` / `quorum` / `both` / `replica`), `connection.required`, and `node.role = "vip"`.
+Availability settings are optional fields, so older files load unchanged: `zone.policy = { mode, min, primaryId }`, `connection.kind = "peer"` with `connection.peerMode` (`failover` / `quorum` / `both` / `replica`), `connection.required`, and `node.role = "vip"`. Monitored addresses are `node.endpoints = [{ id, address, check, port?, path?, insecure? }]`; monitoring settings (agent URL, token, interval) stay in the browser, not in the file.
 
 ## Keyboard shortcuts
 
@@ -118,10 +143,11 @@ Availability settings are optional fields, so older files load unchanged: `zone.
 npm install
 npm run dev        # Vite dev server (port 3030)
 npm run build      # production build to dist/
-npm test           # analysis engine tests (node's built-in runner)
+npm run monitor    # live-monitoring agent on localhost:7070
+npm test           # analysis, monitoring, and agent tests (node's built-in runner)
 ```
 
-Stack: React 18, Vite 5, Tailwind CSS 3, [lucide-react](https://lucide.dev) icons. The UI lives in `src/Nodex.jsx`; the availability / flow analysis behind isolation and simulation is a pure module in `src/analysis.js` (tests in `src/analysis.test.js`).
+Stack: React 18, Vite 5, Tailwind CSS 3, [lucide-react](https://lucide.dev) icons. The UI lives in `src/Nodex.jsx`; the availability / flow analysis behind isolation and simulation is a pure module in `src/analysis.js`, live-monitoring logic is in `src/monitor.js`, and the probe agent is `monitor/server.js` (each with a `.test.js` next to it).
 
 ## Deployment
 
@@ -139,6 +165,8 @@ Then open http://localhost:8080.
 ```bash
 docker-compose up -d
 ```
+
+This starts Nodex on port 8080 and the monitor agent on `127.0.0.1:7070`. Set `NODEX_MONITOR_ALLOW` / `NODEX_MONITOR_TOKEN` in the environment (or a `.env` file) to restrict it.
 
 ## Browser support
 

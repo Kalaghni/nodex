@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect, useMemo } from 'react';
-import { Database, Server, Cloud, Zap, Box, Globe, Lock, HardDrive, Cpu, Network, Shield, Wifi, Code, Container, FileText, Users, Settings, Activity, Mail, Phone, CheckCircle, XCircle, AlertCircle, Plus, Edit2, X, ChevronRight, Hexagon, Trash2, Save, FolderOpen, Download, FilePlus, ZoomIn, ZoomOut, Maximize, Undo, Redo, Copy, Clipboard, Grid, Eye, EyeOff, Home, Building, Factory, Warehouse, ShoppingCart, CreditCard, DollarSign, PieChart, BarChart, LineChart, TrendingUp, Clock, Calendar, Bell, MessageSquare, Send, Upload, Link, Layers, Package, Archive, Folder, Search, Filter, Terminal, GitBranch, Github, Smartphone, Tablet, Monitor, Printer, Camera, Mic, Video, Play, Pause, Square, Circle, Triangle, Star, Heart, ThumbsUp, ThumbsDown, Flag, Bookmark, Tag, Hash, AtSign, MapPin, Navigation, Compass, Map, Truck, Plane, Ship, Train, Car, Bike, Footprints, Key, Unlock, UserCheck, UserX, UserPlus, User, Bot, Cog, Wrench, Hammer, Lightbulb, Flame, Droplet, Wind, Sun, Moon, CloudRain, Snowflake, Thermometer, History, FlaskConical, PowerOff, RotateCcw, ShieldAlert, Focus, ArrowLeftRight, Workflow, LocateFixed } from 'lucide-react';
+import { Database, Server, Cloud, Zap, Box, Globe, Lock, HardDrive, Cpu, Network, Shield, Wifi, Code, Container, FileText, Users, Settings, Activity, Mail, Phone, CheckCircle, XCircle, AlertCircle, Plus, Edit2, X, ChevronRight, Hexagon, Trash2, Save, FolderOpen, Download, FilePlus, ZoomIn, ZoomOut, Maximize, Undo, Redo, Copy, Clipboard, Grid, Eye, EyeOff, Home, Building, Factory, Warehouse, ShoppingCart, CreditCard, DollarSign, PieChart, BarChart, LineChart, TrendingUp, Clock, Calendar, Bell, MessageSquare, Send, Upload, Link, Layers, Package, Archive, Folder, Search, Filter, Terminal, GitBranch, Github, Smartphone, Tablet, Monitor, Printer, Camera, Mic, Video, Play, Pause, Square, Circle, Triangle, Star, Heart, ThumbsUp, ThumbsDown, Flag, Bookmark, Tag, Hash, AtSign, MapPin, Navigation, Compass, Map as MapIcon, Truck, Plane, Ship, Train, Car, Bike, Footprints, Key, Unlock, UserCheck, UserX, UserPlus, User, Bot, Cog, Wrench, Hammer, Lightbulb, Flame, Droplet, Wind, Sun, Moon, CloudRain, Snowflake, Thermometer, History, FlaskConical, PowerOff, RotateCcw, ShieldAlert, Focus, ArrowLeftRight, Workflow, LocateFixed } from 'lucide-react';
 import {
   evaluate,
   findSinglePointsOfFailure,
@@ -14,6 +14,21 @@ import {
   ZONE_POLICIES,
   PEER_MODES
 } from './analysis.js';
+import {
+  CHECK_TYPES,
+  loadMonitorSettings,
+  saveMonitorSettings,
+  validateAddress,
+  checkType,
+  endpointLabel,
+  endpointKey,
+  collectTargets,
+  probeTargets,
+  agentHealth,
+  applyResults,
+  nodeLiveStatus,
+  uptimePercent
+} from './monitor.js';
 
 // Hexagon grid calculations
 const HEX_SIZE = 40;
@@ -302,6 +317,10 @@ const EMPTY_LIST = [];
 // Status palette shared by the outage simulation visuals
 const STATUS_COLORS = { healthy: '#22c55e', degraded: '#f59e0b', down: '#ef4444' };
 const STATUS_LABELS = { healthy: 'Healthy', degraded: 'Degraded', down: 'Unavailable' };
+// Live check result per node (the small dot at a node's lower left)
+const LIVE_COLORS = { up: '#22c55e', partial: '#f59e0b', down: '#ef4444', pending: '#64748b', unknown: '#475569' };
+const LIVE_LABELS = { up: 'Up', partial: 'Partly up', down: 'Down', pending: 'Checking…', unknown: 'Can’t check' };
+
 const CHANNEL_STATUS = {
   healthy: { label: 'Healthy', color: '#22c55e' },
   degraded: { label: 'Degraded', color: '#f59e0b' },
@@ -544,7 +563,7 @@ const AVAILABLE_ICONS = [
   { id: 'video', icon: Video, label: 'Video' },
   // Location
   { id: 'mappin', icon: MapPin, label: 'Location' },
-  { id: 'map', icon: Map, label: 'Map' },
+  { id: 'map', icon: MapIcon, label: 'Map' },
   { id: 'compass', icon: Compass, label: 'Compass' },
   // Transport
   { id: 'truck', icon: Truck, label: 'Truck' },
@@ -780,10 +799,101 @@ export default function Nodex() {
     ? [hoverChannelId]
     : isolatedIds;
 
-  const analysisNeeded = simMode || focusChannelIds.length > 0;
+  // ---- Live monitoring of the real addresses on nodes ----
+  // Endpoints live in the diagram (node.endpoints); where to check them from
+  // (agent URL, token, interval) is per-viewer and kept in localStorage.
+  const [monitorSettings, setMonitorSettingsState] = useState(loadMonitorSettings);
+  const monitorSettingsRef = useRef(monitorSettings);
+  monitorSettingsRef.current = monitorSettings;
+  const setMonitorSettings = (next) => {
+    setMonitorSettingsState(next);
+    saveMonitorSettings(next);
+  };
+  const [liveEnabled, setLiveEnabled] = useState(false);
+  const [liveState, setLiveState] = useState(() => new Map());
+  const [liveError, setLiveError] = useState(null);
+  const [liveLastRun, setLiveLastRun] = useState(null);
+  const [liveChecking, setLiveChecking] = useState(false);
+  const [showMonitorSettings, setShowMonitorSettings] = useState(false);
+  const [monitorHealth, setMonitorHealth] = useState(null);
+  // In simulation, start from what's really down (on by default)
+  const [simIncludeLive, setSimIncludeLive] = useState(true);
+  const liveInFlightRef = useRef(false);
+
+  const liveTargets = useMemo(() => collectTargets(nodes), [nodes]);
+  const liveTargetsRef = useRef(liveTargets);
+  liveTargetsRef.current = liveTargets;
+  const liveTargetsSig = liveTargets.map(t => `${t.key}=${t.check}/${t.address}/${t.port}/${t.path}`).join('|');
+
+  const runLiveChecks = async () => {
+    if (liveInFlightRef.current) return;
+    const targets = liveTargetsRef.current;
+    if (targets.length === 0) {
+      setLiveState(new Map());
+      setLiveError(null);
+      setLiveLastRun(Date.now());
+      return;
+    }
+    liveInFlightRef.current = true;
+    setLiveChecking(true);
+    try {
+      const settings = monitorSettingsRef.current;
+      const results = await probeTargets(settings, targets);
+      // Drop the round if the endpoints changed while it was in flight
+      if (liveTargetsRef.current === targets) {
+        setLiveState(prev => applyResults(prev, targets, results, Date.now(), settings.failAfter));
+      }
+      setLiveError(null);
+    } catch (err) {
+      setLiveError(err.message);
+    } finally {
+      liveInFlightRef.current = false;
+      setLiveChecking(false);
+      setLiveLastRun(Date.now());
+    }
+  };
+
+  useEffect(() => {
+    if (!liveEnabled) return undefined;
+    runLiveChecks();
+    const timer = setInterval(runLiveChecks, Math.max(5, Number(monitorSettings.intervalSec) || 15) * 1000);
+    return () => clearInterval(timer);
+  }, [liveEnabled, monitorSettings.intervalSec, monitorSettings.source, monitorSettings.agentUrl, monitorSettings.token, monitorSettings.timeoutMs, viewKey, liveTargetsSig]);
+
+  const liveNodeStatus = useMemo(() => {
+    const m = new Map();
+    if (!liveEnabled) return m;
+    nodes.forEach(n => {
+      const st = nodeLiveStatus(n, liveState);
+      if (st) m.set(n.id, st);
+    });
+    return m;
+  }, [liveEnabled, nodes, liveState]);
+
+  // Nodes really down right now. While the agent itself is unreachable we
+  // know nothing new — never treat that as every host being down.
+  const liveDownList = useMemo(() => {
+    if (!liveEnabled || liveError) return EMPTY_LIST;
+    const list = [];
+    liveNodeStatus.forEach((st, id) => { if (st.status === 'down') list.push(nodeKey(id)); });
+    return list.length ? list : EMPTY_LIST;
+  }, [liveEnabled, liveError, liveNodeStatus]);
+  const liveDownSet = useMemo(() => new Set(liveDownList), [liveDownList]);
+  const liveImpact = liveDownSet.size > 0;
+  // Status visuals (health badges, dead links, failover arcs) show during a
+  // simulation and whenever monitoring finds a real outage
+  const statusView = simMode || liveImpact;
+
+  const effectiveFailures = useMemo(() => {
+    const all = new Set(simMode ? simFailures : []);
+    if (!simMode || simIncludeLive) liveDownSet.forEach(k => all.add(k));
+    return all;
+  }, [simMode, simFailures, simIncludeLive, liveDownSet]);
+
+  const analysisNeeded = statusView || focusChannelIds.length > 0;
   const analysis = useMemo(
-    () => (analysisNeeded ? evaluate(currentDiagram, simMode ? simFailures : new Set()) : null),
-    [analysisNeeded, currentDiagram, simMode, simFailures]
+    () => (analysisNeeded ? evaluate(currentDiagram, effectiveFailures) : null),
+    [analysisNeeded, currentDiagram, effectiveFailures]
   );
   const spofs = useMemo(
     () => (simMode && showSpof && analysis ? findSinglePointsOfFailure(analysis) : null),
@@ -873,7 +983,8 @@ export default function Nodex() {
     description: '',
     iconId: 'server',
     color: '#3b82f6',
-    role: 'standard'
+    role: 'standard',
+    endpoints: []
   });
   const [newZoneData, setNewZoneData] = useState({
     label: '',
@@ -1867,7 +1978,8 @@ export default function Nodex() {
       description: '',
       iconId: 'server',
       color: '#3b82f6',
-      role: 'standard'
+      role: 'standard',
+      endpoints: []
     });
     setEditingNode(null);
     pendingConnectFromRef.current = null;
@@ -1887,10 +1999,45 @@ export default function Nodex() {
       description: node.description || '',
       iconId: node.iconId,
       color: node.color,
-      role: node.role === 'vip' ? 'vip' : 'standard'
+      role: node.role === 'vip' ? 'vip' : 'standard',
+      endpoints: (node.endpoints || []).map(ep => ({ ...ep }))
     });
     setEditingNode(node);
     setShowNodeCreator(true);
+  };
+
+  // Endpoints as saved: blank rows dropped, addresses trimmed, ports
+  // numeric; `undefined` (field omitted) when none are left
+  const cleanEndpoints = (eps) => {
+    const out = (eps || [])
+      .filter(ep => ep.address && ep.address.trim())
+      .map(ep => {
+        const ct = checkType(ep.check);
+        const port = parseInt(ep.port, 10);
+        return {
+          id: ep.id,
+          address: ep.address.trim(),
+          check: ct.id,
+          ...(ct.port && Number.isInteger(port) && port !== ct.defaultPort ? { port } : {}),
+          ...(ct.path && ep.path && ep.path !== '/' ? { path: ep.path } : {}),
+          ...(ct.id === 'https' && ep.insecure ? { insecure: true } : {})
+        };
+      });
+    return out.length ? out : undefined;
+  };
+
+  // One-off check from the node editor
+  const [endpointTests, setEndpointTests] = useState({});
+  const testEndpoint = async (ep) => {
+    const [target] = collectTargets([{ id: 'test', endpoints: [ep] }]);
+    if (!target) return;
+    setEndpointTests(prev => ({ ...prev, [ep.id]: { pending: true } }));
+    try {
+      const [r] = await probeTargets(monitorSettingsRef.current, [target]);
+      setEndpointTests(prev => ({ ...prev, [ep.id]: r }));
+    } catch (err) {
+      setEndpointTests(prev => ({ ...prev, [ep.id]: { up: null, error: err.message } }));
+    }
   };
 
   const createOrUpdateNode = () => {
@@ -1899,7 +2046,7 @@ export default function Nodex() {
     if (editingNode) {
       setNodes(nodes.map(n => 
         n.id === editingNode.id 
-          ? { ...n, label: newNodeData.label, description: newNodeData.description, iconId: newNodeData.iconId, color: newNodeData.color, role: newNodeData.role === 'vip' ? 'vip' : undefined }
+          ? { ...n, label: newNodeData.label, description: newNodeData.description, iconId: newNodeData.iconId, color: newNodeData.color, role: newNodeData.role === 'vip' ? 'vip' : undefined, endpoints: cleanEndpoints(newNodeData.endpoints) }
           : n
       ));
     } else {
@@ -1922,6 +2069,7 @@ export default function Nodex() {
         iconId: newNodeData.iconId,
         color: newNodeData.color,
         ...(newNodeData.role === 'vip' ? { role: 'vip' } : {}),
+        ...(cleanEndpoints(newNodeData.endpoints) ? { endpoints: cleanEndpoints(newNodeData.endpoints) } : {}),
         q: coords.q,
         r: coords.r
       };
@@ -2665,6 +2813,7 @@ export default function Nodex() {
         }
       }
       if (e.key === 'Escape') {
+        setShowMonitorSettings(false);
         setConnectingFrom(null);
         setSelectedNodeIds([]);
         setSelectedConnectionIds([]);
@@ -2902,7 +3051,7 @@ export default function Nodex() {
     });
     return best;
   };
-  const entityStatus = (key) => (simMode && analysis ? analysis.cur.entities.get(key) : null);
+  const entityStatus = (key) => (statusView && analysis ? analysis.cur.entities.get(key) : null);
 
   // ---- Sidebar: outage simulation panel ----
   const ChannelStatusPill = ({ status }) => {
@@ -2935,7 +3084,7 @@ export default function Nodex() {
     const failures = simFailureList.filter(k =>
       k.startsWith('c:') ? connections.some(c => connKey(c.id) === k) : M.entities.has(k));
     const listOf = (status) => [...M.entities.keys()]
-      .filter(k => !simFailures.has(k) && analysis.cur.entities.get(k).status === status);
+      .filter(k => !simFailures.has(k) && !liveDownSet.has(k) && analysis.cur.entities.get(k).status === status);
     const unavailable = listOf('down');
     const degraded = listOf('degraded');
     const counts = analysis.cur.counts;
@@ -2996,6 +3145,25 @@ export default function Nodex() {
               </button>
             )}
           </div>
+          {liveEnabled && (
+            <label className="flex items-center gap-2 mb-1.5 text-xs text-slate-300 cursor-pointer">
+              <input type="checkbox" checked={simIncludeLive} onChange={(e) => setSimIncludeLive(e.target.checked)} />
+              Start from live outages ({liveDownList.length} down now)
+            </label>
+          )}
+          {liveEnabled && simIncludeLive && liveDownList.length > 0 && (
+            <div className="space-y-1 mb-1">
+              {liveDownList.map(k => (
+                <div key={k} className="flex items-center gap-2 px-2 py-1.5 rounded bg-red-950/40 border border-red-900/60">
+                  <Activity size={13} className="text-red-400 shrink-0" />
+                  <button onClick={() => centerOn(k)} className="flex-1 min-w-0 text-left text-sm truncate hover:text-white text-slate-200">
+                    {M.label(k)}
+                  </button>
+                  <span className="text-[10px] px-1.5 py-0.5 rounded bg-red-900/60 text-red-200" title="Down according to live monitoring">LIVE</span>
+                </div>
+              ))}
+            </div>
+          )}
           {failures.length === 0 ? (
             <p className="text-xs text-slate-500">
               Nothing failed yet. Click a component on the canvas, or run the single-point-of-failure scan below for ideas.
@@ -3135,6 +3303,114 @@ export default function Nodex() {
     );
   };
 
+
+  // ---- Sidebar: live monitoring panel ----
+  const renderLivePanel = () => {
+    const counts = { up: 0, partial: 0, down: 0, pending: 0, unknown: 0 };
+    liveNodeStatus.forEach(st => { counts[st.status]++; });
+    const problems = nodes
+      .filter(n => ['down', 'partial', 'unknown'].includes(liveNodeStatus.get(n.id)?.status) || liveNodeStatus.get(n.id)?.suspect)
+      .sort((a, b) => ['down', 'partial', 'unknown', 'up'].indexOf(liveNodeStatus.get(a.id).status) -
+        ['down', 'partial', 'unknown', 'up'].indexOf(liveNodeStatus.get(b.id).status));
+    const impacted = liveImpact && analysis
+      ? channels.map(ch => ({ ch, sum: analysis.channels.get(ch.id) })).filter(x => x.sum && x.sum.status !== 'healthy' && x.sum.status !== 'unused')
+      : [];
+    return (
+      <div className="mb-5 p-3 rounded-lg bg-slate-900/60 border border-slate-700">
+        <div className="flex items-center gap-2 mb-1">
+          <Activity size={15} className={liveChecking ? 'text-emerald-400 animate-pulse' : 'text-emerald-400'} />
+          <h3 className="text-sm font-semibold flex-1">Live monitoring</h3>
+          <span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-700 text-slate-300">
+            {monitorSettings.source === 'browser' ? 'Browser' : 'Agent'}
+          </span>
+          <button onClick={runLiveChecks} className="p-1 rounded text-slate-400 hover:text-white hover:bg-slate-700" title="Check now">
+            <RotateCcw size={12} />
+          </button>
+          <button onClick={() => setShowMonitorSettings(true)} className="p-1 rounded text-slate-400 hover:text-white hover:bg-slate-700" title="Settings">
+            <Settings size={12} />
+          </button>
+        </div>
+        <p className="text-[11px] text-slate-500 mb-2">
+          {liveChecking ? 'Checking…' : liveLastRun ? `Last checked ${new Date(liveLastRun).toLocaleTimeString()}` : 'Starting…'}
+          {' · every '}{monitorSettings.intervalSec}s
+        </p>
+        {liveError && (
+          <div className="mb-2 p-2 rounded bg-amber-950/50 border border-amber-800/60 text-[11px] text-amber-200">
+            {liveError}
+          </div>
+        )}
+        {liveTargets.length === 0 ? (
+          <p className="text-xs text-slate-400">
+            No addresses to check yet. Right-click a node → <span className="text-slate-200">Monitoring</span> to attach its IP addresses or URLs.
+          </p>
+        ) : (
+          <>
+            <div className="grid grid-cols-4 gap-1 mb-2 text-center">
+              {[['up', counts.up], ['partial', counts.partial], ['down', counts.down], ['pending', counts.pending + counts.unknown]].map(([k, v]) => (
+                <div key={k} className="rounded bg-slate-800 py-1">
+                  <div className="text-sm font-bold" style={{ color: LIVE_COLORS[k] }}>{v}</div>
+                  <div className="text-[9px] uppercase tracking-wide text-slate-500">{k === 'pending' ? 'other' : LIVE_LABELS[k]}</div>
+                </div>
+              ))}
+            </div>
+            {problems.length === 0 && !liveError && counts.up > 0 && (
+              <p className="text-xs text-emerald-400">All monitored nodes are answering.</p>
+            )}
+            <div className="space-y-0.5">
+              {problems.map(n => {
+                const st = liveNodeStatus.get(n.id);
+                const bad = st.endpoints.find(r => r.st && r.st.status !== 'up') || st.endpoints.find(r => r.st?.suspect);
+                return (
+                  <button
+                    key={n.id}
+                    onClick={() => centerOn(nodeKey(n.id))}
+                    className="w-full flex items-start gap-2 px-1.5 py-1 rounded hover:bg-slate-700 text-left"
+                    title="Center on canvas"
+                  >
+                    <span className="w-2 h-2 rounded-full mt-1.5 shrink-0" style={{ backgroundColor: LIVE_COLORS[st.status] }} />
+                    <span className="flex-1 min-w-0">
+                      <span className="block text-sm truncate">
+                        {n.label}
+                        {st.suspect && st.status === 'up' && <span className="text-[10px] text-amber-400"> · missed a check</span>}
+                      </span>
+                      {bad && (
+                        <span className="block text-[11px] text-slate-400 truncate">
+                          {endpointLabel(bad.ep)} — {bad.st?.last?.error || LIVE_LABELS[bad.st?.status || 'pending']}
+                        </span>
+                      )}
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+            {impacted.length > 0 && (
+              <div className="mt-2 pt-2 border-t border-slate-700">
+                <p className="text-[11px] font-semibold text-slate-300 mb-1">Traffic impact</p>
+                {impacted.map(({ ch, sum }) => (
+                  <div key={ch.id} className="flex items-center gap-2 py-0.5">
+                    <span className="w-2 h-2 rounded-full shrink-0" style={{ backgroundColor: ch.color }} />
+                    <span className="text-xs flex-1 truncate" title={sum.headline}>{ch.name}</span>
+                    <ChannelStatusPill status={sum.status} />
+                  </div>
+                ))}
+              </div>
+            )}
+            {liveImpact && (
+              <button
+                onClick={toggleSimMode}
+                className="mt-2 w-full flex items-center justify-center gap-1.5 px-2 py-1.5 rounded text-xs bg-slate-700 hover:bg-slate-600"
+                title="Open the simulation with the live outages already applied"
+              >
+                <FlaskConical size={12} />
+                Explore impact & what-ifs
+              </button>
+            )}
+          </>
+        )}
+      </div>
+    );
+  };
+
   // ---- Sidebar: end-to-end trace of the isolated channels ----
   const FLOW_STATE_STYLES = {
     active: { opacity: 1, label: 'carrying traffic' },
@@ -3191,7 +3467,7 @@ export default function Nodex() {
                     <span className="flex flex-wrap gap-1 pb-0.5">
                       {stage.map(k => {
                         const st = flow.entityState.get(k) || 'active';
-                        const es = simMode ? analysis.cur.entities.get(k) : null;
+                        const es = statusView ? analysis.cur.entities.get(k) : null;
                         const dotColor = es ? STATUS_COLORS[es.status] : ch.color;
                         return (
                           <button
@@ -3436,6 +3712,40 @@ export default function Nodex() {
               <span className="px-1.5 rounded-full bg-white/20 text-[10px]">{simFailureList.length}</span>
             )}
           </button>
+          {(() => {
+            const total = liveNodeStatus.size;
+            const downCount = liveDownList.length;
+            const dot = !liveEnabled ? null
+              : liveError ? STATUS_COLORS.degraded
+              : downCount > 0 ? STATUS_COLORS.down
+              : [...liveNodeStatus.values()].some(st => st.status === 'partial') ? STATUS_COLORS.degraded
+              : total > 0 ? STATUS_COLORS.healthy : '#64748b';
+            return (
+              <button
+                onClick={() => setLiveEnabled(v => !v)}
+                className={`px-2 py-1.5 rounded transition-colors text-xs flex items-center gap-1.5 ${
+                  liveEnabled ? 'bg-slate-700 text-white hover:bg-slate-600' : 'hover:bg-slate-700 text-slate-200'
+                }`}
+                title={liveEnabled
+                  ? (liveError || `Live monitoring on — ${total} monitored node${total === 1 ? '' : 's'}, ${downCount} down`)
+                  : 'Live monitoring — check the real addresses attached to nodes'}
+              >
+                <Activity size={16} className={liveChecking ? 'animate-pulse' : undefined} />
+                <span>Live</span>
+                {dot && <span className="w-2 h-2 rounded-full" style={{ backgroundColor: dot }} />}
+                {liveEnabled && downCount > 0 && (
+                  <span className="px-1.5 rounded-full bg-red-600 text-white text-[10px]">{downCount}</span>
+                )}
+              </button>
+            );
+          })()}
+          <button
+            onClick={() => setShowMonitorSettings(true)}
+            className="p-1.5 hover:bg-slate-700 rounded transition-colors text-slate-400 hover:text-white"
+            title="Monitoring settings"
+          >
+            <Settings size={15} />
+          </button>
         </div>
 
         {/* Breadcrumb in toolbar */}
@@ -3574,6 +3884,7 @@ export default function Nodex() {
       <div className="w-80 bg-slate-800 p-4 border-r border-slate-700 overflow-y-auto scrollbar-thin">
         {simMode ? renderSimPanel() : (<>
         <h2 className="text-xl font-bold mb-4">Nodex</h2>
+        {liveEnabled && renderLivePanel()}
         
         <button
           onClick={() => openNodeCreator()}
@@ -3709,6 +4020,50 @@ export default function Nodex() {
               </div>
               {selectedNode.description && (
                 <p className="text-xs text-slate-300 mb-2">{selectedNode.description}</p>
+              )}
+              {(selectedNode.endpoints || []).length > 0 && (
+                <div className="mt-2 space-y-1">
+                  {selectedNode.endpoints.map(ep => {
+                    const st = liveEnabled ? liveState.get(endpointKey(selectedNode.id, ep)) : null;
+                    const up = uptimePercent(st);
+                    return (
+                      <div key={ep.id} className="flex items-center gap-2 text-xs">
+                        <span
+                          className="w-2 h-2 rounded-full shrink-0"
+                          style={{ backgroundColor: st ? LIVE_COLORS[st.status] : '#475569' }}
+                          title={st ? LIVE_LABELS[st.status] : 'Live monitoring is off'}
+                        />
+                        <span className="text-slate-400 shrink-0">{checkType(ep.check).label}</span>
+                        <span className="font-mono truncate flex-1" title={endpointLabel(ep)}>{endpointLabel(ep)}</span>
+                        {st?.last && (
+                          <span className="text-slate-400 shrink-0" title={st.last.error || st.last.detail || ''}>
+                            {st.last.up ? `${Math.round(st.last.latencyMs ?? 0)} ms` : st.last.up === false ? 'down' : '?'}
+                            {up != null && ` · ${up}%`}
+                          </span>
+                        )}
+                      </div>
+                    );
+                  })}
+                  {/* Recent check history, newest on the right */}
+                  {liveEnabled && (() => {
+                    const hist = selectedNode.endpoints
+                      .map(ep => liveState.get(endpointKey(selectedNode.id, ep))?.history || []);
+                    const len = Math.max(0, ...hist.map(h => h.length));
+                    if (len === 0) return null;
+                    const cols = Array.from({ length: len }, (_, i) => hist.map(h => h[h.length - len + i]).filter(Boolean));
+                    return (
+                      <div className="flex gap-px pt-1" title="Recent checks (all addresses)">
+                        {cols.map((col, i) => {
+                          const known = col.filter(c => c.up !== null);
+                          const color = known.length === 0 ? LIVE_COLORS.unknown
+                            : known.every(c => c.up) ? LIVE_COLORS.up
+                            : known.some(c => c.up) ? LIVE_COLORS.partial : LIVE_COLORS.down;
+                          return <span key={i} className="h-3 flex-1 rounded-sm" style={{ backgroundColor: color, opacity: 0.85 }} />;
+                        })}
+                      </div>
+                    );
+                  })()}
+                </div>
               )}
             </div>
             <div className="flex gap-2">
@@ -4086,7 +4441,7 @@ export default function Nodex() {
             </span>
             {channels.map(ch => {
               const on = isolatedIds.includes(ch.id);
-              const chStatus = simMode && analysis ? analysis.channels.get(ch.id)?.status : null;
+              const chStatus = statusView && analysis ? analysis.channels.get(ch.id)?.status : null;
               return (
                 <button
                   key={ch.id}
@@ -4162,9 +4517,17 @@ export default function Nodex() {
         )}
 
         {/* Legend */}
-        {(simMode || focus) && (
+        {(statusView || focus || liveEnabled) && (
           <div className="absolute bottom-4 left-4 z-10 px-3 py-2 rounded-lg bg-slate-800/90 backdrop-blur border border-slate-700 text-[11px] text-slate-300 space-y-1 pointer-events-none">
-            {simMode && (
+            {liveEnabled && (
+              <div className="flex items-center gap-2 pb-0.5">
+                <span className="relative flex items-center justify-center w-2.5 h-2.5">
+                  <span className="w-2.5 h-2.5 rounded-full border-2" style={{ borderColor: LIVE_COLORS.up, backgroundColor: '#0f172a' }} />
+                </span>
+                Live check (bottom-left dot)
+              </div>
+            )}
+            {statusView && (
               <>
                 {['healthy', 'degraded', 'down'].map(st => (
                   <div key={st} className="flex items-center gap-2">
@@ -4174,7 +4537,7 @@ export default function Nodex() {
                 ))}
                 <div className="flex items-center gap-2">
                   <PowerOff size={11} className="text-red-400" />
-                  Failed (injected)
+                  {simMode ? 'Failed (injected or live)' : 'Down (live check)'}
                 </div>
                 <div className="flex items-center gap-2">
                   <span className="text-amber-400 font-bold w-2.5 text-center">↻</span>
@@ -4202,68 +4565,96 @@ export default function Nodex() {
           </div>
         )}
 
-        {/* Simulation hover card — what this component's status is and why */}
-        {simMode && analysis && (() => {
+        {/* Hover card — a component's status and why (simulation / live
+            impact), plus the live check result of each of its addresses */}
+        {(simMode || liveEnabled) && (() => {
           let key = null;
           let kind = null;
           if (hoveredNode != null) { key = nodeKey(hoveredNode); kind = 'Node'; }
           else if (hoveredConnection != null) { key = connKey(hoveredConnection); kind = 'Link'; }
           else if (hoveredZone != null) { key = zoneKey(hoveredZone); kind = 'Zone'; }
           if (!key) return null;
-          let title;
-          let status;
+          const live = kind === 'Node' ? liveNodeStatus.get(hoveredNode) : null;
+          const showStatus = statusView && analysis;
+          if (!showStatus && !live) return null;
+
+          let title = kind === 'Node' ? nodes.find(n => n.id === hoveredNode)?.label : '';
+          let status = null;
           let reasons = [];
           let failed = simFailures.has(key);
+          const liveDown = liveDownSet.has(key);
           let extra = null;
-          if (kind === 'Link') {
-            const cs = analysis.cur.conns.get(hoveredConnection);
-            if (!cs) return null;
-            title = analysis.model.connLabel(hoveredConnection);
-            status = cs.status === 'ok' ? 'healthy' : 'down';
-            if (cs.reason) reasons = [cs.reason];
-            const conn = connections.find(c => c.id === hoveredConnection);
-            if (conn?.kind === 'peer') {
-              extra = `Peer link · ${PEER_MODES.find(m => m.id === (conn.peerMode || 'failover'))?.label}`;
-            } else if (conn?.required) {
-              extra = 'Required dependency';
-            }
-          } else {
-            const es = analysis.cur.entities.get(key);
-            if (!es) return null;
-            title = analysis.model.label(key);
-            status = es.status;
-            reasons = es.reasons;
-            failed = es.failed;
-            if (es.coveredBy) extra = `Role taken over by ${analysis.model.label(es.coveredBy)}`;
-            else if (es.holder) extra = `VIP held by ${analysis.model.label(es.holder)}`;
-            if (kind === 'Zone') {
-              const z = zones.find(zz => zoneKey(zz.id) === key);
-              const pol = ZONE_POLICIES.find(p => p.id === getZonePolicy(z).mode);
-              extra = [extra, `Policy: ${pol?.label}`].filter(Boolean).join(' · ');
+          if (showStatus) {
+            if (kind === 'Link') {
+              const cs = analysis.cur.conns.get(hoveredConnection);
+              if (!cs) return null;
+              title = analysis.model.connLabel(hoveredConnection);
+              status = cs.status === 'ok' ? 'healthy' : 'down';
+              if (cs.reason) reasons = [cs.reason];
+              const conn = connections.find(c => c.id === hoveredConnection);
+              if (conn?.kind === 'peer') {
+                extra = `Peer link · ${PEER_MODES.find(m => m.id === (conn.peerMode || 'failover'))?.label}`;
+              } else if (conn?.required) {
+                extra = 'Required dependency';
+              }
+            } else {
+              const es = analysis.cur.entities.get(key);
+              if (!es) return null;
+              title = analysis.model.label(key);
+              status = es.status;
+              reasons = es.reasons;
+              failed = es.failed && !liveDown;
+              if (es.coveredBy) extra = `Role taken over by ${analysis.model.label(es.coveredBy)}`;
+              else if (es.holder) extra = `VIP held by ${analysis.model.label(es.holder)}`;
+              if (kind === 'Zone') {
+                const z = zones.find(zz => zoneKey(zz.id) === key);
+                const pol = ZONE_POLICIES.find(p => p.id === getZonePolicy(z).mode);
+                extra = [extra, `Policy: ${pol?.label}`].filter(Boolean).join(' · ');
+              }
             }
           }
-          const left = Math.min(mousePos.x * zoom + viewOffset.x + 16, canvasSize.width - 290);
-          const top = Math.min(mousePos.y * zoom + viewOffset.y + 16, canvasSize.height - 140);
+          const height = 150 + (live ? live.endpoints.length * 18 : 0);
+          const left = Math.min(mousePos.x * zoom + viewOffset.x + 16, canvasSize.width - 330);
+          const top = Math.min(mousePos.y * zoom + viewOffset.y + 16, canvasSize.height - height);
           return (
             <div
-              className="absolute z-30 w-72 px-3 py-2 rounded-lg bg-slate-900/95 border border-slate-600 shadow-2xl text-xs pointer-events-none"
+              className="absolute z-30 w-80 px-3 py-2 rounded-lg bg-slate-900/95 border border-slate-600 shadow-2xl text-xs pointer-events-none"
               style={{ left, top }}
             >
               <div className="flex items-center gap-2 mb-1">
                 <span className="text-slate-500 uppercase tracking-wide text-[10px]">{kind}</span>
                 <span className="font-semibold text-slate-100 truncate flex-1">{title}</span>
               </div>
-              <div className="flex items-center gap-1.5 mb-1">
-                <span className="w-2 h-2 rounded-full" style={{ backgroundColor: STATUS_COLORS[status] }} />
-                <span style={{ color: STATUS_COLORS[status] }} className="font-medium">
-                  {failed ? 'Failed (injected)' : STATUS_LABELS[status]}
-                </span>
-              </div>
+              {status && (
+                <div className="flex items-center gap-1.5 mb-1">
+                  <span className="w-2 h-2 rounded-full" style={{ backgroundColor: STATUS_COLORS[status] }} />
+                  <span style={{ color: STATUS_COLORS[status] }} className="font-medium">
+                    {liveDown ? 'Down (live check)' : failed ? 'Failed (injected)' : STATUS_LABELS[status]}
+                  </span>
+                </div>
+              )}
               {reasons.filter(r => !/^Failed \(simulated|Link failed \(simulated/.test(r)).map((r, i) => (
                 <p key={i} className="text-slate-300">• {r}</p>
               ))}
               {extra && <p className="text-amber-300 mt-0.5">{extra}</p>}
-              <p className="text-slate-500 mt-1">Click to {failed ? 'restore' : 'fail'}</p>
+              {live && (
+                <div className={status ? 'mt-1.5 pt-1.5 border-t border-slate-700' : ''}>
+                  <div className="flex items-center gap-1.5 mb-0.5">
+                    <span className="w-2 h-2 rounded-full" style={{ backgroundColor: LIVE_COLORS[live.status] }} />
+                    <span className="font-medium" style={{ color: LIVE_COLORS[live.status] }}>Live: {LIVE_LABELS[live.status]}</span>
+                  </div>
+                  {live.endpoints.map(({ ep, st }) => (
+                    <div key={ep.id} className="flex items-center gap-1.5 text-slate-300">
+                      <span className="w-1.5 h-1.5 rounded-full shrink-0" style={{ backgroundColor: LIVE_COLORS[st?.status || 'pending'] }} />
+                      <span className="font-mono truncate">{checkType(ep.check).label} {endpointLabel(ep)}</span>
+                      <span className="ml-auto shrink-0 text-slate-400">
+                        {st?.last?.up ? `${Math.round(st.last.latencyMs ?? 0)} ms` : <span className="block max-w-[8rem] truncate" title={st?.last?.error}>{st?.last?.error || '…'}</span>}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              )}
+              {simMode && <p className="text-slate-500 mt-1">Click to {failed ? 'restore' : 'fail'}</p>}
             </div>
           );
         })()}
@@ -4486,7 +4877,7 @@ export default function Nodex() {
               const lineColor = conn.color || '#64748b';
               const markerColorKey = lineColor.replace('#', '');
               const isConnSelected = selectedConnectionIds.includes(conn.id);
-              const connSim = simMode && analysis ? analysis.cur.conns.get(conn.id) : null;
+              const connSim = statusView && analysis ? analysis.cur.conns.get(conn.id) : null;
               const connBroken = connSim && connSim.status !== 'ok';
               const connDimmed = focus && !focus.conns.has(conn.id);
               // Flow direction for the animated particles
@@ -4633,15 +5024,15 @@ export default function Nodex() {
                       ? focus.strands.has(`${conn.id}|${ch.id}`)
                       : focus.conns.has(conn.id));
                     if (connBroken || flowState === 'dead') {
-                      if (simMode) {
+                      if (statusView) {
                         strandColor = STATUS_COLORS.down;
                         strandDash = '5,4';
                         strandOpacity = connSim?.status === 'failed' ? 0.95 : 0.6;
                       }
-                    } else if (flowState === 'standby' && (simMode || focus)) {
+                    } else if (flowState === 'standby' && (statusView || focus)) {
                       strandDash = '6,5';
                       strandOpacity = 0.45;
-                    } else if (flowState === 'stranded' && (simMode || focus)) {
+                    } else if (flowState === 'stranded' && (statusView || focus)) {
                       strandDash = '2,4';
                       strandOpacity = 0.3;
                     } else if (flowState === 'active') {
@@ -4778,10 +5169,10 @@ export default function Nodex() {
 
             {/* Failover arcs: failed member → peer that took over its role,
                 floating VIP → current holder, primary → promoted standby */}
-            {analysis && (simMode || focus) && analysis.cur.failovers.map(fo => {
+            {analysis && (statusView || focus) && analysis.cur.failovers.map(fo => {
               // VIP holder arcs are informative in the baseline too; the
               // others only exist once something has failed
-              if (!simMode && fo.kind !== 'vip') return null;
+              if (!statusView && fo.kind !== 'vip') return null;
               const a = entityCenter(fo.from);
               const b = entityCenter(fo.to);
               if (!a || !b) return null;
@@ -4814,7 +5205,7 @@ export default function Nodex() {
                     stroke={color}
                     strokeWidth="2"
                     strokeDasharray="7,5"
-                    className={simMode ? 'nx-march' : undefined}
+                    className={statusView ? 'nx-march' : undefined}
                     markerEnd={`url(#arrow-arrow-${color.replace('#', '')})`}
                   />
                   <rect
@@ -4934,8 +5325,8 @@ export default function Nodex() {
               const flowState = focusFlowState(nk);
               let groupOpacity = 1;
               if (focus && !focus.ents.has(nk)) groupOpacity = 0.15;
-              else if (focus && !simMode && flowState === 'standby') groupOpacity = 0.6;
-              else if (focus && !simMode && flowState === 'stranded') groupOpacity = 0.4;
+              else if (focus && !statusView && flowState === 'standby') groupOpacity = 0.6;
+              else if (focus && !statusView && flowState === 'stranded') groupOpacity = 0.4;
               const isTraceOrigin = focus?.tracing === nk;
               const isSimHover = simMode && hoveredNode === node.id;
               const isVipNode = node.role === 'vip';
@@ -5013,7 +5404,7 @@ export default function Nodex() {
                     </g>
                   )}
                   {/* Simulation status badge */}
-                  {ns && (
+                  {ns && (simMode || ns.status !== 'healthy') && (
                     ns.status === 'healthy' ? (
                       <circle
                         cx={-HEX_SIZE * 0.6}
@@ -5039,6 +5430,20 @@ export default function Nodex() {
                       </g>
                     )
                   )}
+                  {/* Live check result */}
+                  {liveNodeStatus.has(node.id) && (() => {
+                    const ls = liveNodeStatus.get(node.id);
+                    const color = LIVE_COLORS[ls.status];
+                    return (
+                      <g transform={`translate(${-HEX_SIZE * 0.6}, ${HEX_SIZE * 0.6})`} pointerEvents="none">
+                        {ls.status === 'down' && (
+                          <circle className="nx-pulse ui-overlay" r="6" fill="none" stroke={color} strokeWidth="2" />
+                        )}
+                        <circle r="6" fill="#0f172a" stroke={ls.suspect ? STATUS_COLORS.degraded : color} strokeWidth="2" />
+                        <circle r="3" fill={color} />
+                      </g>
+                    );
+                  })()}
                   {/* Covered by a failover peer */}
                   {ns?.coveredBy && (
                     <g transform={`translate(${HEX_SIZE * 0.6}, ${HEX_SIZE * 0.6})`} pointerEvents="none">
@@ -5272,6 +5677,131 @@ export default function Nodex() {
                 </div>
               </div>
 
+              <div>
+                <div className="flex items-center justify-between mb-1">
+                  <label className="text-sm font-medium flex items-center gap-1.5">
+                    <Activity size={14} className="text-emerald-400" />
+                    Monitoring
+                  </label>
+                  <button
+                    onClick={() => setNewNodeData({
+                      ...newNodeData,
+                      endpoints: [...(newNodeData.endpoints || []), { id: genId(), address: '', check: 'icmp' }]
+                    })}
+                    className="flex items-center gap-1 px-2 py-1 rounded text-xs bg-slate-700 hover:bg-slate-600"
+                  >
+                    <Plus size={12} /> Add address
+                  </button>
+                </div>
+                <p className="text-xs text-slate-400 mb-2">
+                  Real IP addresses or hostnames of this component. Turn on <span className="text-slate-200">Live</span> in the toolbar to check them — outages show on the canvas and in the traffic impact.
+                </p>
+                <div className="space-y-2">
+                  {(newNodeData.endpoints || []).map((ep, i) => {
+                    const ct = checkType(ep.check);
+                    const addrError = ep.address ? validateAddress(ep.address) : null;
+                    const test = endpointTests[ep.id];
+                    const setEp = (patch) => setNewNodeData({
+                      ...newNodeData,
+                      endpoints: newNodeData.endpoints.map((e, j) => (j === i ? { ...e, ...patch } : e))
+                    });
+                    return (
+                      <div key={ep.id} className="p-2 rounded bg-slate-900/60 border border-slate-700">
+                        <div className="flex gap-2">
+                          <select
+                            value={ep.check}
+                            onChange={(e) => setEp({ check: e.target.value, port: undefined })}
+                            className="px-2 py-1.5 bg-slate-700 rounded border border-slate-600 text-sm"
+                            title="How to check it"
+                          >
+                            {CHECK_TYPES.map(c => (
+                              <option key={c.id} value={c.id}>
+                                {c.long}{c.agentOnly && monitorSettings.source === 'browser' ? ' (agent)' : ''}
+                              </option>
+                            ))}
+                          </select>
+                          <input
+                            type="text"
+                            value={ep.address}
+                            onChange={(e) => setEp({ address: e.target.value })}
+                            placeholder="10.0.0.12 or db1.internal"
+                            spellCheck={false}
+                            className={`flex-1 min-w-0 px-2 py-1.5 bg-slate-700 rounded border font-mono text-sm focus:outline-none ${
+                              addrError ? 'border-red-500' : 'border-slate-600 focus:border-blue-500'
+                            }`}
+                          />
+                          {ct.port && (
+                            <input
+                              type="number"
+                              min="1"
+                              max="65535"
+                              value={ep.port ?? ''}
+                              onChange={(e) => setEp({ port: e.target.value })}
+                              placeholder={String(ct.defaultPort)}
+                              className="w-20 px-2 py-1.5 bg-slate-700 rounded border border-slate-600 text-sm focus:outline-none focus:border-blue-500"
+                              title="Port"
+                            />
+                          )}
+                          <button
+                            onClick={() => setNewNodeData({
+                              ...newNodeData,
+                              endpoints: newNodeData.endpoints.filter((_, j) => j !== i)
+                            })}
+                            className="p-1.5 rounded text-slate-400 hover:text-red-400 hover:bg-slate-700"
+                            title="Remove"
+                          >
+                            <Trash2 size={14} />
+                          </button>
+                        </div>
+                        {ct.path && (
+                          <div className="flex items-center gap-2 mt-2">
+                            <input
+                              type="text"
+                              value={ep.path ?? ''}
+                              onChange={(e) => setEp({ path: e.target.value })}
+                              placeholder="/ (path to request, e.g. /health)"
+                              spellCheck={false}
+                              className="flex-1 px-2 py-1 bg-slate-700 rounded border border-slate-600 font-mono text-xs focus:outline-none focus:border-blue-500"
+                            />
+                            {ct.id === 'https' && (
+                              <label className="flex items-center gap-1 text-xs text-slate-400" title="Accept self-signed / internal certificates (agent only)">
+                                <input type="checkbox" checked={!!ep.insecure} onChange={(e) => setEp({ insecure: e.target.checked })} />
+                                Any cert
+                              </label>
+                            )}
+                          </div>
+                        )}
+                        <div className="flex items-center gap-2 mt-1.5 text-xs">
+                          {addrError ? (
+                            <span className="text-red-400">{addrError}</span>
+                          ) : (
+                            <span className="text-slate-500 font-mono truncate">{ep.address ? endpointLabel(ep) : ''}</span>
+                          )}
+                          <span className="ml-auto flex items-center gap-2 shrink-0">
+                            {test && !test.pending && (
+                              <span
+                                className="max-w-[14rem] truncate"
+                                style={{ color: test.up ? LIVE_COLORS.up : test.up === false ? LIVE_COLORS.down : LIVE_COLORS.partial }}
+                                title={test.error || test.detail}
+                              >
+                                {test.up ? `● Up · ${Math.round(test.latencyMs ?? 0)} ms` : `● ${test.error || 'Down'}`}
+                              </span>
+                            )}
+                            <button
+                              onClick={() => testEndpoint(ep)}
+                              disabled={!ep.address || !!addrError || test?.pending}
+                              className="px-2 py-0.5 rounded bg-slate-700 hover:bg-slate-600 disabled:opacity-40"
+                            >
+                              {test?.pending ? 'Testing…' : 'Test'}
+                            </button>
+                          </span>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+
               <div className="flex gap-3 pt-4">
                 <button
                   onClick={createOrUpdateNode}
@@ -5474,6 +6004,162 @@ export default function Nodex() {
           </div>
         </div>
       )}
+
+
+      {/* Monitoring settings */}
+      {showMonitorSettings && (() => {
+        const st = monitorSettings;
+        const set = (patch) => setMonitorSettings({ ...st, ...patch });
+        return (
+          <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50" onMouseDown={() => setShowMonitorSettings(false)}>
+            <div className="bg-slate-800 rounded-lg p-6 w-full max-w-lg max-h-[90vh] overflow-y-auto scrollbar-thin" onMouseDown={(e) => e.stopPropagation()}>
+              <div className="flex items-center justify-between mb-1">
+                <h2 className="text-xl font-bold flex items-center gap-2">
+                  <Activity size={20} className="text-emerald-400" />
+                  Live monitoring
+                </h2>
+                <button onClick={() => setShowMonitorSettings(false)} className="text-slate-400 hover:text-white">
+                  <X size={22} />
+                </button>
+              </div>
+              <p className="text-xs text-slate-400 mb-4">
+                These settings stay in this browser. The addresses to check are part of the diagram (node editor → Monitoring).
+              </p>
+
+              <label className="block text-sm font-medium mb-2">Check from</label>
+              <div className="grid grid-cols-2 gap-2 mb-4">
+                {[
+                  { id: 'agent', label: 'Monitor agent', help: 'Ping, TCP ports, HTTP(S). Run the small Nodex agent on a machine that can reach your hosts.' },
+                  { id: 'browser', label: 'This browser', help: 'No setup, HTTP(S) only — browsers can’t ping or test raw ports.' }
+                ].map(opt => (
+                  <button
+                    key={opt.id}
+                    onClick={() => { set({ source: opt.id }); setMonitorHealth(null); }}
+                    className={`text-left px-3 py-2 rounded transition-all ${
+                      st.source === opt.id ? 'bg-emerald-600/25 ring-2 ring-emerald-400' : 'bg-slate-700 hover:bg-slate-600'
+                    }`}
+                  >
+                    <span className="block text-sm font-medium">{opt.label}</span>
+                    <span className="block text-xs text-slate-400">{opt.help}</span>
+                  </button>
+                ))}
+              </div>
+
+              {st.source === 'agent' && (
+                <div className="space-y-3 mb-4">
+                  <div>
+                    <label className="block text-sm font-medium mb-1">Agent URL</label>
+                    <input
+                      type="text"
+                      value={st.agentUrl}
+                      onChange={(e) => { set({ agentUrl: e.target.value }); setMonitorHealth(null); }}
+                      spellCheck={false}
+                      className="w-full px-3 py-2 bg-slate-700 rounded border border-slate-600 font-mono text-sm focus:border-emerald-500 focus:outline-none"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-sm font-medium mb-1">Token <span className="text-slate-500 font-normal">(if the agent sets NODEX_MONITOR_TOKEN)</span></label>
+                    <input
+                      type="password"
+                      value={st.token}
+                      onChange={(e) => { set({ token: e.target.value }); setMonitorHealth(null); }}
+                      autoComplete="off"
+                      className="w-full px-3 py-2 bg-slate-700 rounded border border-slate-600 font-mono text-sm focus:border-emerald-500 focus:outline-none"
+                    />
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <button
+                      onClick={async () => {
+                        setMonitorHealth({ pending: true });
+                        setMonitorHealth(await agentHealth(monitorSettingsRef.current));
+                      }}
+                      className="px-3 py-1.5 rounded text-sm bg-slate-700 hover:bg-slate-600"
+                    >
+                      Test connection
+                    </button>
+                    {monitorHealth?.pending && <span className="text-xs text-slate-400">Connecting…</span>}
+                    {monitorHealth && !monitorHealth.pending && (
+                      monitorHealth.ok ? (
+                        <span className="text-xs text-emerald-400">
+                          ● Connected · v{monitorHealth.version} · {monitorHealth.checks?.join(', ')}
+                          {monitorHealth.allowlist ? ' · allowlist on' : ''}
+                        </span>
+                      ) : (
+                        <span className="text-xs text-red-400">● {monitorHealth.error}</span>
+                      )
+                    )}
+                  </div>
+                  {monitorHealth?.ok && !monitorHealth.checks?.includes('icmp') && (
+                    <p className="text-xs text-amber-300">The agent has no ping available — ping checks will show as “can’t check”. Use TCP or HTTP checks, or install ping on the agent host.</p>
+                  )}
+                  <div className="p-3 rounded bg-slate-900/70 text-xs text-slate-300 space-y-1">
+                    <p className="font-medium text-slate-200">Run the agent</p>
+                    <p>From the Nodex folder: <code className="px-1 bg-slate-800 rounded">npm run monitor</code> (listens on localhost:7070)</p>
+                    <p>Or with Docker: <code className="px-1 bg-slate-800 rounded">docker compose up -d</code> (starts it next to Nodex)</p>
+                    <p className="text-slate-400">Restrict what it may probe with <code className="px-1 bg-slate-800 rounded">NODEX_MONITOR_ALLOW=10.0.0.0/8</code> and require <code className="px-1 bg-slate-800 rounded">NODEX_MONITOR_TOKEN</code> if anyone else can reach it.</p>
+                  </div>
+                </div>
+              )}
+
+              <div className="grid grid-cols-3 gap-3">
+                <label className="text-sm">
+                  <span className="block font-medium mb-1">Every (s)</span>
+                  <input
+                    type="number"
+                    min="5"
+                    max="3600"
+                    value={st.intervalSec}
+                    onChange={(e) => set({ intervalSec: Math.max(5, parseInt(e.target.value, 10) || 15) })}
+                    className="w-full px-2 py-1.5 bg-slate-700 rounded border border-slate-600 focus:border-emerald-500 focus:outline-none"
+                  />
+                </label>
+                <label className="text-sm">
+                  <span className="block font-medium mb-1">Timeout (ms)</span>
+                  <input
+                    type="number"
+                    min="500"
+                    max="10000"
+                    step="500"
+                    value={st.timeoutMs}
+                    onChange={(e) => set({ timeoutMs: Math.min(10000, Math.max(500, parseInt(e.target.value, 10) || 3000)) })}
+                    className="w-full px-2 py-1.5 bg-slate-700 rounded border border-slate-600 focus:border-emerald-500 focus:outline-none"
+                  />
+                </label>
+                <label className="text-sm" title="Consecutive failed checks before an address counts as down">
+                  <span className="block font-medium mb-1">Down after</span>
+                  <select
+                    value={st.failAfter}
+                    onChange={(e) => set({ failAfter: parseInt(e.target.value, 10) })}
+                    className="w-full px-2 py-1.5 bg-slate-700 rounded border border-slate-600"
+                  >
+                    {[1, 2, 3, 5].map(n => <option key={n} value={n}>{n} failed check{n > 1 ? 's' : ''}</option>)}
+                  </select>
+                </label>
+              </div>
+
+              <div className="flex gap-3 pt-5">
+                <button
+                  onClick={() => {
+                    setShowMonitorSettings(false);
+                    setLiveEnabled(true);
+                  }}
+                  className="flex-1 px-4 py-2 bg-emerald-600 hover:bg-emerald-700 rounded transition-colors"
+                >
+                  {liveEnabled ? 'Done' : 'Start monitoring'}
+                </button>
+                {liveEnabled && (
+                  <button
+                    onClick={() => { setLiveEnabled(false); setShowMonitorSettings(false); }}
+                    className="px-4 py-2 bg-slate-700 hover:bg-slate-600 rounded transition-colors"
+                  >
+                    Stop
+                  </button>
+                )}
+              </div>
+            </div>
+          </div>
+        );
+      })()}
 
       {/* Connection Editor Drawer — edits apply live (undo covers mistakes) */}
       {showConnectionEditor && editingConnection && (

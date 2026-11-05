@@ -1,0 +1,14 @@
+{
+  "name": "nodex-monitor",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Probe agent for Nodex live monitoring (ping, TCP, HTTP) — no dependencies",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
