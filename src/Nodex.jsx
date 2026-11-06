@@ -816,8 +816,6 @@ export default function Nodex() {
   const [liveChecking, setLiveChecking] = useState(false);
   const [showMonitorSettings, setShowMonitorSettings] = useState(false);
   const [monitorHealth, setMonitorHealth] = useState(null);
-  // In simulation, start from what's really down (on by default)
-  const [simIncludeLive, setSimIncludeLive] = useState(true);
   const liveInFlightRef = useRef(false);
 
   const liveTargets = useMemo(() => collectTargets(nodes), [nodes]);
@@ -884,11 +882,9 @@ export default function Nodex() {
   // simulation and whenever monitoring finds a real outage
   const statusView = simMode || liveImpact;
 
-  const effectiveFailures = useMemo(() => {
-    const all = new Set(simMode ? simFailures : []);
-    if (!simMode || simIncludeLive) liveDownSet.forEach(k => all.add(k));
-    return all;
-  }, [simMode, simFailures, simIncludeLive, liveDownSet]);
+  // Simulation and live monitoring never run together (see toggleSimMode /
+  // toggleLive), so failures come from one or the other
+  const effectiveFailures = simMode ? simFailures : liveDownSet;
 
   const analysisNeeded = statusView || focusChannelIds.length > 0;
   const analysis = useMemo(
@@ -924,10 +920,24 @@ export default function Nodex() {
 
   // Simulation is a viewing mode: editing gestures are suspended, so any
   // in-flight edit state is dropped on the way in
+  //
+  // Simulation and live monitoring are mutually exclusive: a what-if view
+  // mixed with real readings is easy to misread. Entering a simulation while
+  // live monitoring has found outages carries them in as ordinary failures,
+  // so the simulation still starts from what's really down.
   const toggleSimMode = () => {
     if (simModeRef.current) {
       setSimMode(false);
       return;
+    }
+    if (liveEnabled) {
+      if (liveDownList.length > 0) {
+        setSimFailuresByView(prev => {
+          const list = prev[viewKey] || [];
+          return { ...prev, [viewKey]: [...list, ...liveDownList.filter(k => !list.includes(k))] };
+        });
+      }
+      setLiveEnabled(false);
     }
     setSimMode(true);
     setSelectedNodeIds([]);
@@ -939,6 +949,11 @@ export default function Nodex() {
     setIsCreatingZone(false);
     setSelectedZoneCells([]);
     setHoveredCell(null);
+  };
+
+  const toggleLive = (on = !liveEnabled) => {
+    if (on && simModeRef.current) setSimMode(false);
+    setLiveEnabled(on);
   };
 
   // World position of a node/zone key, for centering the view on it
@@ -3145,25 +3160,6 @@ export default function Nodex() {
               </button>
             )}
           </div>
-          {liveEnabled && (
-            <label className="flex items-center gap-2 mb-1.5 text-xs text-slate-300 cursor-pointer">
-              <input type="checkbox" checked={simIncludeLive} onChange={(e) => setSimIncludeLive(e.target.checked)} />
-              Start from live outages ({liveDownList.length} down now)
-            </label>
-          )}
-          {liveEnabled && simIncludeLive && liveDownList.length > 0 && (
-            <div className="space-y-1 mb-1">
-              {liveDownList.map(k => (
-                <div key={k} className="flex items-center gap-2 px-2 py-1.5 rounded bg-red-950/40 border border-red-900/60">
-                  <Activity size={13} className="text-red-400 shrink-0" />
-                  <button onClick={() => centerOn(k)} className="flex-1 min-w-0 text-left text-sm truncate hover:text-white text-slate-200">
-                    {M.label(k)}
-                  </button>
-                  <span className="text-[10px] px-1.5 py-0.5 rounded bg-red-900/60 text-red-200" title="Down according to live monitoring">LIVE</span>
-                </div>
-              ))}
-            </div>
-          )}
           {failures.length === 0 ? (
             <p className="text-xs text-slate-500">
               Nothing failed yet. Click a component on the canvas, or run the single-point-of-failure scan below for ideas.
@@ -3399,7 +3395,7 @@ export default function Nodex() {
               <button
                 onClick={toggleSimMode}
                 className="mt-2 w-full flex items-center justify-center gap-1.5 px-2 py-1.5 rounded text-xs bg-slate-700 hover:bg-slate-600"
-                title="Open the simulation with the live outages already applied"
+                title="Stop live monitoring and open a simulation that starts from the current outages"
               >
                 <FlaskConical size={12} />
                 Explore impact & what-ifs
@@ -3722,7 +3718,7 @@ export default function Nodex() {
               : total > 0 ? STATUS_COLORS.healthy : '#64748b';
             return (
               <button
-                onClick={() => setLiveEnabled(v => !v)}
+                onClick={() => toggleLive()}
                 className={`px-2 py-1.5 rounded transition-colors text-xs flex items-center gap-1.5 ${
                   liveEnabled ? 'bg-slate-700 text-white hover:bg-slate-600' : 'hover:bg-slate-700 text-slate-200'
                 }`}
@@ -4537,7 +4533,7 @@ export default function Nodex() {
                 ))}
                 <div className="flex items-center gap-2">
                   <PowerOff size={11} className="text-red-400" />
-                  {simMode ? 'Failed (injected or live)' : 'Down (live check)'}
+                  {simMode ? 'Failed (injected)' : 'Down (live check)'}
                 </div>
                 <div className="flex items-center gap-2">
                   <span className="text-amber-400 font-bold w-2.5 text-center">↻</span>
@@ -6141,7 +6137,7 @@ export default function Nodex() {
                 <button
                   onClick={() => {
                     setShowMonitorSettings(false);
-                    setLiveEnabled(true);
+                    toggleLive(true);
                   }}
                   className="flex-1 px-4 py-2 bg-emerald-600 hover:bg-emerald-700 rounded transition-colors"
                 >
@@ -6149,7 +6145,7 @@ export default function Nodex() {
                 </button>
                 {liveEnabled && (
                   <button
-                    onClick={() => { setLiveEnabled(false); setShowMonitorSettings(false); }}
+                    onClick={() => { toggleLive(false); setShowMonitorSettings(false); }}
                     className="px-4 py-2 bg-slate-700 hover:bg-slate-600 rounded transition-colors"
                   >
                     Stop
