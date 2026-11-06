@@ -95,7 +95,9 @@ const ipType = (addr) => (net.isIP(addr) === 6 ? 'ipv6' : 'ipv4');
 
 // Resolve once and connect to the resolved address — checking a hostname
 // against the allowlist and then letting the connection re-resolve would
-// allow DNS rebinding around it
+// allow DNS rebinding around it. Every address must pass the allowlist;
+// IPv4 comes first, because Node lists AAAA records first and containers
+// often have no IPv6 route.
 const resolveTarget = async (address, allow) => {
   const bare = address.split('%')[0];
   let addrs;
@@ -110,8 +112,16 @@ const resolveTarget = async (address, allow) => {
   if (allow && !addrs.every(a => allow.check(a.split('%')[0], ipType(a.split('%')[0])))) {
     return { error: 'Address not allowed by NODEX_MONITOR_ALLOW', up: null };
   }
-  return { ip: addrs[0] };
+  const v4 = addrs.find(a => ipType(a) === 'ipv4');
+  const v6 = addrs.find(a => ipType(a.split('%')[0]) === 'ipv6');
+  return { ips: [v4, v6].filter(Boolean) };
 };
+
+// The monitor host itself has no IPv6 — that says nothing about the target
+const NO_V6 = ['EAFNOSUPPORT', 'ENETUNREACH', 'EADDRNOTAVAIL'];
+const noV6Result = (ip, code) => (ipType(ip.split('%')[0]) === 'ipv6' && NO_V6.includes(code)) || code === 'EAFNOSUPPORT'
+  ? { up: null, error: 'IPv6 isn’t available on the monitor host' }
+  : null;
 
 // ---------------------------------------------------------------------------
 // Checks
@@ -127,9 +137,8 @@ const tcpCheck = (ip, port, timeoutMs) => new Promise(resolve => {
   };
   socket.setTimeout(timeoutMs, () => done({ up: false, error: 'Timed out' }));
   socket.once('connect', () => done({ up: true, latencyMs: now() - t0 }));
-  socket.once('error', (err) => done(err.code === 'EAFNOSUPPORT'
-    ? { up: null, error: 'IPv6 isn’t available on the monitor host' }
-    : { up: false, error: err.code === 'ECONNREFUSED' ? 'Connection refused' : (err.code || err.message) }));
+  socket.once('error', (err) => done(noV6Result(ip, err.code)
+    || { up: false, error: err.code === 'ECONNREFUSED' ? 'Connection refused' : (err.code || err.message) }));
 });
 
 const httpCheck = (target, ip, timeoutMs) => new Promise(resolve => {
@@ -162,6 +171,11 @@ const httpCheck = (target, ip, timeoutMs) => new Promise(resolve => {
   });
   req.on('error', (err) => {
     const code = err.code || err.message;
+    const noV6 = noV6Result(ip, err.code);
+    if (noV6) {
+      resolve(noV6);
+      return;
+    }
     resolve({
       up: false,
       error: /CERT|SELF_SIGNED|UNABLE_TO_VERIFY/.test(code) ? `TLS certificate: ${code}` :
@@ -228,11 +242,21 @@ export const probeTarget = async (target, { timeoutMs = 3000, allow = null, ping
   const invalid = validateTarget(target);
   if (invalid) return { up: null, error: invalid };
   const resolved = await resolveTarget(normalizeAddress(target.address), allow);
-  if (!resolved.ip) return { up: resolved.up, error: resolved.error };
+  if (!resolved.ips) return { up: resolved.up, error: resolved.error };
+  const run = (ip) => target.check === 'icmp' ? icmpCheck(pingPath, ip, timeoutMs)
+    : target.check === 'tcp' ? tcpCheck(ip, Number(target.port), timeoutMs)
+      : httpCheck(target, ip, timeoutMs);
+  // Try IPv4, then IPv6: the first "up" wins; otherwise report the first
+  // definite answer (a real "down" beats "IPv6 unavailable here")
   let result;
-  if (target.check === 'icmp') result = await icmpCheck(pingPath, resolved.ip, timeoutMs);
-  else if (target.check === 'tcp') result = await tcpCheck(resolved.ip, Number(target.port), timeoutMs);
-  else result = await httpCheck(target, resolved.ip, timeoutMs);
+  for (const ip of resolved.ips) {
+    const r = await run(ip);
+    if (r.up === true) {
+      result = r;
+      break;
+    }
+    if (!result || (result.up === null && r.up === false)) result = r;
+  }
   if (result.latencyMs != null) result.latencyMs = Math.round(result.latencyMs * 10) / 10;
   return result;
 };

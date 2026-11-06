@@ -74,6 +74,14 @@ test('icmp without a ping binary reports "can\'t check", not "down"', async () =
   assert.equal(r.up, null);
 });
 
+test('dual-stack hostnames fall back to IPv4 (Node lists ::1 first)', async () => {
+  // tcpServer listens on 127.0.0.1 only; "localhost" resolves to ::1 and 127.0.0.1
+  const r = await probeTarget({ address: 'localhost', check: 'tcp', port: tcpPort });
+  assert.equal(r.up, true);
+  const h = await probeTarget({ address: 'localhost', check: 'http', port: webPort });
+  assert.equal(h.up, true);
+});
+
 test('allowlist blocks addresses outside the configured networks', async () => {
   const allow = parseAllowlist('10.0.0.0/8');
   const r = await probeTarget({ address: '127.0.0.1', check: 'tcp', port: tcpPort }, { allow });
@@ -131,7 +139,8 @@ test('HTTP API: auth, CORS preflight, probe, limits', async () => {
   }
 });
 
-test('icmp: runs ping without a shell, parses the reply time, reports no-reply as down', async (t) => {
+// Fakes `ping` with a shell script, so it only runs where /bin/sh exists
+test('icmp: runs ping without a shell, parses the reply time, reports no-reply as down', { skip: process.platform === 'win32' && 'needs /bin/sh' }, async (t) => {
   const fs = await import('node:fs');
   const os = await import('node:os');
   const path = await import('node:path');

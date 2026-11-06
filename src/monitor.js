@@ -15,7 +15,8 @@ export const CHECK_TYPES = [
 
 export const DEFAULT_MONITOR_SETTINGS = {
   source: 'agent', // 'agent' | 'browser'
-  agentUrl: 'http://localhost:7070',
+  // A hosted build sets VITE_MONITOR_URL (e.g. /monitor, proxied same-origin)
+  agentUrl: import.meta.env?.VITE_MONITOR_URL || 'http://localhost:7070',
   token: '',
   intervalSec: 15,
   timeoutMs: 3000,
