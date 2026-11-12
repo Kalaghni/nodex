@@ -1,5 +1,5 @@
 # Nodex monitor agent — ping / TCP / HTTP checks for Nodex live monitoring
-FROM node:20-alpine
+FROM node:24-alpine
 
 # iputils ping supports unprivileged ICMP sockets (Docker grants them via
 # net.ipv4.ping_group_range), so the agent doesn't need to run as root
