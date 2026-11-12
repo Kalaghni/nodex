@@ -1,6 +1,7 @@
 import { useEffect, useRef } from 'react';
 import { flushSync } from 'react-dom';
 import { pinchView, touchPair } from './touchGeometry.js';
+import { installCanvasTouchClickGuard } from './touchClickGuard.js';
 
 // Translate touch into the editor's existing mouse gestures so dragging, undo,
 // zone creation, selection and connection editing share one implementation.
@@ -15,7 +16,7 @@ export function useCanvasTouch({ canvasRef, view3d, zoomStateRef, setZoom, setVi
     const pointers = new Map();
     let gesture = null;
     let lastTap = null;
-    let handledTouch = false;
+    const removeClickGuard = installCanvasTouchClickGuard(canvas);
     const mouse = (target, type, point, button = 0) => target.dispatchEvent(new MouseEvent(type, {
       bubbles: true, cancelable: true, clientX: point.x, clientY: point.y,
       button, buttons: type === 'mouseup' || type === 'click' || type === 'dblclick' ? 0 : button === 1 ? 4 : 1
@@ -38,10 +39,8 @@ export function useCanvasTouch({ canvasRef, view3d, zoomStateRef, setZoom, setVi
       if (pointers.size >= 2) { event.preventDefault(); return; }
       // Never swallow a tap on HTML controls floating above the SVG canvas.
       if (!pointers.size && !event.target.closest('svg.nx-canvas')) {
-        handledTouch = false;
         return;
       }
-      handledTouch = true;
       event.preventDefault();
       canvas.setPointerCapture(event.pointerId);
       const point = { x: event.clientX, y: event.clientY };
@@ -106,19 +105,11 @@ export function useCanvasTouch({ canvasRef, view3d, zoomStateRef, setZoom, setVi
       gesture = null;
     };
     const cancelPointer = (event) => { if (pointers.has(event.pointerId)) stop(); };
-    const preventCompatibilityClick = (event) => {
-      if (handledTouch && (event.pointerType === 'touch' || event.sourceCapabilities?.firesTouchEvents)) {
-        event.preventDefault();
-        event.stopImmediatePropagation();
-      }
-    };
     canvas.addEventListener('pointerdown', down, { passive: false });
     canvas.addEventListener('pointermove', move, { passive: false });
     canvas.addEventListener('pointerup', up);
     canvas.addEventListener('pointercancel', cancelPointer);
     canvas.addEventListener('lostpointercapture', cancelPointer);
-    canvas.addEventListener('click', preventCompatibilityClick, true);
-    canvas.addEventListener('dblclick', preventCompatibilityClick, true);
     window.addEventListener('blur', stop);
     return () => {
       canvas.removeEventListener('pointerdown', down);
@@ -126,8 +117,7 @@ export function useCanvasTouch({ canvasRef, view3d, zoomStateRef, setZoom, setVi
       canvas.removeEventListener('pointerup', up);
       canvas.removeEventListener('pointercancel', cancelPointer);
       canvas.removeEventListener('lostpointercapture', cancelPointer);
-      canvas.removeEventListener('click', preventCompatibilityClick, true);
-      canvas.removeEventListener('dblclick', preventCompatibilityClick, true);
+      removeClickGuard();
       window.removeEventListener('blur', stop);
       if (pointers.size) optionsRef.current.cancel();
     };
