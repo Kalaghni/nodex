@@ -1,6 +1,6 @@
 import React, { useState, useRef, useEffect, useMemo } from 'react';
 import { Database, Server, Cloud, Zap, Box, Globe, Lock, HardDrive, Cpu, Network, Shield, Wifi, Code, Container, FileText, Users, Settings, Activity, Mail, Phone, CheckCircle, XCircle, AlertCircle, Plus, Edit2, X, ChevronRight, Hexagon, Trash2, Save, FolderOpen, Download, FilePlus, ZoomIn, ZoomOut, Maximize, Undo, Redo, Copy, Clipboard, Grid, Eye, EyeOff, Home, Building, Factory, Warehouse, ShoppingCart, CreditCard, DollarSign, PieChart, BarChart, LineChart, TrendingUp, Clock, Calendar, Bell, MessageSquare, Send, Upload, Link, Layers, Package, Archive, Folder, Search, Filter, Terminal, GitBranch, Github, Smartphone, Tablet, Monitor, Printer, Camera, Mic, Video, Play, Pause, Square, Circle, Triangle, Star, Heart, ThumbsUp, ThumbsDown, Flag, Bookmark, Tag, Hash, AtSign, MapPin, Navigation, Compass, Map as MapIcon, Truck, Plane, Ship, Train, Car, Bike, Footprints, Key, Unlock, UserCheck, UserX, UserPlus, User, Bot, Cog, Wrench, Hammer, Lightbulb, Flame, Droplet, Wind, Sun, Moon, CloudRain, Snowflake, Thermometer, History, FlaskConical, PowerOff, RotateCcw, ShieldAlert, Focus, ArrowLeftRight, Workflow, LocateFixed, Axis3d } from 'lucide-react';
-import { isLinkPath, pathResolves, linkTargets, pathLabel, samePath, hasChildren } from './links';
+import { normalizeLink, isLink, resolveLink, diagramPaths, pathLabel, linkLabel, samePath, hasChildren, remapLinkTabs, newTabUid } from './links';
 import {
   evaluate,
   findSinglePointsOfFailure,
@@ -653,9 +653,11 @@ const offsetPolyline = (pts, offset) => {
   ];
 };
 
-// Create a new tab
-const createTab = (name = 'Untitled', diagrams = null, fileHandle = null) => ({
+// Create a new tab. `id` is per-session; `uid` is saved with the tab so
+// node links into it survive save/load.
+const createTab = (name = 'Untitled', diagrams = null, fileHandle = null, uid = null) => ({
   id: genId(),
+  uid: uid || newTabUid(),
   name,
   diagrams: diagrams || { root: createEmptyDiagram() },
   currentPath: ['root'],
@@ -1300,6 +1302,7 @@ export default function Nodex() {
           if (t.fileHandle) {
             await writeToHandle(t.fileHandle, {
               version: 1,
+              uid: t.uid,
               name: t.name,
               diagrams: t.diagrams,
               currentPath: t.currentPath
@@ -1378,8 +1381,8 @@ export default function Nodex() {
   const gridBounds = getGridBounds();
 
   // Tab management
-  const addTab = (name = 'Untitled', diagrams = null, fileHandle = null) => {
-    const newTab = createTab(name, diagrams, fileHandle);
+  const addTab = (name = 'Untitled', diagrams = null, fileHandle = null, uid = null) => {
+    const newTab = createTab(name, diagrams, fileHandle, uid);
     setTabs(prevTabs => [...prevTabs, newTab]);
     setActiveTabId(newTab.id);
     setSelectedNode(null);
@@ -1419,6 +1422,7 @@ export default function Nodex() {
 
   const getTabSaveData = (tab) => ({
     version: 1,
+    uid: tab.uid,
     name: tab.name,
     diagrams: tab.diagrams,
     currentPath: tab.currentPath
@@ -1491,6 +1495,7 @@ export default function Nodex() {
     version: 2,
     type: 'nodex-project',
     tabs: tabsRef.current.map(t => ({
+      uid: t.uid,
       name: t.name,
       diagrams: t.diagrams,
       currentPath: t.currentPath
@@ -1545,13 +1550,35 @@ export default function Nodex() {
       d => d.nodes.length === 0 && d.connections.length === 0 && d.zones.length === 0
     );
 
+  // Saved tab uids, kept unless one clashes with a tab that stays open (the
+  // same file opened twice) — then it gets a fresh uid, and links inside
+  // the loaded tabs are repointed to match
+  const assignLoadedUids = (loaded, replacing) => {
+    const taken = new Set(replacing ? [] : tabsRef.current.map(t => t.uid));
+    const uidMap = {};
+    const uids = loaded.map(t => {
+      const saved = typeof t.uid === 'string' && t.uid ? t.uid : null;
+      if (saved && !taken.has(saved)) {
+        taken.add(saved);
+        return saved;
+      }
+      const fresh = newTabUid();
+      if (saved) uidMap[saved] = fresh;
+      taken.add(fresh);
+      return fresh;
+    });
+    return loaded.map((t, i) => ({ uid: uids[i], diagrams: remapLinkTabs(t.diagrams, uidMap) }));
+  };
+
   const loadFileData = (data, fileName, fileHandle = null) => {
     // Project file: restore all tabs
     if (Array.isArray(data.tabs)) {
-      const newTabs = data.tabs
-        .filter(t => t && t.diagrams)
-        .map(t => ({
-          ...createTab(t.name || 'Untitled', t.diagrams),
+      const loaded = data.tabs.filter(t => t && t.diagrams);
+      const replacing = isPristineWorkspace(tabsRef.current);
+      const fixed = assignLoadedUids(loaded, replacing);
+      const newTabs = loaded
+        .map((t, i) => ({
+          ...createTab(t.name || 'Untitled', fixed[i].diagrams, null, fixed[i].uid),
           currentPath: Array.isArray(t.currentPath) && t.currentPath.length > 0 ? t.currentPath : ['root']
         }));
       if (newTabs.length === 0) {
@@ -1575,7 +1602,8 @@ export default function Nodex() {
     // Single-diagram file: open as a new tab
     if (data.diagrams) {
       const name = data.name || fileName?.replace('.json', '') || 'Imported';
-      addTab(name, data.diagrams, fileHandle);
+      const [fixed] = assignLoadedUids([data], false);
+      addTab(name, fixed.diagrams, fileHandle, fixed.uid);
       // Update path after tab is created
       setTimeout(() => {
         setCurrentPath(data.currentPath || ['root']);
@@ -2026,16 +2054,18 @@ export default function Nodex() {
   // Open a node: follow its link if it has one, otherwise go into its own
   // nested diagram
   const openNode = (node) => {
-    if (!isLinkPath(node.link)) {
+    if (!isLink(node.link)) {
       navigateToNode(node);
       return;
     }
-    if (!pathResolves(diagrams, node.link)) {
-      alert(`“${node.label}” links to a diagram that no longer exists. Edit the node to change its link.`);
+    const target = resolveLink(tabsRef.current, activeTab, node.link);
+    if (!target) {
+      alert(`“${node.label}” links to a diagram that isn't open or no longer exists. Edit the node (E) to change its link.`);
       return;
     }
-    if (samePath(node.link, currentPath)) return;
-    setCurrentPath([...node.link]);
+    if (target.tab.id === activeTab.id && samePath(target.path, currentPath)) return;
+    setTabs(prev => prev.map(t => (t.id === target.tab.id ? { ...t, currentPath: [...target.path] } : t)));
+    if (target.tab.id !== activeTab.id) setActiveTabId(target.tab.id);
     setSelectedNode(null);
     setSelectedZone(null);
     setConnectingFrom(null);
@@ -2097,7 +2127,10 @@ export default function Nodex() {
       role: node.role === 'vip' ? 'vip' : 'standard',
       endpoints: (node.endpoints || []).map(ep => ({ ...ep })),
       model3d: node.model3d ? { ...node.model3d } : undefined,
-      link: isLinkPath(node.link) ? [...node.link] : undefined
+      link: (() => {
+        const l = normalizeLink(node.link);
+        return l ? { tab: l.tab || activeTab.uid, path: [...l.path] } : undefined;
+      })()
     });
     setEditingNode(node);
     setShowNodeCreator(true);
@@ -2139,10 +2172,15 @@ export default function Nodex() {
 
   // A link is only kept on a node without children — opening the node
   // follows the link, so its own nested diagram would be unreachable
+  const linkKeyOf = (link) => {
+    const l = normalizeLink(link);
+    return l ? `${l.tab || activeTab.uid}|${l.path.join('/')}` : '';
+  };
   const cleanLink = (link, node) => {
-    if (!isLinkPath(link)) return undefined;
-    if (node && hasChildren(diagrams, currentPath, node.id) && !samePath(link, node.link)) return undefined;
-    return [...link];
+    const l = normalizeLink(link);
+    if (!l) return undefined;
+    if (node && hasChildren(diagrams, currentPath, node.id) && linkKeyOf(link) !== linkKeyOf(node.link)) return undefined;
+    return { tab: l.tab || activeTab.uid, path: [...l.path] };
   };
 
   const createOrUpdateNode = () => {
@@ -3208,7 +3246,7 @@ export default function Nodex() {
         traceOrigin: focus?.tracing === nk,
         live: live ? LIVE_COLORS[live.status] : null,
         nested: !!hasNestedDiagram(n.id),
-        linked: isLinkPath(n.link)
+        linked: isLink(n.link)
       });
     });
     zones.forEach(z => {
@@ -4392,11 +4430,11 @@ export default function Nodex() {
                   <span className="text-xs bg-blue-600 px-1.5 py-0.5 rounded">Has children</span>
                 )}
               </div>
-              {isLinkPath(selectedNode.link) && (
+              {isLink(selectedNode.link) && (
                 <p className="text-xs text-violet-300 mb-2 flex items-center gap-1.5" title="Double-click the node to go there">
                   <Link size={12} className="shrink-0" />
                   <span className="truncate">
-                    {pathResolves(diagrams, selectedNode.link) ? pathLabel(diagrams, selectedNode.link) : 'Broken link'}
+                    {linkLabel(tabs, activeTab, selectedNode.link)}
                   </span>
                 </p>
               )}
@@ -4452,9 +4490,9 @@ export default function Nodex() {
               <button
                 onClick={() => openNode(selectedNode)}
                 className="flex-1 px-3 py-1.5 bg-blue-600 hover:bg-blue-700 rounded text-sm transition-colors flex items-center justify-center gap-1.5"
-                title={isLinkPath(selectedNode.link) ? `Go to ${pathLabel(diagrams, selectedNode.link)}` : 'Open this node\'s nested diagram'}
+                title={isLink(selectedNode.link) ? `Go to ${linkLabel(tabs, activeTab, selectedNode.link)}` : 'Open this node\'s nested diagram'}
               >
-                {isLinkPath(selectedNode.link) ? (<><Link size={14} /> Follow Link</>) : 'Open Diagram'}
+                {isLink(selectedNode.link) ? (<><Link size={14} /> Follow Link</>) : 'Open Diagram'}
               </button>
               <button
                 onClick={deleteSelectedNodes}
@@ -5718,7 +5756,7 @@ export default function Nodex() {
               const isConnectingSource = connectingFrom?.id === node.id;
               const isConnectingTarget = connectingFrom && hoveredNode === node.id && connectingFrom.id !== node.id;
               const hasNested = hasNestedDiagram(node.id);
-              const isLinked = isLinkPath(node.link);
+              const isLinked = isLink(node.link);
 
               // Determine stroke style
               let strokeColor = node.color;
@@ -5793,7 +5831,7 @@ export default function Nodex() {
                   {/* Link indicator — a linked node opens its link target */}
                   {isLinked && (
                     <g transform={`translate(${HEX_SIZE * 0.6}, ${-HEX_SIZE * 0.6})`} pointerEvents="none">
-                      <title>{`Links to ${pathLabel(diagrams, node.link)}`}</title>
+                      <title>{`Links to ${linkLabel(tabs, activeTab, node.link)}`}</title>
                       <circle r="9" fill="#8b5cf6" stroke="white" strokeWidth="2" />
                       <foreignObject x="-6" y="-6" width="12" height="12">
                         <div className="w-full h-full flex items-center justify-center">
@@ -6041,14 +6079,25 @@ export default function Nodex() {
                 />
               </div>
 
-              {/* Link: opening the node goes to a diagram up the tree instead
-                  of into its own nested diagram */}
+              {/* Link: opening the node goes to the linked diagram — any
+                  diagram in any open tab — instead of its own nested one */}
               {(() => {
                 const nodeHasChildren = !!editingNode && hasChildren(diagrams, currentPath, editingNode.id);
-                const targets = linkTargets(currentPath);
-                const link = isLinkPath(newNodeData.link) ? newNodeData.link : null;
-                const linkKey = link ? link.join('/') : '';
-                const outsideTree = link && !targets.some(t => samePath(t, link));
+                const link = normalizeLink(newNodeData.link);
+                const linkKey = linkKeyOf(newNodeData.link);
+                // This tab first; a node can't link to its own nested diagram
+                const ownPath = editingNode ? [...currentPath, String(editingNode.id)] : null;
+                const groups = [activeTab, ...tabs.filter(t => t.id !== activeTab.id)].map(t => ({
+                  tab: t,
+                  paths: diagramPaths(t.diagrams, t.id === activeTab.id ? ownPath : null)
+                }));
+                const known = groups.some(g => g.paths.some(p => `${g.tab.uid}|${p.join('/')}` === linkKey));
+                const optionLabel = (t, p) => {
+                  const depth = p.length - 1;
+                  const name = depth === 0 ? 'Root' : pathLabel(t.diagrams, p).split(' / ').pop();
+                  const here = t.id === activeTab.id && samePath(p, currentPath) ? '  (this diagram)' : '';
+                  return `${'\u00a0\u00a0\u00a0'.repeat(depth)}${depth ? '└ ' : ''}${name}${here}`;
+                };
                 return (
                   <div>
                     <label className="block text-sm font-medium mb-2 flex items-center gap-1.5">
@@ -6057,27 +6106,38 @@ export default function Nodex() {
                     <select
                       value={linkKey}
                       disabled={nodeHasChildren && !link}
-                      onChange={(e) => setNewNodeData({ ...newNodeData, link: e.target.value ? e.target.value.split('/') : undefined })}
+                      onChange={(e) => {
+                        const v = e.target.value;
+                        const bar = v.indexOf('|');
+                        setNewNodeData({
+                          ...newNodeData,
+                          link: v ? { tab: v.slice(0, bar), path: v.slice(bar + 1).split('/') } : undefined
+                        });
+                      }}
                       className="w-full px-3 py-2 bg-slate-700 rounded border border-slate-600 focus:border-blue-500 focus:outline-none disabled:opacity-50"
                     >
                       <option value="">None — opens its own nested diagram</option>
-                      {targets.map((t, i) => (
-                        <option key={t.join('/')} value={t.join('/')}>
-                          {pathLabel(diagrams, t)}{i === 0 ? ' (this diagram)' : ''}
-                        </option>
-                      ))}
-                      {outsideTree && (
+                      {link && !known && (
                         <option value={linkKey}>
-                          {pathResolves(diagrams, link) ? pathLabel(diagrams, link) : `Broken link (${linkKey})`}
+                          {resolveLink(tabs, activeTab, link) ? linkLabel(tabs, activeTab, link) : 'Broken link — tab not open or diagram removed'}
                         </option>
                       )}
+                      {groups.map(g => (
+                        <optgroup key={g.tab.id} label={g.tab.id === activeTab.id ? `${g.tab.name} (this tab)` : g.tab.name}>
+                          {g.paths.map(p => (
+                            <option key={p.join('/')} value={`${g.tab.uid}|${p.join('/')}`}>
+                              {optionLabel(g.tab, p)}
+                            </option>
+                          ))}
+                        </optgroup>
+                      ))}
                     </select>
                     <p className="text-xs text-slate-400 mt-1">
                       {nodeHasChildren && !link
                         ? 'This node has children. Remove them before linking it — a linked node opens its link target, so it can’t have a nested diagram.'
                         : link
                           ? 'Double-clicking this node goes to the linked diagram. A linked node can’t have children.'
-                          : 'Point this node at a diagram up the tree. Double-clicking it then goes there instead of into a nested diagram.'}
+                          : 'Point this node at any diagram, in this tab or another open tab. Double-clicking it then goes there instead of into a nested diagram.'}
                     </p>
                   </div>
                 );
