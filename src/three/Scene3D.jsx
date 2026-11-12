@@ -74,7 +74,7 @@ const Scene3D = forwardRef(function Scene3D(props, ref) {
       )}
       {tip && (
         <div
-          className="absolute z-30 max-w-xs px-3 py-2 rounded-lg bg-slate-900/95 border border-slate-600 shadow-2xl text-xs pointer-events-none"
+          className="nx-hover-tooltip absolute z-30 max-w-xs px-3 py-2 rounded-lg bg-slate-900/95 border border-slate-600 shadow-2xl text-xs pointer-events-none"
           style={{
             left: Math.min(hover.x - rect.left + 16, rect.width - 300),
             top: Math.min(hover.y - rect.top + 16, rect.height - 120)

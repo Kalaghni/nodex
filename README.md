@@ -114,6 +114,14 @@ Try it with [`examples/ha-web-stack.json`](examples/ha-web-stack.json): edge LBs
 - Unsaved changes trigger a leave-page warning
 - **Export** the full diagram (not just the viewport) as standalone **SVG** or 2× **PNG**
 
+## Phones and tablets
+
+- The canvas fills the screen. **Tools** opens diagram settings, zones, channels, and the selected component; **Actions** opens file, export, view, undo, and monitoring controls.
+- In 2D, drag empty canvas to pan, pinch to zoom, tap a node to select it, and drag a node to move it. Double-tap opens its nested diagram or follows its link.
+- A selected node has **Edit**, **Open**, and **Connect** buttons at the bottom of the canvas. To connect, tap **Connect**, then another node or zone (or an empty cell to create a connected node).
+- Choose a zone shape in **Tools**, then drag on the canvas to size it. Tabs have visible close and options buttons; the options menu includes Rename and Save Page.
+- Dialogs scroll within the screen, and palettes adapt to the available width. In 3D, drag to orbit and use two fingers to pan and zoom.
+
 ## File formats
 
 Plain JSON, two flavors, auto-detected on open:

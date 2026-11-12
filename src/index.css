@@ -91,3 +91,146 @@ html, body, #root {
 @media (prefers-reduced-motion: reduce) {
   .nx-flow, .nx-flow-rev, .nx-march, .nx-pulse { animation: none; }
 }
+
+/* The canvas is the workspace: browser chrome and tool panels must not take
+   it off screen. Keep the existing slate/blue editor palette at every size. */
+.nx-editor { height: 100dvh; }
+.nx-toolbar { height: auto; min-height: 48px; flex-wrap: wrap; }
+.nx-toolbar > * { flex-shrink: 0; }
+.nx-canvas-container > svg.nx-canvas { touch-action: none; }
+.nx-mobile-panel { color: #f8fafc; background: #1e293b; }
+.nx-editor button:focus-visible, .nx-mobile-panel button:focus-visible {
+  outline: 2px solid #60a5fa;
+  outline-offset: 2px;
+}
+
+@media (max-width: 1023px) {
+  .nx-mobile-header {
+    display: flex;
+    flex-shrink: 0;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    min-height: 56px;
+    padding: max(4px, env(safe-area-inset-top)) max(8px, env(safe-area-inset-right)) 4px max(8px, env(safe-area-inset-left));
+    background: #1e293b;
+    border-bottom: 1px solid #334155;
+  }
+  .nx-mobile-header button, .nx-panel-header button, .nx-canvas-controls button {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    min-height: 44px;
+    min-width: 44px;
+    padding: 8px;
+    border-radius: 8px;
+    font-size: 12px;
+  }
+  .nx-mobile-header button:active, .nx-canvas-controls button:active { background: #334155; }
+  .nx-mobile-panel {
+    position: fixed;
+    inset: auto 0 0;
+    width: 100%;
+    max-width: 640px;
+    max-height: min(88dvh, 800px);
+    margin: auto auto 0;
+    padding: 0;
+    border: 1px solid #475569;
+    border-bottom: 0;
+    border-radius: 18px 18px 0 0;
+    overflow: hidden;
+    box-shadow: 0 -12px 40px #02061766;
+  }
+  .nx-mobile-panel[open] { display: flex; flex-direction: column; }
+  .nx-mobile-panel::backdrop { background: #020617a8; }
+  .nx-panel-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 8px 12px 8px 20px;
+    flex-shrink: 0;
+    border-bottom: 1px solid #334155;
+  }
+  .nx-panel-body {
+    min-height: 0;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    padding-bottom: max(20px, env(safe-area-inset-bottom));
+  }
+  .nx-panel-body button { min-height: 44px; min-width: 44px; }
+  .nx-panel-body .opacity-0, .nx-tabs .opacity-0 { opacity: 1; }
+  .nx-actions-body { display: flex; flex-wrap: wrap; gap: 12px; padding: 16px; }
+  .nx-actions-body > div { flex-wrap: wrap; border: 0; padding: 0; gap: 8px; }
+  .nx-actions-body > div:not(.nx-toolbar-status) {
+    width: 100%;
+    padding-bottom: 12px;
+    border-bottom: 1px solid #334155;
+  }
+  :where(.nx-actions-body) button { min-width: 44px; background-color: #334155; }
+  .nx-actions-body .nx-toolbar-status { margin: 0; flex-wrap: wrap; gap: 8px; }
+  .nx-tabs { height: 49px; overflow-y: hidden; padding: 4px max(4px, env(safe-area-inset-left)) 0; }
+  .nx-tab { height: 44px; padding: 0 4px 0 12px; }
+  .nx-tabs button { min-width: 44px; min-height: 44px; flex-shrink: 0; }
+  .nx-mobile-breadcrumb {
+    display: flex;
+    align-items: center;
+    flex-shrink: 0;
+    gap: 4px;
+    padding: 0 8px;
+    min-height: 44px;
+    overflow-x: auto;
+    white-space: nowrap;
+    background: #172033;
+  }
+  .nx-mobile-breadcrumb button { flex-shrink: 0; padding: 12px 8px; font-size: 12px; }
+  .nx-mobile-breadcrumb [aria-current] { color: #93c5fd; }
+  .nx-canvas-controls {
+    position: absolute;
+    bottom: max(8px, env(safe-area-inset-bottom));
+    left: max(8px, env(safe-area-inset-left));
+    right: max(8px, env(safe-area-inset-right));
+    z-index: 25;
+    pointer-events: none;
+    display: grid;
+    gap: 8px;
+  }
+  .nx-touch-selection, .nx-touch-navigation {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    pointer-events: auto;
+    padding: 4px 8px;
+    border: 1px solid #475569;
+    border-radius: 12px;
+    background: #1e293bf5;
+    box-shadow: 0 4px 16px #02061733;
+  }
+  .nx-touch-selection button { flex-shrink: 0; }
+  .nx-touch-selection > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .nx-touch-navigation { background: #0f172aeb; }
+  .nx-touch-navigation > span { pointer-events: none; }
+  .nx-modal-backdrop { padding: max(12px, env(safe-area-inset-top)) 12px max(12px, env(safe-area-inset-bottom)); }
+  .nx-dialog { padding: 20px; max-width: 100%; max-height: 100%; overscroll-behavior: contain; }
+  .nx-dialog button { min-height: 44px; }
+  .nx-dialog :is(input, textarea, select), .nx-mobile-panel :is(input, textarea, select) { font-size: 16px; min-width: 0; }
+  .nx-dialog :is(.grid-cols-8, .grid-cols-10) { grid-template-columns: repeat(auto-fit, minmax(44px, 1fr)); }
+  .nx-dialog :is(.grid-cols-8, .grid-cols-10) > button { width: 100%; min-height: 44px; }
+  .nx-connection-drawer { width: min(100%, 384px); height: 100dvh; padding-bottom: max(20px, env(safe-area-inset-bottom)); }
+  .nx-trace-bar button, .nx-simulation-strip button { min-height: 44px; min-width: 44px; }
+  .nx-simulation-strip { flex-wrap: wrap; justify-content: center; gap: 4px; }
+  /* Leave room for touch navigation below the simulation strip and legend. */
+  .nx-canvas-container > .bottom-4 { bottom: max(76px, calc(env(safe-area-inset-bottom) + 68px)); max-width: calc(100% - 16px); }
+}
+
+@media (max-width: 374px) {
+  .nx-mobile-header { gap: 0; }
+  .nx-mobile-header button { padding: 6px; gap: 4px; }
+  .nx-touch-selection { flex-wrap: wrap; }
+  .nx-touch-selection > span { flex-basis: 100%; padding: 4px; }
+}
+
+@media (pointer: coarse) {
+  .nx-editor .group > .opacity-0 { opacity: 1; }
+  .nx-hover-tooltip { display: none; }
+}
