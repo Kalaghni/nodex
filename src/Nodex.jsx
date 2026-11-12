@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect, useMemo } from 'react';
-import { Database, Server, Cloud, Zap, Box, Globe, Lock, HardDrive, Cpu, Network, Shield, Wifi, Code, Container, FileText, Users, Settings, Activity, Mail, Phone, CheckCircle, XCircle, AlertCircle, Plus, Edit2, X, ChevronRight, Hexagon, Trash2, Save, FolderOpen, Download, FilePlus, ZoomIn, ZoomOut, Maximize, Undo, Redo, Copy, Clipboard, Grid, Eye, EyeOff, Home, Building, Factory, Warehouse, ShoppingCart, CreditCard, DollarSign, PieChart, BarChart, LineChart, TrendingUp, Clock, Calendar, Bell, MessageSquare, Send, Upload, Link, Layers, Package, Archive, Folder, Search, Filter, Terminal, GitBranch, Github, Smartphone, Tablet, Monitor, Printer, Camera, Mic, Video, Play, Pause, Square, Circle, Triangle, Star, Heart, ThumbsUp, ThumbsDown, Flag, Bookmark, Tag, Hash, AtSign, MapPin, Navigation, Compass, Map as MapIcon, Truck, Plane, Ship, Train, Car, Bike, Footprints, Key, Unlock, UserCheck, UserX, UserPlus, User, Bot, Cog, Wrench, Hammer, Lightbulb, Flame, Droplet, Wind, Sun, Moon, CloudRain, Snowflake, Thermometer, History, FlaskConical, PowerOff, RotateCcw, ShieldAlert, Focus, ArrowLeftRight, Workflow, LocateFixed } from 'lucide-react';
+import { Database, Server, Cloud, Zap, Box, Globe, Lock, HardDrive, Cpu, Network, Shield, Wifi, Code, Container, FileText, Users, Settings, Activity, Mail, Phone, CheckCircle, XCircle, AlertCircle, Plus, Edit2, X, ChevronRight, Hexagon, Trash2, Save, FolderOpen, Download, FilePlus, ZoomIn, ZoomOut, Maximize, Undo, Redo, Copy, Clipboard, Grid, Eye, EyeOff, Home, Building, Factory, Warehouse, ShoppingCart, CreditCard, DollarSign, PieChart, BarChart, LineChart, TrendingUp, Clock, Calendar, Bell, MessageSquare, Send, Upload, Link, Layers, Package, Archive, Folder, Search, Filter, Terminal, GitBranch, Github, Smartphone, Tablet, Monitor, Printer, Camera, Mic, Video, Play, Pause, Square, Circle, Triangle, Star, Heart, ThumbsUp, ThumbsDown, Flag, Bookmark, Tag, Hash, AtSign, MapPin, Navigation, Compass, Map as MapIcon, Truck, Plane, Ship, Train, Car, Bike, Footprints, Key, Unlock, UserCheck, UserX, UserPlus, User, Bot, Cog, Wrench, Hammer, Lightbulb, Flame, Droplet, Wind, Sun, Moon, CloudRain, Snowflake, Thermometer, History, FlaskConical, PowerOff, RotateCcw, ShieldAlert, Focus, ArrowLeftRight, Workflow, LocateFixed, Axis3d } from 'lucide-react';
 import {
   evaluate,
   findSinglePointsOfFailure,
@@ -29,6 +29,13 @@ import {
   nodeLiveStatus,
   uptimePercent
 } from './monitor.js';
+import { cleanModelOverride, readModelFile, MODEL_SCALE_MIN, MODEL_SCALE_MAX } from './three/modelSpec.js';
+import { MODEL_IDS, NO_MODEL } from './three/modelIds.js';
+
+// The 3D engine (three.js) loads on first use, not with the 2D editor
+const Scene3D = React.lazy(() => import('./three/Scene3D.jsx'));
+const ModelPreview = React.lazy(() => import('./three/ModelPicker.jsx'));
+const ModelGrid = React.lazy(() => import('./three/ModelPicker.jsx').then(m => ({ default: m.ModelGrid })));
 
 // Hexagon grid calculations
 const HEX_SIZE = 40;
@@ -988,6 +995,24 @@ export default function Nodex() {
   const connectionsRef = useRef(connections);
   connectionsRef.current = connections;
 
+  // 2D / 3D view. Per viewer, not part of the document.
+  const [view3d, setView3dState] = useState(() => {
+    try { return localStorage.getItem('nodex.view3d') === '1'; } catch { return false; }
+  });
+  const setView3d = (on) => {
+    setView3dState(on);
+    try { localStorage.setItem('nodex.view3d', on ? '1' : '0'); } catch { /* storage blocked */ }
+  };
+  const scene3dRef = useRef(null);
+  const [show3dHelp, setShow3dHelp] = useState(() => {
+    try { return localStorage.getItem('nodex.view3dHelp') !== '0'; } catch { return true; }
+  });
+  const toggle3dHelp = (on) => {
+    setShow3dHelp(on);
+    try { localStorage.setItem('nodex.view3dHelp', on ? '1' : '0'); } catch { /* storage blocked */ }
+  };
+  const [modelErrors, setModelErrors] = useState({});
+
   // UI State
   const [showNodeCreator, setShowNodeCreator] = useState(false);
   const [showZoneCreator, setShowZoneCreator] = useState(false);
@@ -1001,6 +1026,43 @@ export default function Nodex() {
     role: 'standard',
     endpoints: []
   });
+  // 3D model override in the node editor. `source` is UI-only (which tab
+  // is picked) and is dropped when the node is saved.
+  const modelSourceOf = (m) => m?.source || (m?.url ? 'custom' : m?.builtin === NO_MODEL ? 'none' : m?.builtin ? 'builtin' : 'icon');
+  const nodeModelSource = modelSourceOf(newNodeData.model3d);
+  const modelFileInputRef = useRef(null);
+  const setNodeModel = (patch) => setNewNodeData(prev => ({ ...prev, model3d: { ...(prev.model3d || {}), ...patch } }));
+  const pickModelSource = (source) => setNewNodeData(prev => {
+    const m = prev.model3d || {};
+    const keep = { scale: m.scale, rotation: m.rotation };
+    if (source === 'icon') return { ...prev, model3d: keep };
+    if (source === 'builtin') {
+      const builtin = m.builtin && m.builtin !== NO_MODEL ? m.builtin : prev.iconId;
+      return { ...prev, model3d: { ...keep, source, builtin } };
+    }
+    if (source === 'custom') return { ...prev, model3d: { ...keep, source, url: m.url, name: m.name } };
+    return { ...prev, model3d: { ...keep, source: 'none', builtin: NO_MODEL } };
+  });
+  const handleModelFile = async (e) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+    if (!/\.(glb|gltf)$/i.test(file.name)) {
+      alert('Choose a .glb or .gltf file');
+      return;
+    }
+    if (file.size > 20 * 1024 * 1024) {
+      alert('That model is over 20 MB. It would be saved inside the diagram file — host it somewhere and use its URL instead.');
+      return;
+    }
+    try {
+      const url = await readModelFile(file);
+      setNodeModel({ source: 'custom', url, name: file.name, builtin: undefined });
+    } catch (err) {
+      alert(`Couldn’t read the file: ${err.message}`);
+    }
+  };
+
   const [newZoneData, setNewZoneData] = useState({
     label: '',
     color: '#3b82f6',
@@ -1994,7 +2056,8 @@ export default function Nodex() {
       iconId: 'server',
       color: '#3b82f6',
       role: 'standard',
-      endpoints: []
+      endpoints: [],
+      model3d: undefined
     });
     setEditingNode(null);
     pendingConnectFromRef.current = null;
@@ -2015,7 +2078,8 @@ export default function Nodex() {
       iconId: node.iconId,
       color: node.color,
       role: node.role === 'vip' ? 'vip' : 'standard',
-      endpoints: (node.endpoints || []).map(ep => ({ ...ep }))
+      endpoints: (node.endpoints || []).map(ep => ({ ...ep })),
+      model3d: node.model3d ? { ...node.model3d } : undefined
     });
     setEditingNode(node);
     setShowNodeCreator(true);
@@ -2061,7 +2125,7 @@ export default function Nodex() {
     if (editingNode) {
       setNodes(nodes.map(n => 
         n.id === editingNode.id 
-          ? { ...n, label: newNodeData.label, description: newNodeData.description, iconId: newNodeData.iconId, color: newNodeData.color, role: newNodeData.role === 'vip' ? 'vip' : undefined, endpoints: cleanEndpoints(newNodeData.endpoints) }
+          ? { ...n, label: newNodeData.label, description: newNodeData.description, iconId: newNodeData.iconId, color: newNodeData.color, role: newNodeData.role === 'vip' ? 'vip' : undefined, endpoints: cleanEndpoints(newNodeData.endpoints), model3d: cleanModelOverride(newNodeData.model3d) }
           : n
       ));
     } else {
@@ -2085,6 +2149,7 @@ export default function Nodex() {
         color: newNodeData.color,
         ...(newNodeData.role === 'vip' ? { role: 'vip' } : {}),
         ...(cleanEndpoints(newNodeData.endpoints) ? { endpoints: cleanEndpoints(newNodeData.endpoints) } : {}),
+        ...(cleanModelOverride(newNodeData.model3d) ? { model3d: cleanModelOverride(newNodeData.model3d) } : {}),
         q: coords.q,
         r: coords.r
       };
@@ -3068,6 +3133,230 @@ export default function Nodex() {
   };
   const entityStatus = (key) => (statusView && analysis ? analysis.cur.entities.get(key) : null);
 
+  // ---- 3D view ----
+  // The 3D scene mirrors this level of the diagram. Everything that decides
+  // how a component looks (selection, isolation, simulation, live status)
+  // is computed here from the same state the 2D canvas uses.
+  const visuals3d = (() => {
+    if (!view3d) return null;
+    const nodesV = new Map();
+    const zonesV = new Map();
+    const connsV = new Map();
+    nodes.forEach(n => {
+      const nk = nodeKey(n.id);
+      const ns = entityStatus(nk);
+      const flowState = focusFlowState(nk);
+      const live = liveNodeStatus.get(n.id);
+      nodesV.set(n.id, {
+        selected: selectedNodeIds.includes(n.id),
+        hovered: hoveredNode === n.id,
+        status: ns?.status || null,
+        failed: !!ns?.failed,
+        collateralDown: ns?.status === 'down' && !ns?.failed,
+        showHealthy: simMode,
+        dimmed: !!focus && !focus.ents.has(nk),
+        standby: !!focus && !statusView && flowState === 'standby',
+        stranded: !!focus && !statusView && flowState === 'stranded',
+        traceOrigin: focus?.tracing === nk,
+        live: live ? LIVE_COLORS[live.status] : null,
+        nested: !!hasNestedDiagram(n.id)
+      });
+    });
+    zones.forEach(z => {
+      const zk = zoneKey(z.id);
+      const zs = entityStatus(zk);
+      zonesV.set(z.id, {
+        selected: selectedZone?.id === z.id,
+        hovered: hoveredZone === z.id && hoveredNode == null && hoveredConnection == null,
+        status: zs?.status || null,
+        failed: !!zs?.failed,
+        dimmed: !!focus && !focus.ents.has(zk) && !focus.contextZones.has(z.id)
+      });
+    });
+    connections.forEach(conn => {
+      const geom = connGeoms[conn.id];
+      if (!geom) return;
+      const lineColor = conn.color || '#64748b';
+      const connSim = statusView && analysis ? analysis.cur.conns.get(conn.id) : null;
+      const connBroken = connSim && connSim.status !== 'ok';
+      const strands = (geom.channels.length > 0 ? geom.channels : [null]).map(ch => {
+        let color = ch ? ch.color : lineColor;
+        let dash = conn.lineType || 'solid';
+        let opacity = 1;
+        let animate = false;
+        const flowState = ch && flows ? flows.get(ch.id)?.connState.get(conn.id) : null;
+        const strandFocused = !focus || (ch ? focus.strands.has(`${conn.id}|${ch.id}`) : focus.conns.has(conn.id));
+        if (connBroken || flowState === 'dead') {
+          if (statusView) {
+            color = STATUS_COLORS.down;
+            dash = 'dashed';
+            opacity = connSim?.status === 'failed' ? 0.95 : 0.6;
+          }
+        } else if (flowState === 'standby' && (statusView || focus)) {
+          dash = 'dashed';
+          opacity = 0.45;
+        } else if (flowState === 'stranded' && (statusView || focus)) {
+          dash = 'dotted';
+          opacity = 0.3;
+        } else if (flowState === 'active') {
+          animate = !!focus;
+        }
+        if (focus && !strandFocused) {
+          opacity = Math.min(opacity, 0.1);
+          animate = false;
+        }
+        return { color, dash, opacity, animate };
+      });
+      connsV.set(conn.id, {
+        strands,
+        selected: selectedConnectionIds.includes(conn.id),
+        hovered: hoveredConnection === conn.id,
+        dimmed: !!focus && !focus.conns.has(conn.id),
+        endStyles: getConnEndStyles(conn),
+        reversed: connFlowReversed(conn)
+      });
+    });
+    return { nodes: nodesV, zones: zonesV, conns: connsV };
+  })();
+
+  const zoneLabels3d = view3d
+    ? Object.fromEntries(zones.filter(z => z.label && z.cells.length).map(z => [z.id, getZoneLabelLayout(z)]))
+    : null;
+
+  const handle3dHover = (hit) => {
+    setHoveredNode(hit?.kind === 'node' ? hit.id : null);
+    setHoveredZone(hit?.kind === 'zone' ? hit.id : null);
+    setHoveredConnection(hit?.kind === 'conn' ? hit.id : null);
+  };
+
+  const handle3dPick = (hit, e) => {
+    if (!hit) {
+      if (!simMode) {
+        setSelectedNodeIds([]);
+        setSelectedZone(null);
+        setSelectedConnectionIds([]);
+      }
+      return;
+    }
+    if (hit.kind === 'node') {
+      const node = nodes.find(n => n.id === hit.id);
+      if (!node) return;
+      if (e.shiftKey) {
+        navigateToNode(node);
+        return;
+      }
+      if (simMode) {
+        toggleFailure(nodeKey(node.id));
+        return;
+      }
+      if (e.ctrlKey || e.metaKey) {
+        setSelectedNodeIds(prev => (prev.includes(node.id) ? prev.filter(id => id !== node.id) : [...prev, node.id]));
+      } else {
+        setSelectedNodeIds([node.id]);
+      }
+      setSelectedZone(null);
+    } else if (hit.kind === 'zone') {
+      const zone = zones.find(z => z.id === hit.id);
+      if (!zone) return;
+      if (simMode) {
+        toggleFailure(zoneKey(zone.id));
+        return;
+      }
+      setSelectedZone(zone);
+      setSelectedNodeIds([]);
+    } else if (hit.kind === 'conn') {
+      const conn = connections.find(c => c.id === hit.id);
+      if (!conn) return;
+      if (simMode) {
+        toggleFailure(connKey(conn.id));
+        return;
+      }
+      if (e.ctrlKey || e.metaKey) {
+        setSelectedConnectionIds(prev => (prev.includes(conn.id) ? prev.filter(i => i !== conn.id) : [...prev, conn.id]));
+        return;
+      }
+      setEditingConnection(conn);
+      setShowConnectionEditor(true);
+    }
+  };
+
+  // Right-click edits, like on the 2D canvas
+  const handle3dContext = (hit) => {
+    if (!hit || simMode) return;
+    if (hit.kind === 'node') {
+      const node = nodes.find(n => n.id === hit.id);
+      if (!node) return;
+      setSelectedNodeIds([node.id]);
+      openNodeEditor(node);
+    } else if (hit.kind === 'zone') {
+      const zone = zones.find(z => z.id === hit.id);
+      if (zone) openZoneEditor(zone);
+    } else if (hit.kind === 'conn') {
+      const conn = connections.find(c => c.id === hit.id);
+      if (!conn) return;
+      setEditingConnection(conn);
+      setShowConnectionEditor(true);
+    }
+  };
+
+  // Hover card text in 3D: what it is, its status and why
+  const describe3d = (hit) => {
+    const lines = [];
+    let title = '';
+    let kind = '';
+    let key = null;
+    if (hit.kind === 'node') {
+      const n = nodes.find(nn => nn.id === hit.id);
+      if (!n) return null;
+      kind = 'Node';
+      title = n.label;
+      key = nodeKey(n.id);
+      if (n.description) lines.push({ text: n.description });
+      if (modelErrors[n.id] && n.model3d?.url) lines.push({ text: `3D model: ${modelErrors[n.id]}`, color: STATUS_COLORS.degraded });
+      const live = liveNodeStatus.get(n.id);
+      if (live) lines.push({ text: `Live: ${LIVE_LABELS[live.status]}`, color: LIVE_COLORS[live.status] });
+    } else if (hit.kind === 'zone') {
+      const z = zones.find(zz => zz.id === hit.id);
+      if (!z) return null;
+      kind = 'Zone';
+      title = z.label || 'Zone';
+      key = zoneKey(z.id);
+    } else if (hit.kind === 'conn') {
+      const c = connections.find(cc => cc.id === hit.id);
+      if (!c) return null;
+      kind = 'Link';
+      const name = (id, type) => (type === 'zone'
+        ? zones.find(z => z.id === id)?.label || 'Zone'
+        : nodes.find(n => n.id === id)?.label || '?');
+      title = c.label || `${name(c.from, c.fromType)} → ${name(c.to, c.toType)}`;
+      if (c.label) lines.push({ text: `${name(c.from, c.fromType)} → ${name(c.to, c.toType)}` });
+      key = connKey(c.id);
+    }
+    const es = key ? entityStatus(key) : null;
+    if (es) {
+      lines.push({ text: es.failed ? 'Failed (injected)' : STATUS_LABELS[es.status], color: STATUS_COLORS[es.status] });
+      (es.reasons || [])
+        .filter(r => !/^Failed \(simulated|Link failed \(simulated/.test(r))
+        .forEach(r => lines.push({ text: `• ${r}` }));
+    }
+    if (simMode) lines.push({ text: `Click to ${es?.failed ? 'restore' : 'fail'}`, color: '#64748b' });
+    return { kind, title, lines };
+  };
+
+  // Drawing zones and links happens on the grid — those tools drop back to 2D
+  useEffect(() => {
+    if (view3d && (isCreatingZone || connectingFrom)) setView3d(false);
+  }, [view3d, isCreatingZone, connectingFrom]);
+
+  const export3dPng = () => {
+    const url = scene3dRef.current?.screenshot(2);
+    if (!url) return;
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = exportFileName('png').replace(/\.png$/, '-3d.png');
+    a.click();
+  };
+
   // ---- Sidebar: outage simulation panel ----
   const ChannelStatusPill = ({ status }) => {
     const meta = CHANNEL_STATUS[status] || CHANNEL_STATUS.unused;
@@ -3596,23 +3885,42 @@ export default function Nodex() {
         <div className="flex items-center gap-1 pr-2 border-r border-slate-600">
           <button
             onClick={exportAsSVG}
-            className="p-2 hover:bg-slate-700 rounded transition-colors text-xs flex items-center gap-1"
-            title="Export as SVG"
+            disabled={view3d}
+            className="p-2 hover:bg-slate-700 rounded transition-colors text-xs flex items-center gap-1 disabled:opacity-30 disabled:cursor-not-allowed"
+            title={view3d ? 'SVG export is 2D only — switch to 2D' : 'Export as SVG'}
           >
             <Download size={16} />
             <span>SVG</span>
           </button>
           <button
-            onClick={exportAsPNG}
+            onClick={view3d ? export3dPng : exportAsPNG}
             className="p-2 hover:bg-slate-700 rounded transition-colors text-xs flex items-center gap-1"
-            title="Export as PNG"
+            title={view3d ? 'Export the 3D view as PNG' : 'Export as PNG'}
           >
             <Download size={16} />
             <span>PNG</span>
           </button>
         </div>
 
-        {/* Zoom controls */}
+        {/* Zoom controls (camera controls in 3D) */}
+        {view3d ? (
+          <div className="flex items-center gap-1 pr-2 border-r border-slate-600">
+            <button
+              onClick={() => scene3dRef.current?.topView()}
+              className="p-2 hover:bg-slate-700 rounded transition-colors text-xs"
+              title="Look straight down"
+            >
+              Top
+            </button>
+            <button
+              onClick={() => scene3dRef.current?.fit()}
+              className="p-2 hover:bg-slate-700 rounded transition-colors"
+              title="Fit the diagram in view"
+            >
+              <Maximize size={18} />
+            </button>
+          </div>
+        ) : (
         <div className="flex items-center gap-1 pr-2 border-r border-slate-600">
           <button
             onClick={zoomOut}
@@ -3636,6 +3944,27 @@ export default function Nodex() {
           >
             <Maximize size={18} />
           </button>
+        </div>
+        )}
+
+        {/* 2D / 3D */}
+        <div className="flex items-center pr-2 border-r border-slate-600">
+          <div className="flex rounded bg-slate-900/60 p-0.5" role="group" aria-label="View">
+            {[{ id: false, label: '2D' }, { id: true, label: '3D' }].map(opt => (
+              <button
+                key={opt.label}
+                onClick={() => setView3d(opt.id)}
+                className={`px-2 py-1 rounded text-xs flex items-center gap-1 transition-colors ${
+                  view3d === opt.id ? 'bg-blue-600 text-white' : 'text-slate-300 hover:bg-slate-700'
+                }`}
+                title={opt.id ? '3D view — orbit around the diagram with 3D models for every node' : 'Flat hex-grid editor'}
+                aria-pressed={view3d === opt.id}
+              >
+                {opt.id && <Axis3d size={14} />}
+                {opt.label}
+              </button>
+            ))}
+          </div>
         </div>
 
         {/* Edit operations */}
@@ -4404,13 +4733,13 @@ export default function Nodex() {
       <div
         ref={canvasRef}
         className="flex-1 relative overflow-hidden select-none"
-        onMouseDown={handleCanvasMouseDown}
-        onMouseMove={handleCanvasMouseMove}
-        onMouseLeave={handleCanvasMouseLeave}
-        onWheel={handleWheel}
+        onMouseDown={view3d ? undefined : handleCanvasMouseDown}
+        onMouseMove={view3d ? undefined : handleCanvasMouseMove}
+        onMouseLeave={view3d ? undefined : handleCanvasMouseLeave}
+        onWheel={view3d ? undefined : handleWheel}
         onContextMenu={(e) => e.preventDefault()}
         style={{
-          cursor: isPanning || isDraggingZone ? 'grabbing' : simMode ? 'grab' : isCreatingZone ? 'crosshair' : connectingFrom ? 'crosshair' : resizingZone ? 'nwse-resize' : 'default'
+          cursor: view3d ? 'default' : isPanning || isDraggingZone ? 'grabbing' : simMode ? 'grab' : isCreatingZone ? 'crosshair' : connectingFrom ? 'crosshair' : resizingZone ? 'nwse-resize' : 'default'
         }}
       >
         {/* File drop overlay — pointer-events-none so it never steals the
@@ -4563,7 +4892,7 @@ export default function Nodex() {
 
         {/* Hover card — a component's status and why (simulation / live
             impact), plus the live check result of each of its addresses */}
-        {(simMode || liveEnabled) && (() => {
+        {!view3d && (simMode || liveEnabled) && (() => {
           let key = null;
           let kind = null;
           if (hoveredNode != null) { key = nodeKey(hoveredNode); kind = 'Node'; }
@@ -4655,6 +4984,55 @@ export default function Nodex() {
           );
         })()}
 
+        {view3d && (
+          <>
+            <React.Suspense fallback={
+              <div className="absolute inset-0 flex items-center justify-center text-sm text-slate-400">Loading 3D view…</div>
+            }>
+            <Scene3D
+              ref={scene3dRef}
+              nodes={nodes}
+              zones={zones}
+              connections={connections}
+              connGeoms={connGeoms}
+              zoneLabels={zoneLabels3d}
+              visuals={visuals3d}
+              axialToPixel={axialToPixel}
+              hexSize={HEX_SIZE}
+              fitKey={viewKey}
+              onPick={handle3dPick}
+              onContextPick={handle3dContext}
+              onHover={handle3dHover}
+              describe={describe3d}
+              onModelStatus={(id, err) => setModelErrors(prev => (prev[id] === (err || undefined) ? prev : { ...prev, [id]: err || undefined }))}
+            />
+            </React.Suspense>
+            {show3dHelp ? (
+              <div className="absolute top-4 right-4 z-10 pl-3 pr-7 py-2 rounded-lg bg-slate-800/90 backdrop-blur border border-slate-700 text-[11px] text-slate-400 leading-relaxed">
+                <div><span className="text-slate-200">Drag</span> orbit · <span className="text-slate-200">Right / Shift-drag</span> pan · <span className="text-slate-200">Scroll</span> zoom</div>
+                <div>
+                  <span className="text-slate-200">Click</span> {simMode ? 'fail / restore' : 'select'} · <span className="text-slate-200">Right-click</span> edit · <span className="text-slate-200">Shift+Click</span> open · <span className="text-slate-200">Double-click</span> focus
+                </div>
+                <button
+                  onClick={() => toggle3dHelp(false)}
+                  className="absolute top-1.5 right-1.5 text-slate-500 hover:text-white"
+                  title="Hide"
+                >
+                  <X size={13} />
+                </button>
+              </div>
+            ) : (
+              <button
+                onClick={() => toggle3dHelp(true)}
+                className="absolute top-4 right-4 z-10 w-7 h-7 rounded-full bg-slate-800/90 border border-slate-700 text-xs text-slate-400 hover:text-white"
+                title="3D controls"
+              >
+                ?
+              </button>
+            )}
+          </>
+        )}
+        {!view3d && (
         <svg className="nx-canvas w-full h-full">
           <g transform={`translate(${viewOffset.x}, ${viewOffset.y}) scale(${zoom})`}>
             {/* Zone backgrounds */}
@@ -5562,6 +5940,7 @@ export default function Nodex() {
             </defs>
           </g>
         </svg>
+        )}
       </div>
     </div>
 
@@ -5648,6 +6027,142 @@ export default function Nodex() {
                     />
                   ))}
                 </div>
+              </div>
+
+              <div>
+                <div className="flex items-center justify-between mb-2">
+                  <label className="text-sm font-medium flex items-center gap-1.5">
+                    <Axis3d size={14} className="text-sky-400" />
+                    3D model
+                  </label>
+                  {cleanModelOverride(newNodeData.model3d) && (
+                    <button
+                      onClick={() => setNewNodeData({ ...newNodeData, model3d: undefined })}
+                      className="flex items-center gap-1 text-xs text-slate-400 hover:text-white"
+                      title="Use the icon’s model at normal size"
+                    >
+                      <RotateCcw size={12} /> Reset
+                    </button>
+                  )}
+                </div>
+                <div className="grid grid-cols-1 sm:grid-cols-[200px_1fr] gap-3">
+                  <React.Suspense fallback={<div className="rounded bg-slate-900" style={{ height: 176 }} />}>
+                    <ModelPreview
+                      node={{ iconId: newNodeData.iconId, color: newNodeData.color, model3d: cleanModelOverride(newNodeData.model3d) }}
+                      height={176}
+                    />
+                  </React.Suspense>
+                  <div className="space-y-3 min-w-0">
+                    <div className="grid grid-cols-2 gap-1.5">
+                      {[
+                        { id: 'icon', label: 'Match icon', help: 'Follows the icon above' },
+                        { id: 'builtin', label: 'Built-in', help: 'Any of the 3D models' },
+                        { id: 'custom', label: 'Custom file', help: '.glb / .gltf or a URL' },
+                        { id: 'none', label: 'None', help: 'Just the hexagon' }
+                      ].map(opt => (
+                        <button
+                          key={opt.id}
+                          onClick={() => pickModelSource(opt.id)}
+                          className={`text-left px-2.5 py-1.5 rounded transition-all ${
+                            nodeModelSource === opt.id ? 'bg-blue-600/30 ring-2 ring-blue-400' : 'bg-slate-700 hover:bg-slate-600'
+                          }`}
+                        >
+                          <span className="block text-xs font-medium">{opt.label}</span>
+                          <span className="block text-[11px] text-slate-400">{opt.help}</span>
+                        </button>
+                      ))}
+                    </div>
+                    {nodeModelSource !== 'none' && (
+                      <div className="grid grid-cols-2 gap-3">
+                        <label className="block text-xs text-slate-400">
+                          <span className="flex justify-between mb-1">Scale <span className="text-slate-200">{(newNodeData.model3d?.scale ?? 1).toFixed(2)}×</span></span>
+                          <input
+                            type="range"
+                            min={MODEL_SCALE_MIN}
+                            max={MODEL_SCALE_MAX}
+                            step="0.05"
+                            value={newNodeData.model3d?.scale ?? 1}
+                            onChange={(e) => setNodeModel({ scale: parseFloat(e.target.value) })}
+                            className="w-full accent-blue-500"
+                          />
+                        </label>
+                        <label className="block text-xs text-slate-400">
+                          <span className="flex justify-between mb-1">Rotation <span className="text-slate-200">{Math.round(newNodeData.model3d?.rotation ?? 0)}°</span></span>
+                          <input
+                            type="range"
+                            min="0"
+                            max="345"
+                            step="15"
+                            value={newNodeData.model3d?.rotation ?? 0}
+                            onChange={(e) => setNodeModel({ rotation: parseInt(e.target.value, 10) })}
+                            className="w-full accent-blue-500"
+                          />
+                        </label>
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                {nodeModelSource === 'builtin' && (
+                  <div className="mt-2 max-h-44 overflow-y-auto bg-slate-900 rounded p-2 scrollbar-thin">
+                    <React.Suspense fallback={<div className="h-20" />}>
+                      <ModelGrid
+                        items={AVAILABLE_ICONS.filter(ic => MODEL_IDS.includes(ic.id))}
+                        color={newNodeData.color}
+                        value={newNodeData.model3d?.builtin}
+                        onPick={(id) => setNodeModel({ source: 'builtin', builtin: id })}
+                      />
+                    </React.Suspense>
+                  </div>
+                )}
+
+                {nodeModelSource === 'custom' && (
+                  <div className="mt-2 space-y-2">
+                    <div className="flex items-center gap-2">
+                      <button
+                        onClick={() => modelFileInputRef.current?.click()}
+                        className="flex items-center gap-1.5 px-3 py-1.5 rounded text-xs bg-slate-700 hover:bg-slate-600 shrink-0"
+                      >
+                        <Upload size={13} /> Choose file…
+                      </button>
+                      <input
+                        ref={modelFileInputRef}
+                        type="file"
+                        accept=".glb,.gltf,model/gltf-binary,model/gltf+json"
+                        onChange={handleModelFile}
+                        className="hidden"
+                      />
+                      <span className="text-xs text-slate-500">or</span>
+                      <input
+                        type="url"
+                        value={newNodeData.model3d?.url?.startsWith('data:') ? '' : (newNodeData.model3d?.url || '')}
+                        onChange={(e) => setNodeModel({ source: 'custom', url: e.target.value, name: undefined })}
+                        placeholder="https://example.com/models/router.glb"
+                        className="flex-1 min-w-0 px-2 py-1.5 bg-slate-700 rounded border border-slate-600 focus:border-blue-500 focus:outline-none text-xs font-mono"
+                      />
+                    </div>
+                    {newNodeData.model3d?.url?.startsWith('data:') && (
+                      <div className="flex items-center gap-2 px-2 py-1.5 rounded bg-slate-900 text-xs">
+                        <Package size={13} className="text-sky-400 shrink-0" />
+                        <span className="truncate text-slate-200">{newNodeData.model3d.name || 'Embedded model'}</span>
+                        <span className="text-slate-500 shrink-0">{Math.round(newNodeData.model3d.url.length * 0.75 / 1024)} KB, saved in the diagram</span>
+                        <button
+                          onClick={() => setNodeModel({ url: undefined, name: undefined })}
+                          className="ml-auto text-slate-400 hover:text-white shrink-0"
+                          title="Remove the file"
+                        >
+                          <X size={13} />
+                        </button>
+                      </div>
+                    )}
+                    {newNodeData.model3d?.url?.startsWith('data:') && newNodeData.model3d.url.length > 4 * 1024 * 1024 * 4 / 3 && (
+                      <p className="text-xs text-amber-400">Large models make the diagram file big and slow to save — consider hosting it and using a URL.</p>
+                    )}
+                    <p className="text-[11px] text-slate-500">
+                      glTF 2.0: a <span className="text-slate-300">.glb</span>, or a <span className="text-slate-300">.gltf</span> with its buffers and textures embedded. Files are stored inside the diagram; URLs must allow cross-origin loading. Models are scaled to fit the hexagon.
+                    </p>
+                  </div>
+                )}
               </div>
 
               <div>
