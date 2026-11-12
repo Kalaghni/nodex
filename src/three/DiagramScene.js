@@ -1019,7 +1019,11 @@ export class DiagramScene {
       e.liveDot.material.emissive.set(v.live);
     }
     e.statusDot.visible = !v.live && v.status === 'healthy' && !!v.showHealthy;
-    e.nestedDot.visible = !!v.nested;
+    // Linked nodes open their link target instead of a nested diagram
+    e.nestedDot.visible = !!v.nested || !!v.linked;
+    const nestedColor = v.linked ? '#8b5cf6' : '#3b82f6';
+    e.nestedDot.material.color.set(nestedColor);
+    e.nestedDot.material.emissive.set(nestedColor);
 
     setLabelOpacity(e.label, v.dimmed ? 0.25 : 1);
     if (e.label) {

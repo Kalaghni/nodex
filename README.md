@@ -9,13 +9,14 @@ Architecture diagramming on a hexagonal grid. Nodex is a single-page React app f
 ### Canvas
 - **Infinite hex grid** that expands as you pan, zoom (scroll wheel), and place content
 - **Nodes**: hexagons with an icon (90+ built in), color, label, and description
-- **Nested diagrams**: every node can contain its own child diagram — Shift+Click (or "Open Diagram") to descend, breadcrumbs to climb back up
+- **Nested diagrams**: every node can contain its own child diagram — double-click (or Shift+Click, or "Open Diagram") to descend, breadcrumbs to climb back up
+- **Node links**: instead of a child diagram, a node can link to a diagram up the tree (the one it sits in, or any ancestor up to Root) — set it under *Link* in the node editor. Opening a linked node (double-click, Shift+Click, "Follow Link") jumps to that diagram. A linked node can't have children, and a node that already has children can't be linked until they're removed. Linked nodes show a purple link badge
 - **Zones**: colored regions in three shapes — rectangle, hexagon, and circular — with a name label you can place on any side (or center), inside or outside the boundary
   - Middle-drag a selected zone to move it; nodes sitting on it come along
   - Drag the round handle to resize (corner for rectangles, radius for hex/circular)
 
 ### Connections
-- Double-click a node **or zone** to start a connection; click another node or zone to finish — node→node, node→zone, and zone→zone all work
+- Right-click a node **or zone** to start a connection; click another node or zone to finish — node→node, node→zone, and zone→zone all work
 - Mid-connection, click an **empty cell** to create a new node pre-wired to the source
 - Lines terminate at hexagon edges; a zone connection lies exactly on the line between the two centers, trimmed where it crosses each zone's outline
 - Per-connection options, edited in a live side drawer:
@@ -43,7 +44,7 @@ Architecture diagramming on a hexagonal grid. Nodex is a single-page React app f
 - Combine with isolation to watch one flow re-route around failures in real time
 
 ### Live monitoring
-- Attach **real addresses** to a node (right-click → *Monitoring*): IP or hostname plus a check — **Ping**, **TCP port open**, **HTTP** or **HTTPS** (with a path, e.g. `/health`). A node can have several; *Test* checks one on the spot
+- Attach **real addresses** to a node (edit the node — select it and press **E** — → *Monitoring*): IP or hostname plus a check — **Ping**, **TCP port open**, **HTTP** or **HTTPS** (with a path, e.g. `/health`). A node can have several; *Test* checks one on the spot
 - Toggle **Live** in the toolbar: every address is checked on an interval and each node gets a live dot — green up, amber partly up (some of its addresses fail), red down, grey can't check. Hover a node for per-address latency and errors; the sidebar lists what's failing and the recent check history of the selected node
 - **Real outages flow into the impact analysis**: a node that's really down is treated like a failure — dependents, failovers, and every affected traffic channel light up exactly as in a simulation. *Explore impact & what-ifs* opens the simulation starting from the live state, so you can ask "and if this fails too?"
 - An address only counts as down after *N* consecutive failed checks (default 2, configurable) so a single lost packet isn't an outage; recovery shows immediately. If the agent itself can't be reached, nothing is marked down — Nodex says the agent is unreachable instead
@@ -70,7 +71,7 @@ Ping uses the system `ping` binary (no shell; the Docker image runs it as an unp
 ### 3D view
 - Switch **2D / 3D** in the toolbar to see the current diagram level as a 3D scene: every node stands on a raised hexagon with a **3D model of its icon**, zones become translucent floors with low walls, and connections (with their channel strands, arrowheads and labels) run between them
 - **Every icon has a matching 3D model** (all 86, built procedurally — nothing to download), tinted with the node's color
-- **Per-node override** (right-click → *3D model*, with a live turntable preview):
+- **Per-node override** (edit the node → *3D model*, with a live turntable preview):
   - *Match icon* (default) · any other *Built-in* model (thumbnail gallery) · a *Custom file* — a glTF 2.0 `.glb` / self-contained `.gltf`, embedded in the diagram, or a URL · *None* (just the hexagon)
   - **Scale** (0.25–4×) and **rotation** apply to whichever model is shown; custom models are fitted to the cell automatically, and while one loads (or if it fails) the icon's model stands in
 - Everything else carries over: selection, isolation fading and animated traffic packets, simulation and live status (failed models grey out with a pulsing red ring), nested diagrams
@@ -138,9 +139,10 @@ Availability settings are optional fields, so older files load unchanged: `zone.
 | Ctrl+Z / Ctrl+Y | Undo / redo |
 | Ctrl+S | Save tab |
 | Ctrl+Shift+S | Save project (all tabs) |
-| Double-click node/zone | Start a connection |
-| Right-click node | Edit the node |
-| Shift+Click node | Open nested diagram |
+| Double-click node | Open the node (nested diagram, or its link target) |
+| Right-click node/zone | Start a connection |
+| E | Edit the selected node |
+| Shift+Click node | Open the node (same as double-click) |
 | Delete / Backspace | Remove selection |
 | Scroll | Zoom |
 | Shift+Drag / Middle-drag | Pan |

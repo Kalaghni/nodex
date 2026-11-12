@@ -1,5 +1,6 @@
 import React, { useState, useRef, useEffect, useMemo } from 'react';
 import { Database, Server, Cloud, Zap, Box, Globe, Lock, HardDrive, Cpu, Network, Shield, Wifi, Code, Container, FileText, Users, Settings, Activity, Mail, Phone, CheckCircle, XCircle, AlertCircle, Plus, Edit2, X, ChevronRight, Hexagon, Trash2, Save, FolderOpen, Download, FilePlus, ZoomIn, ZoomOut, Maximize, Undo, Redo, Copy, Clipboard, Grid, Eye, EyeOff, Home, Building, Factory, Warehouse, ShoppingCart, CreditCard, DollarSign, PieChart, BarChart, LineChart, TrendingUp, Clock, Calendar, Bell, MessageSquare, Send, Upload, Link, Layers, Package, Archive, Folder, Search, Filter, Terminal, GitBranch, Github, Smartphone, Tablet, Monitor, Printer, Camera, Mic, Video, Play, Pause, Square, Circle, Triangle, Star, Heart, ThumbsUp, ThumbsDown, Flag, Bookmark, Tag, Hash, AtSign, MapPin, Navigation, Compass, Map as MapIcon, Truck, Plane, Ship, Train, Car, Bike, Footprints, Key, Unlock, UserCheck, UserX, UserPlus, User, Bot, Cog, Wrench, Hammer, Lightbulb, Flame, Droplet, Wind, Sun, Moon, CloudRain, Snowflake, Thermometer, History, FlaskConical, PowerOff, RotateCcw, ShieldAlert, Focus, ArrowLeftRight, Workflow, LocateFixed, Axis3d } from 'lucide-react';
+import { isLinkPath, pathResolves, linkTargets, pathLabel, samePath, hasChildren } from './links';
 import {
   evaluate,
   findSinglePointsOfFailure,
@@ -1115,9 +1116,6 @@ export default function Nodex() {
   // this holds the source node id to auto-connect to the node being created
   const pendingConnectFromRef = useRef(null);
 
-  // Debounce timer for clicks on the hover "+" over zone cells: a single
-  // click opens the node creator, a double-click starts a zone connection
-  const pendingCellClickRef = useRef(null);
   
   const [hoveredConnection, setHoveredConnection] = useState(null);
   // Id-based like zone selection: the drawer edits the live connection, so
@@ -2025,6 +2023,24 @@ export default function Nodex() {
     setViewOffset({ x: 400, y: 300 });
   };
 
+  // Open a node: follow its link if it has one, otherwise go into its own
+  // nested diagram
+  const openNode = (node) => {
+    if (!isLinkPath(node.link)) {
+      navigateToNode(node);
+      return;
+    }
+    if (!pathResolves(diagrams, node.link)) {
+      alert(`“${node.label}” links to a diagram that no longer exists. Edit the node to change its link.`);
+      return;
+    }
+    if (samePath(node.link, currentPath)) return;
+    setCurrentPath([...node.link]);
+    setSelectedNode(null);
+    setSelectedZone(null);
+    setConnectingFrom(null);
+  };
+
   const navigateUp = (index) => {
     setCurrentPath(currentPath.slice(0, index + 1));
     setSelectedNode(null);
@@ -2057,7 +2073,8 @@ export default function Nodex() {
       color: '#3b82f6',
       role: 'standard',
       endpoints: [],
-      model3d: undefined
+      model3d: undefined,
+      link: undefined
     });
     setEditingNode(null);
     pendingConnectFromRef.current = null;
@@ -2079,7 +2096,8 @@ export default function Nodex() {
       color: node.color,
       role: node.role === 'vip' ? 'vip' : 'standard',
       endpoints: (node.endpoints || []).map(ep => ({ ...ep })),
-      model3d: node.model3d ? { ...node.model3d } : undefined
+      model3d: node.model3d ? { ...node.model3d } : undefined,
+      link: isLinkPath(node.link) ? [...node.link] : undefined
     });
     setEditingNode(node);
     setShowNodeCreator(true);
@@ -2119,13 +2137,21 @@ export default function Nodex() {
     }
   };
 
+  // A link is only kept on a node without children — opening the node
+  // follows the link, so its own nested diagram would be unreachable
+  const cleanLink = (link, node) => {
+    if (!isLinkPath(link)) return undefined;
+    if (node && hasChildren(diagrams, currentPath, node.id) && !samePath(link, node.link)) return undefined;
+    return [...link];
+  };
+
   const createOrUpdateNode = () => {
     if (!newNodeData.label.trim()) return;
 
     if (editingNode) {
       setNodes(nodes.map(n => 
         n.id === editingNode.id 
-          ? { ...n, label: newNodeData.label, description: newNodeData.description, iconId: newNodeData.iconId, color: newNodeData.color, role: newNodeData.role === 'vip' ? 'vip' : undefined, endpoints: cleanEndpoints(newNodeData.endpoints), model3d: cleanModelOverride(newNodeData.model3d) }
+          ? { ...n, label: newNodeData.label, description: newNodeData.description, iconId: newNodeData.iconId, color: newNodeData.color, role: newNodeData.role === 'vip' ? 'vip' : undefined, endpoints: cleanEndpoints(newNodeData.endpoints), model3d: cleanModelOverride(newNodeData.model3d), link: cleanLink(newNodeData.link, n) }
           : n
       ));
     } else {
@@ -2150,6 +2176,7 @@ export default function Nodex() {
         ...(newNodeData.role === 'vip' ? { role: 'vip' } : {}),
         ...(cleanEndpoints(newNodeData.endpoints) ? { endpoints: cleanEndpoints(newNodeData.endpoints) } : {}),
         ...(cleanModelOverride(newNodeData.model3d) ? { model3d: cleanModelOverride(newNodeData.model3d) } : {}),
+        ...(cleanLink(newNodeData.link) ? { link: cleanLink(newNodeData.link) } : {}),
         q: coords.q,
         r: coords.r
       };
@@ -2574,13 +2601,13 @@ export default function Nodex() {
 
     // Nodes don't move during a simulation; Shift+Click still descends
     if (simModeRef.current) {
-      if (e.shiftKey) navigateToNode(node);
+      if (e.shiftKey) openNode(node);
       return;
     }
 
-    // Shift+click to navigate into nested diagram
+    // Shift+click opens the node (nested diagram or link target)
     if (e.shiftKey) {
-      navigateToNode(node);
+      openNode(node);
       return;
     }
 
@@ -2656,7 +2683,15 @@ export default function Nodex() {
     }
   };
 
+  // Double-click opens the node — its nested diagram, or its link target
   const handleNodeDoubleClick = (e, node) => {
+    e.stopPropagation();
+    openNode(node);
+  };
+
+  // Right-click starts a connection from the node
+  const handleNodeContextMenu = (e, node) => {
+    e.preventDefault();
     e.stopPropagation();
     if (simModeRef.current) return;
     // Set initial mouse position to node position so the line doesn't jump to (0,0)
@@ -2712,7 +2747,9 @@ export default function Nodex() {
     setSelectedNode(null);
   };
 
-  const handleZoneDoubleClick = (e, zone) => {
+  // Right-click starts a connection from the zone
+  const handleZoneContextMenu = (e, zone) => {
+    e.preventDefault();
     e.stopPropagation();
     if (simModeRef.current) return;
     setConnectingFrom({ kind: 'zone', id: zone.id, label: zone.label || 'Zone' });
@@ -2879,6 +2916,17 @@ export default function Nodex() {
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'd' && !inModal && !inField) {
         e.preventDefault();
         if (selectedNodeIdsRef.current.length > 0 && !simModeRef.current) duplicateSelection();
+      }
+
+      // E edits the selected node (right-click now starts connections)
+      if (e.key.toLowerCase() === 'e' && !e.ctrlKey && !e.metaKey && !e.altKey && !inField && !inModal && !simModeRef.current) {
+        const ids = selectedNodeIdsRef.current;
+        const node = ids.length === 1 && nodesRef.current.find(n => n.id === ids[0]);
+        if (node) {
+          e.preventDefault();
+          openNodeEditor(node);
+        }
+        return;
       }
 
       if ((e.key === 'Delete' || e.key === 'Backspace') && !inModal) {
@@ -3159,7 +3207,8 @@ export default function Nodex() {
         stranded: !!focus && !statusView && flowState === 'stranded',
         traceOrigin: focus?.tracing === nk,
         live: live ? LIVE_COLORS[live.status] : null,
-        nested: !!hasNestedDiagram(n.id)
+        nested: !!hasNestedDiagram(n.id),
+        linked: isLinkPath(n.link)
       });
     });
     zones.forEach(z => {
@@ -3242,7 +3291,7 @@ export default function Nodex() {
       const node = nodes.find(n => n.id === hit.id);
       if (!node) return;
       if (e.shiftKey) {
-        navigateToNode(node);
+        openNode(node);
         return;
       }
       if (simMode) {
@@ -3280,7 +3329,7 @@ export default function Nodex() {
     }
   };
 
-  // Right-click edits, like on the 2D canvas
+  // Right-click edits (connections are drawn on the 2D canvas)
   const handle3dContext = (hit) => {
     if (!hit || simMode) return;
     if (hit.kind === 'node') {
@@ -3626,7 +3675,7 @@ export default function Nodex() {
         )}
         {liveTargets.length === 0 ? (
           <p className="text-xs text-slate-400">
-            No addresses to check yet. Right-click a node → <span className="text-slate-200">Monitoring</span> to attach its IP addresses or URLs.
+            No addresses to check yet. Edit a node (select it, press <span className="text-slate-200">E</span>) → <span className="text-slate-200">Monitoring</span> to attach its IP addresses or URLs.
           </p>
         ) : (
           <>
@@ -4310,9 +4359,9 @@ export default function Nodex() {
             <li><kbd className="px-1 bg-slate-600 rounded">Ctrl+Y</kbd> Redo</li>
             <li><kbd className="px-1 bg-slate-600 rounded">Ctrl+S</kbd> Save tab</li>
             <li><kbd className="px-1 bg-slate-600 rounded">Ctrl+Shift+S</kbd> Save project</li>
-            <li><kbd className="px-1 bg-slate-600 rounded">Shift+Click</kbd> Open nested diagram</li>
-            <li><kbd className="px-1 bg-slate-600 rounded">Double-click</kbd> Start connecting</li>
-            <li><kbd className="px-1 bg-slate-600 rounded">Right-click</kbd> Edit node</li>
+            <li><kbd className="px-1 bg-slate-600 rounded">Double-click</kbd> Open node (nested diagram or link)</li>
+            <li><kbd className="px-1 bg-slate-600 rounded">Right-click</kbd> Start connecting</li>
+            <li><kbd className="px-1 bg-slate-600 rounded">E</kbd> Edit selected node</li>
             <li><kbd className="px-1 bg-slate-600 rounded">Delete</kbd> Remove selected</li>
             <li><kbd className="px-1 bg-slate-600 rounded">Scroll</kbd> Zoom in/out</li>
             <li><kbd className="px-1 bg-slate-600 rounded">Shift+Drag</kbd> Pan canvas</li>
@@ -4343,6 +4392,14 @@ export default function Nodex() {
                   <span className="text-xs bg-blue-600 px-1.5 py-0.5 rounded">Has children</span>
                 )}
               </div>
+              {isLinkPath(selectedNode.link) && (
+                <p className="text-xs text-violet-300 mb-2 flex items-center gap-1.5" title="Double-click the node to go there">
+                  <Link size={12} className="shrink-0" />
+                  <span className="truncate">
+                    {pathResolves(diagrams, selectedNode.link) ? pathLabel(diagrams, selectedNode.link) : 'Broken link'}
+                  </span>
+                </p>
+              )}
               {selectedNode.description && (
                 <p className="text-xs text-slate-300 mb-2">{selectedNode.description}</p>
               )}
@@ -4393,10 +4450,11 @@ export default function Nodex() {
             </div>
             <div className="flex gap-2">
               <button
-                onClick={() => navigateToNode(selectedNode)}
-                className="flex-1 px-3 py-1.5 bg-blue-600 hover:bg-blue-700 rounded text-sm transition-colors"
+                onClick={() => openNode(selectedNode)}
+                className="flex-1 px-3 py-1.5 bg-blue-600 hover:bg-blue-700 rounded text-sm transition-colors flex items-center justify-center gap-1.5"
+                title={isLinkPath(selectedNode.link) ? `Go to ${pathLabel(diagrams, selectedNode.link)}` : 'Open this node\'s nested diagram'}
               >
-                Open Diagram
+                {isLinkPath(selectedNode.link) ? (<><Link size={14} /> Follow Link</>) : 'Open Diagram'}
               </button>
               <button
                 onClick={deleteSelectedNodes}
@@ -5062,7 +5120,7 @@ export default function Nodex() {
                     opacity={zoneDimmed ? 0.25 : 1}
                     style={{ transition: 'opacity 200ms' }}
                     onClick={(e) => handleZoneClick(e, zone)}
-                    onDoubleClick={(e) => handleZoneDoubleClick(e, zone)}
+                    onContextMenu={(e) => handleZoneContextMenu(e, zone)}
                     onMouseDown={(e) => handleZoneMouseDown(e, zone)}
                     onMouseEnter={() => setHoveredZone(zone.id)}
                     onMouseLeave={() => setHoveredZone(null)}
@@ -5196,23 +5254,13 @@ export default function Nodex() {
                     }
                     setHoveredCell(null);
                   };
-                  // On zone cells, wait long enough to tell a double-click
-                  // (start a connection from the zone) from a single click
-                  // (create a node here) — the overlay owns both gestures
-                  if (!connectingFrom && getZoneForCell(q, r)) {
-                    clearTimeout(pendingCellClickRef.current);
-                    pendingCellClickRef.current = setTimeout(openCreatorHere, 250);
-                  } else {
-                    openCreatorHere();
-                  }
+                  openCreatorHere();
                 }}
-                onDoubleClick={(e) => {
-                  e.stopPropagation();
+                onContextMenu={(e) => {
+                  // The overlay sits on top of zone cells — right-click
+                  // starts a connection from the zone underneath
                   const zone = getZoneForCell(hoveredCell.q, hoveredCell.r);
-                  if (zone) {
-                    clearTimeout(pendingCellClickRef.current);
-                    setConnectingFrom({ kind: 'zone', id: zone.id, label: zone.label || 'Zone' });
-                  }
+                  if (zone) handleZoneContextMenu(e, zone);
                 }}
                 onMouseDown={(e) => {
                   // This overlay sits on top of zone cells — pass a
@@ -5670,6 +5718,7 @@ export default function Nodex() {
               const isConnectingSource = connectingFrom?.id === node.id;
               const isConnectingTarget = connectingFrom && hoveredNode === node.id && connectingFrom.id !== node.id;
               const hasNested = hasNestedDiagram(node.id);
+              const isLinked = isLinkPath(node.link);
 
               // Determine stroke style
               let strokeColor = node.color;
@@ -5715,13 +5764,7 @@ export default function Nodex() {
                   onMouseDown={(e) => handleNodeMouseDown(e, node)}
                   onClick={(e) => handleNodeClick(e, node)}
                   onDoubleClick={(e) => handleNodeDoubleClick(e, node)}
-                  onContextMenu={(e) => {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    if (simMode) return;
-                    setSelectedNodeIds([node.id]);
-                    openNodeEditor(node);
-                  }}
+                  onContextMenu={(e) => handleNodeContextMenu(e, node)}
                   onMouseEnter={() => setHoveredNode(node.id)}
                   onMouseLeave={() => setHoveredNode(null)}
                   style={{ cursor: simMode ? 'pointer' : 'move', transition: 'opacity 200ms' }}
@@ -5747,8 +5790,20 @@ export default function Nodex() {
                     strokeDasharray={strokeDash}
                     opacity={isDownNode && !isFailedNode ? 0.45 : 0.9}
                   />
+                  {/* Link indicator — a linked node opens its link target */}
+                  {isLinked && (
+                    <g transform={`translate(${HEX_SIZE * 0.6}, ${-HEX_SIZE * 0.6})`} pointerEvents="none">
+                      <title>{`Links to ${pathLabel(diagrams, node.link)}`}</title>
+                      <circle r="9" fill="#8b5cf6" stroke="white" strokeWidth="2" />
+                      <foreignObject x="-6" y="-6" width="12" height="12">
+                        <div className="w-full h-full flex items-center justify-center">
+                          <Link size={10} color="white" strokeWidth={2.5} />
+                        </div>
+                      </foreignObject>
+                    </g>
+                  )}
                   {/* Nested indicator */}
-                  {hasNested && (
+                  {hasNested && !isLinked && (
                     <circle
                       cx={HEX_SIZE * 0.6}
                       cy={-HEX_SIZE * 0.6}
@@ -5985,6 +6040,48 @@ export default function Nodex() {
                   className="w-full px-3 py-2 bg-slate-700 rounded border border-slate-600 focus:border-blue-500 focus:outline-none resize-none"
                 />
               </div>
+
+              {/* Link: opening the node goes to a diagram up the tree instead
+                  of into its own nested diagram */}
+              {(() => {
+                const nodeHasChildren = !!editingNode && hasChildren(diagrams, currentPath, editingNode.id);
+                const targets = linkTargets(currentPath);
+                const link = isLinkPath(newNodeData.link) ? newNodeData.link : null;
+                const linkKey = link ? link.join('/') : '';
+                const outsideTree = link && !targets.some(t => samePath(t, link));
+                return (
+                  <div>
+                    <label className="block text-sm font-medium mb-2 flex items-center gap-1.5">
+                      <Link size={14} /> Link
+                    </label>
+                    <select
+                      value={linkKey}
+                      disabled={nodeHasChildren && !link}
+                      onChange={(e) => setNewNodeData({ ...newNodeData, link: e.target.value ? e.target.value.split('/') : undefined })}
+                      className="w-full px-3 py-2 bg-slate-700 rounded border border-slate-600 focus:border-blue-500 focus:outline-none disabled:opacity-50"
+                    >
+                      <option value="">None — opens its own nested diagram</option>
+                      {targets.map((t, i) => (
+                        <option key={t.join('/')} value={t.join('/')}>
+                          {pathLabel(diagrams, t)}{i === 0 ? ' (this diagram)' : ''}
+                        </option>
+                      ))}
+                      {outsideTree && (
+                        <option value={linkKey}>
+                          {pathResolves(diagrams, link) ? pathLabel(diagrams, link) : `Broken link (${linkKey})`}
+                        </option>
+                      )}
+                    </select>
+                    <p className="text-xs text-slate-400 mt-1">
+                      {nodeHasChildren && !link
+                        ? 'This node has children. Remove them before linking it — a linked node opens its link target, so it can’t have a nested diagram.'
+                        : link
+                          ? 'Double-clicking this node goes to the linked diagram. A linked node can’t have children.'
+                          : 'Point this node at a diagram up the tree. Double-clicking it then goes there instead of into a nested diagram.'}
+                    </p>
+                  </div>
+                );
+              })()}
 
               <div>
                 <label className="block text-sm font-medium mb-2">Icon</label>
