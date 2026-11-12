@@ -32,6 +32,8 @@ import {
 } from './monitor.js';
 import { cleanModelOverride, readModelFile, MODEL_SCALE_MIN, MODEL_SCALE_MAX } from './three/modelSpec.js';
 import { MODEL_IDS, NO_MODEL } from './three/modelIds.js';
+import ResponsivePanel, { useCompactLayout } from './components/ResponsivePanel.jsx';
+import { useCanvasTouch } from './useCanvasTouch.js';
 
 // The 3D engine (three.js) loads on first use, not with the 2D editor
 const Scene3D = React.lazy(() => import('./three/Scene3D.jsx'));
@@ -1192,6 +1194,10 @@ export default function Nodex() {
   const canvasRef = useRef(null);
   const fileInputRef = useRef(null);
   const [canvasSize, setCanvasSize] = useState({ width: 800, height: 600 });
+  const measuredCanvasRef = useRef({ width: 800, height: 600 });
+  const compactLayout = useCompactLayout();
+  const [mobilePanel, setMobilePanel] = useState(null);
+  const closeMobilePanel = () => { setMobilePanel(null); setShowRecents(false); };
 
   // Autosave + project file link
   const [autosave, setAutosave] = useState(false);
@@ -1265,24 +1271,44 @@ export default function Nodex() {
     }
   };
 
-  // Update canvas size on mount and resize
+  // Observe the actual canvas: opening panels, rotating a phone and browser
+  // chrome changes can resize it without a window resize event.
   useEffect(() => {
     const updateSize = () => {
       if (canvasRef.current) {
         const rect = canvasRef.current.getBoundingClientRect();
+        if (!rect.width || !rect.height) return;
         setCanvasSize({ width: rect.width, height: rect.height });
+        // Preserve the world point in the center as the available space changes.
+        const before = measuredCanvasRef.current;
+        setViewOffset(offset => ({
+          x: offset.x + (rect.width - before.width) / 2,
+          y: offset.y + (rect.height - before.height) / 2
+        }));
+        measuredCanvasRef.current = { width: rect.width, height: rect.height };
       }
     };
     updateSize();
-    window.addEventListener('resize', updateSize);
-    return () => window.removeEventListener('resize', updateSize);
+    const observer = new ResizeObserver(updateSize);
+    observer.observe(canvasRef.current);
+    return () => observer.disconnect();
   }, []);
 
   // Connection selection is per-diagram — clear it on tab/level changes
   const currentPathKey = currentPath.join('/');
   useEffect(() => {
     setSelectedConnectionIds([]);
+    setMobilePanel(null);
   }, [activeTabId, currentPathKey]);
+
+  useEffect(() => {
+    if (showNodeCreator || showZoneCreator || showConnectionEditor || showMonitorSettings || isCreatingZone) {
+      setMobilePanel(null);
+      setShowRecents(false);
+    }
+  }, [showNodeCreator, showZoneCreator, showConnectionEditor, showMonitorSettings, isCreatingZone]);
+
+  useEffect(() => { if (!compactLayout) setMobilePanel(null); }, [compactLayout]);
 
   // Autosave: after any change settles for a second, write every linked
   // on-device file (project file and/or per-tab files). No-op until a file
@@ -1384,7 +1410,7 @@ export default function Nodex() {
     setActiveTabId(newTab.id);
     setSelectedNode(null);
     setSelectedZone(null);
-    setViewOffset({ x: 400, y: 300 });
+    setViewOffset({ x: canvasSize.width / 2, y: canvasSize.height / 2 });
     setZoom(1);
   };
 
@@ -1562,7 +1588,7 @@ export default function Nodex() {
       setActiveTabId(newTabs[0].id);
       setSelectedNode(null);
       setSelectedZone(null);
-      setViewOffset({ x: 400, y: 300 });
+      setViewOffset({ x: canvasSize.width / 2, y: canvasSize.height / 2 });
       setZoom(1);
       if (fileHandle) {
         setProjectHandle(fileHandle);
@@ -2020,7 +2046,7 @@ export default function Nodex() {
     setCurrentPath(newPath);
     setSelectedNode(null);
     setSelectedZone(null);
-    setViewOffset({ x: 400, y: 300 });
+    setViewOffset({ x: canvasSize.width / 2, y: canvasSize.height / 2 });
   };
 
   // Open a node: follow its link if it has one, otherwise go into its own
@@ -2592,6 +2618,23 @@ export default function Nodex() {
     zoomAt(e.deltaY > 0 ? 0.9 : 1.1, e.clientX - rect.left, e.clientY - rect.top);
   };
 
+  useCanvasTouch({
+    canvasRef, view3d, zoomStateRef, setZoom, setViewOffset,
+    drawing: isCreatingZone || !!connectingFrom,
+    simMode,
+    cancel: () => {
+      setIsPanning(false);
+      setDraggingNode(null);
+      dragGroupRef.current = null;
+      zoneDragRef.current = null;
+      setIsDraggingZone(false);
+      setMarquee(null);
+      setResizingZone(null);
+      setZoneSelectionStart(null);
+      setSelectedZoneCells([]);
+    }
+  });
+
   const handleNodeMouseDown = (e, node) => {
     if (e.button !== 0) return;
     e.stopPropagation();
@@ -2865,6 +2908,11 @@ export default function Nodex() {
 
   useEffect(() => {
     const handleKeyDown = (e) => {
+      if (mobilePanel) {
+        // Native dialogs contain focus; editor shortcuts must not act behind them.
+        if (e.key === 'Escape') closeMobilePanel();
+        return;
+      }
       // Save (Ctrl+S = active tab, Ctrl+Shift+S = whole project)
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
         e.preventDefault();
@@ -2968,7 +3016,7 @@ export default function Nodex() {
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [showNodeCreator, showZoneCreator, showConnectionEditor, isCreatingZone, clipboard]);
+  }, [showNodeCreator, showZoneCreator, showConnectionEditor, isCreatingZone, clipboard, mobilePanel]);
 
   const gridHexagons = [];
   for (let q = gridBounds.minQ; q <= gridBounds.maxQ; q++) {
@@ -3832,9 +3880,26 @@ export default function Nodex() {
 
 
   return (
-    <div className="flex flex-col h-screen bg-slate-900 text-white">
+    <div className="nx-editor flex flex-col h-screen bg-slate-900 text-white">
+      {compactLayout && (
+        <header className="nx-mobile-header">
+          <button onClick={() => setMobilePanel('tools')} aria-controls="editor-tools" aria-expanded={mobilePanel === 'tools'}>
+            <Layers size={20} /><span>Tools</span>
+          </button>
+          <span className="font-semibold tracking-tight">Nodex</span>
+          <div className="flex items-center gap-1">
+            <button onClick={() => openNodeCreator()} disabled={simMode} aria-label="Add node" className="text-blue-300 disabled:opacity-40">
+              <Plus size={20} /><span>Node</span>
+            </button>
+            <button onClick={() => setMobilePanel('actions')} aria-controls="editor-actions" aria-expanded={mobilePanel === 'actions'}>
+              <Settings size={20} /><span>Actions</span>
+            </button>
+          </div>
+        </header>
+      )}
       {/* Toolbar */}
-      <div className="h-12 bg-slate-800 border-b border-slate-700 flex items-center px-2 gap-1 shrink-0">
+      <ResponsivePanel id="editor-actions" title="Editor actions" compact={compactLayout} open={mobilePanel === 'actions'} onClose={closeMobilePanel}
+        className="nx-toolbar h-12 bg-slate-800 border-b border-slate-700 flex items-center px-2 gap-1 shrink-0">
         {/* File operations */}
         <div className="flex items-center gap-1 pr-2 border-r border-slate-600">
           <button
@@ -3851,7 +3916,7 @@ export default function Nodex() {
           >
             <FolderOpen size={18} />
           </button>
-          <div className="relative">
+          <div className={compactLayout && showRecents ? 'relative w-full' : 'relative'}>
             <button
               onClick={() => setShowRecents(s => !s)}
               className={`p-2 rounded transition-colors ${showRecents ? 'bg-slate-700' : 'hover:bg-slate-700'}`}
@@ -3861,8 +3926,8 @@ export default function Nodex() {
             </button>
             {showRecents && (
               <>
-                <div className="fixed inset-0 z-40" onClick={() => setShowRecents(false)} />
-                <div className="absolute left-0 top-full mt-1 w-72 bg-slate-800 border border-slate-600 rounded-lg shadow-2xl z-50 py-1">
+                {!compactLayout && <div className="fixed inset-0 z-40" onClick={() => setShowRecents(false)} />}
+                <div className={`${compactLayout ? 'mt-1 w-full' : 'absolute left-0 top-full mt-1 w-72'} bg-slate-800 border border-slate-600 rounded-lg shadow-2xl z-50 py-1`}>
                   {recentFiles.length === 0 ? (
                     <p className="px-3 py-2 text-xs text-slate-400">
                       No recent files yet — files you open or save on this device will show up here.
@@ -4142,7 +4207,7 @@ export default function Nodex() {
         )}
 
         {/* Status info on right */}
-        <div className="ml-auto flex items-center gap-4 text-xs text-slate-400">
+        <div className="nx-toolbar-status ml-auto flex items-center gap-4 text-xs text-slate-400">
           <span>Nodes: {nodes.length}</span>
           <span>Connections: {connections.length}</span>
           <span>Zones: {zones.length}</span>
@@ -4160,15 +4225,29 @@ export default function Nodex() {
             </span>
           )}
         </div>
-      </div>
+      </ResponsivePanel>
+
+      {compactLayout && currentPath.length > 1 && (
+        <nav className="nx-mobile-breadcrumb" aria-label="Diagram path">
+          {breadcrumbs.map((crumb, index) => (
+            <React.Fragment key={crumb.index}>
+              {index > 0 && <ChevronRight size={14} className="shrink-0 text-slate-500" />}
+              <button onClick={() => navigateUp(crumb.index)} aria-current={index === breadcrumbs.length - 1 ? 'location' : undefined}>
+                {index === 0 ? <Home size={16} /> : crumb.label}
+                {index === 0 && <span className="sr-only">Root</span>}
+              </button>
+            </React.Fragment>
+          ))}
+        </nav>
+      )}
 
       {/* Tabs bar */}
-      <div className="h-9 bg-slate-850 border-b border-slate-700 flex items-center px-1 gap-1 shrink-0 overflow-x-auto scrollbar-thin"
+      <div className="nx-tabs h-9 bg-slate-850 border-b border-slate-700 flex items-center px-1 gap-1 shrink-0 overflow-x-auto scrollbar-thin"
            style={{ backgroundColor: '#1a2332' }}>
         {tabs.map(tab => (
           <div
             key={tab.id}
-            className={`flex items-center gap-1 px-3 py-1.5 rounded-t text-sm cursor-pointer group ${
+            className={`nx-tab shrink-0 flex items-center gap-1 px-3 py-1.5 rounded-t text-sm cursor-pointer group ${
               tab.id === activeTabId
                 ? 'bg-slate-800 text-white'
                 : 'bg-slate-900 text-slate-400 hover:bg-slate-800 hover:text-slate-200'
@@ -4191,12 +4270,23 @@ export default function Nodex() {
               {tab.fileHandle && <span className="text-emerald-400 mr-1">●</span>}
               {tab.name}
             </span>
+            {compactLayout && tab.id === activeTabId && (
+              <button
+                aria-label={`Options for ${tab.name}`}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  const rect = event.currentTarget.getBoundingClientRect();
+                  setTabMenu({ x: rect.left, y: rect.bottom, tabId: tab.id });
+                }}
+              ><Settings size={15} /></button>
+            )}
             <button
               onClick={(e) => {
                 e.stopPropagation();
                 closeTab(tab.id);
               }}
               className="ml-1 p-0.5 rounded hover:bg-slate-600 opacity-0 group-hover:opacity-100 transition-opacity"
+              aria-label={`Close ${tab.name}`}
             >
               <X size={14} />
             </button>
@@ -4224,7 +4314,7 @@ export default function Nodex() {
             />
             <div
               className="fixed z-50 w-48 bg-slate-800 border border-slate-600 rounded-lg shadow-2xl py-1"
-              style={{ left: tabMenu.x, top: tabMenu.y }}
+              style={{ left: Math.max(8, Math.min(tabMenu.x, window.innerWidth - 200)), top: Math.max(8, Math.min(tabMenu.y, window.innerHeight - 112)) }}
             >
               <button
                 onClick={() => {
@@ -4253,11 +4343,12 @@ export default function Nodex() {
         );
       })()}
 
-      <div className="flex flex-1 overflow-hidden">
+      <div className="flex flex-1 min-h-0 overflow-hidden">
       {/* Sidebar */}
-      <div className="w-80 bg-slate-800 p-4 border-r border-slate-700 overflow-y-auto scrollbar-thin">
+      <ResponsivePanel id="editor-tools" title="Diagram tools" compact={compactLayout} open={mobilePanel === 'tools'} onClose={closeMobilePanel}
+        className="w-80 shrink-0 bg-slate-800 p-4 border-r border-slate-700 overflow-y-auto scrollbar-thin">
         {simMode ? renderSimPanel() : (<>
-        <h2 className="text-xl font-bold mb-4">Nodex</h2>
+        {!compactLayout && <h2 className="text-xl font-bold mb-4">Nodex</h2>}
         {liveEnabled && renderLivePanel()}
         
         <button
@@ -4345,10 +4436,18 @@ export default function Nodex() {
               size={14}
               className={`transition-transform ${showShortcuts ? 'rotate-90' : ''}`}
             />
-            Shortcuts
+            {compactLayout ? 'Touch controls' : 'Shortcuts'}
           </button>
           {showShortcuts && (
           <ul className="text-xs space-y-1 text-slate-300 mt-3">
+            {compactLayout ? (<>
+              <li>Drag empty canvas to pan; pinch with two fingers to zoom.</li>
+              <li>Tap a node to select it, or drag it to move it.</li>
+              <li>Use Edit, Open and Connect below a selected node.</li>
+              <li>Double-tap a node to open its diagram or follow its link.</li>
+              <li>Choose a zone shape, then drag on the canvas to size it.</li>
+              <li>In 3D, drag to orbit and use two fingers to pan and zoom.</li>
+            </>) : (<>
             <li><kbd className="px-1 bg-slate-600 rounded">Drag canvas</kbd> Box-select nodes</li>
             <li><kbd className="px-1 bg-slate-600 rounded">Ctrl+Click</kbd> Add/remove from selection</li>
             <li><kbd className="px-1 bg-slate-600 rounded">Ctrl+A</kbd> Select all nodes</li>
@@ -4366,6 +4465,7 @@ export default function Nodex() {
             <li><kbd className="px-1 bg-slate-600 rounded">Scroll</kbd> Zoom in/out</li>
             <li><kbd className="px-1 bg-slate-600 rounded">Shift+Drag</kbd> Pan canvas</li>
             <li><kbd className="px-1 bg-slate-600 rounded">Esc</kbd> Cancel action</li>
+            </>)}
           </ul>
           )}
         </div>
@@ -4785,12 +4885,12 @@ export default function Nodex() {
           </button>
         )}
         </>)}
-      </div>
+      </ResponsivePanel>
 
       {/* Canvas */}
       <div
         ref={canvasRef}
-        className="flex-1 relative overflow-hidden select-none"
+        className="nx-canvas-container flex-1 min-w-0 relative overflow-hidden select-none"
         onMouseDown={view3d ? undefined : handleCanvasMouseDown}
         onMouseMove={view3d ? undefined : handleCanvasMouseMove}
         onMouseLeave={view3d ? undefined : handleCanvasMouseLeave}
@@ -4800,6 +4900,35 @@ export default function Nodex() {
           cursor: view3d ? 'default' : isPanning || isDraggingZone ? 'grabbing' : simMode ? 'grab' : isCreatingZone ? 'crosshair' : connectingFrom ? 'crosshair' : resizingZone ? 'nwse-resize' : 'default'
         }}
       >
+        {compactLayout && (
+          <div className="nx-canvas-controls" onMouseDown={event => event.stopPropagation()}>
+            {connectingFrom || isCreatingZone ? (
+              <div className="nx-touch-selection">
+                <span className="text-xs text-amber-200">{connectingFrom ? `Connect ${connectingFrom.label}: tap a target` : 'Drag to size the zone'}</span>
+                <button onClick={() => { setConnectingFrom(null); cancelZoneCreation(); }} aria-label="Cancel action"><X size={20} /></button>
+              </div>
+            ) : !simMode && selectedNode ? (
+              <div className="nx-touch-selection">
+                <span className="text-xs text-slate-300 truncate min-w-0 flex-1">{selectedNode.label}</span>
+                <button onClick={() => openNodeEditor(selectedNode)}><Edit2 size={16} />Edit</button>
+                <button onClick={() => openNode(selectedNode)}><FolderOpen size={16} />Open</button>
+                {!view3d && <button onClick={event => handleNodeContextMenu(event, selectedNode)}><Link size={16} />Connect</button>}
+              </div>
+            ) : !simMode && selectedZone ? (
+              <div className="nx-touch-selection">
+                <span className="text-xs text-slate-300 truncate min-w-0 flex-1">{selectedZone.label || 'Zone'}</span>
+                <button onClick={() => openZoneEditor(selectedZone)}><Edit2 size={16} />Edit</button>
+                {!view3d && <button onClick={event => handleZoneContextMenu(event, selectedZone)}><Link size={16} />Connect</button>}
+              </div>
+            ) : null}
+            <div className="nx-touch-navigation">
+              <span className="text-[11px] text-slate-400 flex-1">{view3d ? 'Drag to orbit · pinch to zoom' : 'Drag to pan · pinch to zoom'}</span>
+              <button onClick={view3d ? () => scene3dRef.current?.topView() : zoomOut} aria-label={view3d ? 'Top view' : 'Zoom out'}>{view3d ? <Eye size={20} /> : <ZoomOut size={20} />}</button>
+              <button onClick={view3d ? () => scene3dRef.current?.fit() : resetView} aria-label={view3d ? 'Fit diagram' : 'Reset view'}><Maximize size={20} /></button>
+              {!view3d && <button onClick={zoomIn} aria-label="Zoom in"><ZoomIn size={20} /></button>}
+            </div>
+          </div>
+        )}
         {/* File drop overlay — pointer-events-none so it never steals the
             drag events that keep it visible */}
         {isDraggingFile && (
@@ -4814,7 +4943,7 @@ export default function Nodex() {
             preview one on its own */}
         {channels.length > 0 && !isCreatingZone && (
           <div
-            className="absolute top-3 left-1/2 -translate-x-1/2 z-20 flex items-center gap-1 px-2 py-1 rounded-full bg-slate-800/90 backdrop-blur border border-slate-600 shadow-xl max-w-[calc(100%-2rem)] overflow-x-auto scrollbar-thin"
+            className="nx-trace-bar absolute top-3 left-1/2 -translate-x-1/2 z-20 flex items-center gap-1 px-2 py-1 rounded-full bg-slate-800/90 backdrop-blur border border-slate-600 shadow-xl max-w-[calc(100%-2rem)] overflow-x-auto scrollbar-thin"
             onMouseDown={(e) => e.stopPropagation()}
             onMouseLeave={() => setHoverChannelId(null)}
           >
@@ -4864,7 +4993,7 @@ export default function Nodex() {
         {/* Simulation strip */}
         {simMode && (
           <div
-            className="absolute bottom-4 left-1/2 -translate-x-1/2 z-20 flex items-center gap-3 pl-3 pr-1.5 py-1.5 rounded-full bg-slate-800/95 backdrop-blur border border-red-500/60 shadow-xl text-xs whitespace-nowrap"
+            className="nx-simulation-strip absolute bottom-4 left-1/2 -translate-x-1/2 z-20 flex items-center gap-3 pl-3 pr-1.5 py-1.5 rounded-full bg-slate-800/95 backdrop-blur border border-red-500/60 shadow-xl text-xs whitespace-nowrap"
             onMouseDown={(e) => e.stopPropagation()}
           >
             <span className="flex items-center gap-1.5 text-red-300 font-semibold">
@@ -4900,7 +5029,7 @@ export default function Nodex() {
         )}
 
         {/* Legend */}
-        {(statusView || focus || liveEnabled) && (
+        {!compactLayout && (statusView || focus || liveEnabled) && (
           <div className="absolute bottom-4 left-4 z-10 px-3 py-2 rounded-lg bg-slate-800/90 backdrop-blur border border-slate-700 text-[11px] text-slate-300 space-y-1 pointer-events-none">
             {liveEnabled && (
               <div className="flex items-center gap-2 pb-0.5">
@@ -5001,7 +5130,7 @@ export default function Nodex() {
           const top = Math.min(mousePos.y * zoom + viewOffset.y + 16, canvasSize.height - height);
           return (
             <div
-              className="absolute z-30 w-80 px-3 py-2 rounded-lg bg-slate-900/95 border border-slate-600 shadow-2xl text-xs pointer-events-none"
+              className="nx-hover-tooltip absolute z-30 w-80 px-3 py-2 rounded-lg bg-slate-900/95 border border-slate-600 shadow-2xl text-xs pointer-events-none"
               style={{ left, top }}
             >
               <div className="flex items-center gap-2 mb-1">
@@ -6001,8 +6130,8 @@ export default function Nodex() {
 
     {/* Node Creator Modal */}
       {showNodeCreator && (
-        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
-          <div className="bg-slate-800 rounded-lg p-6 w-full max-w-2xl max-h-[90vh] overflow-y-auto scrollbar-thin">
+        <div className="nx-modal-backdrop fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+          <div className="nx-dialog bg-slate-800 rounded-lg p-6 w-full max-w-2xl max-h-[90vh] overflow-y-auto scrollbar-thin">
             <div className="flex items-center justify-between mb-4">
               <h2 className="text-xl font-bold">
                 {editingNode ? 'Edit Node' : 'Create New Node'}
@@ -6435,8 +6564,8 @@ export default function Nodex() {
 
       {/* Zone Creator Modal */}
       {showZoneCreator && (
-        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
-          <div className="bg-slate-800 rounded-lg p-6 w-full max-w-md max-h-[90vh] overflow-y-auto scrollbar-thin">
+        <div className="nx-modal-backdrop fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+          <div className="nx-dialog bg-slate-800 rounded-lg p-6 w-full max-w-md max-h-[90vh] overflow-y-auto scrollbar-thin">
             <div className="flex items-center justify-between mb-4">
               <h2 className="text-xl font-bold">
                 {editingZone ? 'Edit Zone' : 'Create Zone'}
@@ -6619,8 +6748,8 @@ export default function Nodex() {
         const st = monitorSettings;
         const set = (patch) => setMonitorSettings({ ...st, ...patch });
         return (
-          <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50" onMouseDown={() => setShowMonitorSettings(false)}>
-            <div className="bg-slate-800 rounded-lg p-6 w-full max-w-lg max-h-[90vh] overflow-y-auto scrollbar-thin" onMouseDown={(e) => e.stopPropagation()}>
+          <div className="nx-modal-backdrop fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50" onMouseDown={() => setShowMonitorSettings(false)}>
+            <div className="nx-dialog bg-slate-800 rounded-lg p-6 w-full max-w-lg max-h-[90vh] overflow-y-auto scrollbar-thin" onMouseDown={(e) => e.stopPropagation()}>
               <div className="flex items-center justify-between mb-1">
                 <h2 className="text-xl font-bold flex items-center gap-2">
                   <Activity size={20} className="text-emerald-400" />
@@ -6771,7 +6900,7 @@ export default function Nodex() {
 
       {/* Connection Editor Drawer — edits apply live (undo covers mistakes) */}
       {showConnectionEditor && editingConnection && (
-        <div className="fixed right-0 top-0 bottom-0 w-96 bg-slate-800 border-l border-slate-700 z-50 p-6 overflow-y-auto scrollbar-thin shadow-2xl">
+        <div className="nx-connection-drawer nx-dialog fixed right-0 top-0 bottom-0 w-96 bg-slate-800 border-l border-slate-700 z-50 p-6 overflow-y-auto scrollbar-thin shadow-2xl">
           <div className="flex items-center justify-between mb-4">
             <h2 className="text-xl font-bold">Edit Connection</h2>
             <div className="flex items-center gap-1">
