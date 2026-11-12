@@ -67,6 +67,16 @@ The agent probes whatever it's asked to, so lock it down when anyone else can re
 
 Ping uses the system `ping` binary (no shell; the Docker image runs it as an unprivileged user). Where no `ping` is available, ping checks show as *can't check* — use a TCP or HTTP check instead.
 
+### 3D view
+- Switch **2D / 3D** in the toolbar to see the current diagram level as a 3D scene: every node stands on a raised hexagon with a **3D model of its icon**, zones become translucent floors with low walls, and connections (with their channel strands, arrowheads and labels) run between them
+- **Every icon has a matching 3D model** (all 86, built procedurally — nothing to download), tinted with the node's color
+- **Per-node override** (right-click → *3D model*, with a live turntable preview):
+  - *Match icon* (default) · any other *Built-in* model (thumbnail gallery) · a *Custom file* — a glTF 2.0 `.glb` / self-contained `.gltf`, embedded in the diagram, or a URL · *None* (just the hexagon)
+  - **Scale** (0.25–4×) and **rotation** apply to whichever model is shown; custom models are fitted to the cell automatically, and while one loads (or if it fails) the icon's model stands in
+- Everything else carries over: selection, isolation fading and animated traffic packets, simulation and live status (failed models grey out with a pulsing red ring), nested diagrams
+- Controls: drag to orbit, right / Shift-drag to pan, scroll to zoom at the cursor; click to select (or fail/restore while simulating), right-click to edit, Shift+Click to open a nested diagram, double-click to focus a node. *Top* looks straight down, ⛶ fits the view, and *PNG* exports the 3D view
+- Drawing zones and links happens on the grid, so starting either switches back to 2D. three.js loads only when the 3D view or the model editor is first opened
+
 ### Availability semantics
 The simulation understands redundancy through a few optional properties:
 
@@ -114,7 +124,7 @@ Plain JSON, two flavors, auto-detected on open:
 
 `diagrams` is a flat map keyed by nesting path (`"root"`, `"root/<nodeId>"`, …), each entry holding `nodes`, `connections`, `zones`, and `channels`.
 
-Availability settings are optional fields, so older files load unchanged: `zone.policy = { mode, min, primaryId }`, `connection.kind = "peer"` with `connection.peerMode` (`failover` / `quorum` / `both` / `replica`), `connection.required`, and `node.role = "vip"`. Monitored addresses are `node.endpoints = [{ id, address, check, port?, path?, insecure? }]`; monitoring settings (agent URL, token, interval) stay in the browser, not in the file.
+Availability settings are optional fields, so older files load unchanged: `zone.policy = { mode, min, primaryId }`, `connection.kind = "peer"` with `connection.peerMode` (`failover` / `quorum` / `both` / `replica`), `connection.required`, and `node.role = "vip"`. 3D overrides are `node.model3d = { builtin? | url?, name?, scale?, rotation? }` (`builtin: "none"` hides the model; omitted entirely when the node uses its icon's model at normal size). Monitored addresses are `node.endpoints = [{ id, address, check, port?, path?, insecure? }]`; monitoring settings (agent URL, token, interval) stay in the browser, not in the file.
 
 ## Keyboard shortcuts
 
@@ -147,7 +157,7 @@ npm run monitor    # live-monitoring agent on localhost:7070
 npm test           # analysis, monitoring, and agent tests (node's built-in runner)
 ```
 
-Stack: React 18, Vite 5, Tailwind CSS 3, [lucide-react](https://lucide.dev) icons. The UI lives in `src/Nodex.jsx`; the availability / flow analysis behind isolation and simulation is a pure module in `src/analysis.js`, live-monitoring logic is in `src/monitor.js`, and the probe agent is `monitor/server.js` (each with a `.test.js` next to it).
+Stack: React 18, Vite 5, Tailwind CSS 3, [lucide-react](https://lucide.dev) icons, [three.js](https://threejs.org) for the 3D view. The UI lives in `src/Nodex.jsx`; the availability / flow analysis behind isolation and simulation is a pure module in `src/analysis.js`, live-monitoring logic is in `src/monitor.js`, the probe agent is `monitor/server.js`, and the 3D view lives in `src/three/` — `models.js` (one procedural model per icon), `modelSpec.js` (per-node overrides), `DiagramScene.js` (the renderer) (each with a `.test.js` next to it where it has logic).
 
 ## Deployment
 
