@@ -114,6 +114,53 @@ Try it with [`examples/ha-web-stack.json`](examples/ha-web-stack.json): edge LBs
 - Unsaved changes trigger a leave-page warning
 - **Export** the full diagram (not just the viewport) as standalone **SVG** or 2× **PNG**
 
+## MCP toolkit and Nodex server (optional)
+
+Nodex ships an [MCP](https://modelcontextprotocol.io) server, so AI assistants (Claude Code, Claude Desktop, any MCP client) can read, build and analyse diagrams. It works in two ways, and neither changes how Nodex behaves for anyone who doesn't use it.
+
+**Local files (stdio).** Point it at a folder of diagram `.json` files (the same files the editor opens and saves):
+
+```bash
+claude mcp add nodex -- node /path/to/nodex/server/stdio.js --dir ~/diagrams
+```
+
+**Nodex server (opt-in backend).** Keep diagrams on a small server so the editor and MCP clients work on the same documents, with changes showing up live in every open editor:
+
+```bash
+NODEX_SERVER_TOKEN=$(openssl rand -hex 32) npm run server     # http://localhost:7071, diagrams in ./data
+claude mcp add --transport http nodex http://localhost:7071/mcp --header "Authorization: Bearer <token>"
+```
+
+Then, in the editor, click the cloud button in the toolbar, tick *Use a Nodex server*, and enter the URL and token. From there you can open documents from the server or save the current tab to it. A linked tab (blue dot) saves back to the server (Ctrl+S or Autosave), and edits made elsewhere, such as by an MCP client, are applied as they happen (and can be undone). If both sides changed, the tab dot turns amber, and the next save asks which version to keep. A stdio client can also edit server documents: `node server/stdio.js --server http://localhost:7071 --token <token>`.
+
+**Tools**
+
+| Tool | What it does |
+|---|---|
+| `list_documents`, `create_document`, `rename_document` | Find and create diagrams |
+| `get_document` | Outline every diagram level (top level and nested node diagrams) |
+| `get_diagram` | Read one level: nodes with grid positions, connections, zones with members, channels |
+| `add_nodes`, `update_nodes`, `remove_nodes` | Nodes with icons, colours, monitored endpoints, links; placed at a `{ col, row }`, next to another node, or automatically |
+| `connect`, `update_connections`, `remove_connections` | Traffic links, dependencies and peer links (failover / quorum), with channels, line styles and pointers |
+| `upsert_zone`, `remove_zones` | Rectangle, hexagon or circle zones, sized explicitly or fitted around nodes, with availability policies |
+| `upsert_channel`, `remove_channels` | Named traffic flows |
+| `analyze` | The editor's outage simulation: per-flow status and hops, what's degraded and why, single points of failure, with optional simulated failures |
+
+Nodes, zones and channels can be named by id or label, and nested levels by node label (`path: "josh-docker"`). Each call that edits a diagram is saved as one revision, against the revision it read, so concurrent edits are retried or refused instead of lost.
+
+**Server settings**
+
+| Variable | Default | |
+|---|---|---|
+| `HOST` / `PORT` | `127.0.0.1` / `7071` | Listen address |
+| `NODEX_SERVER_TOKEN` | - | Bearer token for every request (the editor API, the event stream and `/mcp`). Required beyond localhost. |
+| `NODEX_SERVER_INSECURE` | - | `1` allows no token beyond localhost (only behind something that already authenticates) |
+| `NODEX_DATA` | `./data` | Folder of diagram files. Existing `.json` diagrams in it show up as documents. |
+| `NODEX_SERVER_ORIGIN` | `*` | CORS origin allowed to call the server |
+| `NODEX_SERVER_MAX_BODY` | 16 MB | Request size limit (diagrams can embed custom 3D models) |
+
+API: `GET/POST /api/documents`, `GET/PUT/DELETE /api/documents/:id` (with `ETag` / `If-Match` revisions; a stale write gets `409`), `GET /api/events` (Server-Sent Events), `POST /mcp` (MCP Streamable HTTP), `GET /health`. Project files (several tabs in one file) aren't served; save each tab as its own diagram.
+
 ## Phones and tablets
 
 - The canvas fills the screen. **Tools** opens diagram settings, zones, channels, and the selected component; **Actions** opens file, export, view, undo, and monitoring controls.
@@ -164,10 +211,12 @@ npm install
 npm run dev        # Vite dev server (port 3030)
 npm run build      # production build to dist/
 npm run monitor    # live-monitoring agent on localhost:7070
-npm test           # analysis, monitoring, and agent tests (node's built-in runner)
+npm run server     # optional Nodex server + MCP endpoint on localhost:7071
+npm run mcp        # MCP server over stdio (--dir <folder> or --server <url>)
+npm test           # analysis, monitoring, agent, MCP toolkit and server tests (node's built-in runner)
 ```
 
-Stack: React 18, Vite 5, Tailwind CSS 3, [lucide-react](https://lucide.dev) icons, [three.js](https://threejs.org) for the 3D view. The UI lives in `src/Nodex.jsx`; the availability / flow analysis behind isolation and simulation is a pure module in `src/analysis.js`, live-monitoring logic is in `src/monitor.js`, the probe agent is `monitor/server.js`, and the 3D view lives in `src/three/` — `models.js` (one procedural model per icon), `modelSpec.js` (per-node overrides), `DiagramScene.js` (the renderer) (each with a `.test.js` next to it where it has logic).
+Stack: React 18, Vite 5, Tailwind CSS 3, [lucide-react](https://lucide.dev) icons, [three.js](https://threejs.org) for the 3D view. The UI lives in `src/Nodex.jsx`; the availability / flow analysis behind isolation and simulation is a pure module in `src/analysis.js`, live-monitoring logic is in `src/monitor.js`, the probe agent is `monitor/server.js`, and the 3D view lives in `src/three/` — `models.js` (one procedural model per icon), `modelSpec.js` (per-node overrides), `DiagramScene.js` (the renderer) (each with a `.test.js` next to it where it has logic). The MCP toolkit and optional server live in `server/`: `core/document.js` (editing operations on the diagram format), `core/analyze.js` (the simulation, in labels), `tools.js` (the MCP tools), `store.js` (diagram files with revisions), `server.js` (HTTP backend) and `stdio.js`; the editor's side is `src/serverSync.js`.
 
 ## Deployment
 
@@ -187,6 +236,14 @@ docker-compose up -d
 ```
 
 This starts Nodex on port 8080 and the monitor agent on `127.0.0.1:7070`. Set `NODEX_MONITOR_ALLOW` / `NODEX_MONITOR_TOKEN` in the environment (or a `.env` file) to restrict it.
+
+To also run the optional Nodex server (diagrams in the `nodex-data` volume):
+
+```bash
+NODEX_SERVER_TOKEN=$(openssl rand -hex 32) docker compose --profile server up -d
+```
+
+The editor reaches it same-origin at `/server` (build with `--build-arg VITE_NODEX_SERVER_URL=/server` to make that the default URL), and MCP clients at `<nodex url>/server/mcp` with the same token.
 
 ## Browser support
 

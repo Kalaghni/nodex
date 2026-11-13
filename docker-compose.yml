@@ -24,3 +24,26 @@ services:
       # Unprivileged ping (Docker's default, made explicit)
       - net.ipv4.ping_group_range=0 2147483647
     restart: unless-stopped
+
+  # Optional Nodex server: stores diagrams so the editor and MCP clients
+  # (Claude Code, Claude Desktop, ...) work on the same documents, live.
+  # Off unless asked for:
+  #   NODEX_SERVER_TOKEN=$(openssl rand -hex 32) docker compose --profile server up -d
+  # The editor reaches it same-origin at /server (see nginx.conf), and MCP
+  # clients at <nodex url>/server/mcp with the same bearer token.
+  server:
+    profiles: ["server"]
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    ports:
+      - "127.0.0.1:7071:7071"
+    environment:
+      # Required - the server refuses to start without one
+      - NODEX_SERVER_TOKEN=${NODEX_SERVER_TOKEN:-}
+    volumes:
+      - nodex-data:/data
+    restart: unless-stopped
+
+volumes:
+  nodex-data:

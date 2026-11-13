@@ -7,3 +7,4 @@ README.md
 .env.*
 *.log
 .DS_Store
+data

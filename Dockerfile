@@ -15,6 +15,10 @@ COPY . .
 # Hosted builds point the monitor at a same-origin path, e.g. /monitor
 ARG VITE_MONITOR_URL=
 ENV VITE_MONITOR_URL=$VITE_MONITOR_URL
+# ...and the optional Nodex server at e.g. /server (the editor still only
+# talks to it once someone turns it on under Server)
+ARG VITE_NODEX_SERVER_URL=
+ENV VITE_NODEX_SERVER_URL=$VITE_NODEX_SERVER_URL
 
 # Build the application
 RUN npm run build
