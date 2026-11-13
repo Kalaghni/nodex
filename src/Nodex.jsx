@@ -34,6 +34,17 @@ import { cleanModelOverride, readModelFile, MODEL_SCALE_MIN, MODEL_SCALE_MAX } f
 import { MODEL_IDS, NO_MODEL } from './three/modelIds.js';
 import ResponsivePanel, { useCompactLayout } from './components/ResponsivePanel.jsx';
 import { useCanvasTouch } from './useCanvasTouch.js';
+import {
+  loadServerSettings,
+  saveServerSettings,
+  serverHealth,
+  listServerDocs,
+  fetchServerDoc,
+  saveServerDoc,
+  createServerDoc,
+  subscribeServerEvents,
+  maxIdIn
+} from './serverSync.js';
 
 // The 3D engine (three.js) loads on first use, not with the 2D editor
 const Scene3D = React.lazy(() => import('./three/Scene3D.jsx'));
@@ -47,6 +58,9 @@ const HEX_SIZE = 40;
 // created within the same millisecond (e.g. paste twice, import + new tab)
 let __nextId = Date.now();
 const genId = () => __nextId++;
+// Documents edited elsewhere (the Nodex server, MCP clients) may already use
+// ids above the counter - keep new ids clear of them
+const bumpIdsPast = (maxId) => { if (maxId >= __nextId) __nextId = maxId + 1; };
 
 // ---- Recent files ----
 // Stored in IndexedDB, not localStorage: FileSystemFileHandle objects are
@@ -1201,6 +1215,18 @@ export default function Nodex() {
   const [mobilePanel, setMobilePanel] = useState(null);
   const closeMobilePanel = () => { setMobilePanel(null); setShowRecents(false); };
 
+  // Nodex server link (opt-in - see serverSync.js)
+  const [serverSettings, setServerSettings] = useState(loadServerSettings);
+  const serverSettingsRef = useRef(serverSettings);
+  serverSettingsRef.current = serverSettings;
+  useEffect(() => { saveServerSettings(serverSettings); }, [serverSettings]);
+  const [showServerDialog, setShowServerDialog] = useState(false);
+  const showServerDialogRef = useRef(false);
+  showServerDialogRef.current = showServerDialog;
+  const [serverHealthState, setServerHealthState] = useState(null);
+  const [serverDocs, setServerDocs] = useState(null);
+  const [serverLive, setServerLive] = useState('off'); // off | connecting | live | error
+
   // Autosave + project file link
   const [autosave, setAutosave] = useState(false);
   const [projectHandle, setProjectHandle] = useState(null);
@@ -1336,6 +1362,13 @@ export default function Nodex() {
             wrote = true;
           }
         }
+        // Server-linked tabs: only when they have unsaved changes and no
+        // unresolved conflict (that needs a decision - see the tab marker)
+        for (const t of tabsRef.current) {
+          if (t.server && !t.server.conflict && tabHasServerChanges(t)) {
+            if (await saveTabToServer(t.id) === 'saved') wrote = true;
+          }
+        }
         if (wrote) dirtyRef.current = false;
       } catch (err) {
         console.warn('Autosave failed:', err);
@@ -1407,8 +1440,9 @@ export default function Nodex() {
   const gridBounds = getGridBounds();
 
   // Tab management
-  const addTab = (name = 'Untitled', diagrams = null, fileHandle = null, uid = null) => {
-    const newTab = createTab(name, diagrams, fileHandle, uid);
+  // `extra` adds fields to the new tab (e.g. its link to a server document)
+  const addTab = (name = 'Untitled', diagrams = null, fileHandle = null, uid = null, extra = null) => {
+    const newTab = { ...createTab(name, diagrams, fileHandle, uid), ...extra };
     setTabs(prevTabs => [...prevTabs, newTab]);
     setActiveTabId(newTab.id);
     setSelectedNode(null);
@@ -1479,6 +1513,10 @@ export default function Nodex() {
   const saveTabToFile = async (tabId) => {
     const tab = tabsRef.current.find(t => t.id === tabId);
     if (!tab) return;
+    if (tab.server) {
+      await saveServerTab(tabId);
+      return;
+    }
     const data = getTabSaveData(tab);
 
     if (tab.fileHandle) {
@@ -1515,6 +1553,210 @@ export default function Nodex() {
   };
 
   const saveToFile = () => saveTabToFile(activeTabIdRef.current);
+
+  // ---- Nodex server (optional) ----
+  // A tab linked to a server document carries `server: { id, revision,
+  // synced, syncedName, conflict }`. Saving writes back against `revision`;
+  // changes made elsewhere arrive as live events and are applied when the
+  // tab has no unsaved edits of its own - otherwise it's flagged as a
+  // conflict and the next save asks which version wins.
+  const tabHasServerChanges = (t) =>
+    !!t.server && (t.diagrams !== t.server.synced || t.name !== t.server.syncedName);
+
+  const markServerSynced = (tabId, revision, diagramsSaved, nameSaved) => {
+    setTabs(prev => prev.map(t => (t.id === tabId && t.server
+      ? { ...t, server: { ...t.server, revision, synced: diagramsSaved, syncedName: nameSaved, conflict: null } }
+      : t)));
+  };
+
+  const markServerConflict = (tabId, revision) => {
+    setTabs(prev => prev.map(t => (t.id === tabId && t.server
+      ? { ...t, server: { ...t.server, conflict: revision || t.server.conflict || 'unknown' } }
+      : t)));
+  };
+
+  // Returns 'saved' | 'conflict'; throws on other failures
+  const saveTabToServer = async (tabId, { force = false } = {}) => {
+    const tab = tabsRef.current.find(t => t.id === tabId);
+    if (!tab?.server) return 'saved';
+    try {
+      const saved = await saveServerDoc(serverSettingsRef.current, tab.server.id, getTabSaveData(tab), force ? null : tab.server.revision);
+      markServerSynced(tab.id, saved.revision, tab.diagrams, tab.name);
+      return 'saved';
+    } catch (err) {
+      if (err.status === 409) {
+        markServerConflict(tab.id, err.revision);
+        return 'conflict';
+      }
+      throw err;
+    }
+  };
+
+  // Replace a linked tab's content with the server's current version
+  const reloadServerTab = async (tabId, { onlyIfUnchanged = false } = {}) => {
+    const tab = tabsRef.current.find(t => t.id === tabId);
+    if (!tab?.server) return;
+    const { doc, revision } = await fetchServerDoc(serverSettingsRef.current, tab.server.id);
+    bumpIdsPast(maxIdIn(doc.diagrams));
+    const latest = tabsRef.current.find(t => t.id === tabId);
+    if (!latest?.server) return;
+    if (onlyIfUnchanged && (latest.diagrams !== tab.diagrams || latest.name !== tab.name)) {
+      markServerConflict(tabId, revision); // edited while we were fetching
+      return;
+    }
+    // Undoable, like any other change
+    const h = getHistory(tabId);
+    h.past.push(latest.diagrams);
+    if (h.past.length > 100) h.past.shift();
+    h.future = [];
+    h.lastPush = 0;
+    bumpHistory();
+    const name = doc.name || latest.name;
+    setTabs(prev => prev.map(t => (t.id === tabId
+      ? {
+          ...t,
+          name,
+          diagrams: doc.diagrams,
+          currentPath: doc.diagrams[t.currentPath.join('/')] ? t.currentPath : ['root'],
+          server: { ...t.server, revision, synced: doc.diagrams, syncedName: name, conflict: null }
+        }
+      : t)));
+    if (tabId === activeTabIdRef.current) {
+      // Drop selections that no longer exist
+      const level = doc.diagrams[latest.currentPath.join('/')] || doc.diagrams.root;
+      const nodeIds = new Set((level?.nodes || []).map(n => n.id));
+      const connIds = new Set((level?.connections || []).map(c => c.id));
+      setSelectedNodeIds(ids => ids.filter(id => nodeIds.has(id)));
+      setSelectedConnectionIds(ids => ids.filter(id => connIds.has(id)));
+      setSelectedZoneId(id => ((level?.zones || []).some(z => z.id === id) ? id : null));
+    }
+  };
+
+  // Both sides changed: let the user pick
+  const resolveServerConflict = async (tabId) => {
+    const tab = tabsRef.current.find(t => t.id === tabId);
+    if (!tab?.server) return;
+    const overwrite = window.confirm(
+      `"${tab.name}" was changed on the server (for example by an MCP client) after you last synced.\n\n` +
+      'OK: overwrite the server copy with your version\nCancel: discard your changes and load the server version'
+    );
+    try {
+      if (overwrite) await saveTabToServer(tabId, { force: true });
+      else await reloadServerTab(tabId);
+      dirtyRef.current = false;
+    } catch (err) {
+      alert(`Server: ${err.message}`);
+    }
+  };
+
+  const saveServerTab = async (tabId) => {
+    try {
+      const result = await saveTabToServer(tabId);
+      if (result === 'conflict') await resolveServerConflict(tabId);
+      else dirtyRef.current = false;
+    } catch (err) {
+      alert(`Couldn't save to the server: ${err.message}`);
+    }
+  };
+
+  const openServerDoc = async (id) => {
+    const open = tabsRef.current.find(t => t.server?.id === id);
+    if (open) {
+      setActiveTabId(open.id);
+      setShowServerDialog(false);
+      return;
+    }
+    try {
+      const { doc, revision } = await fetchServerDoc(serverSettingsRef.current, id);
+      loadFileData(doc, id, null, { id, revision });
+      setAutosave(true);
+      setShowServerDialog(false);
+    } catch (err) {
+      alert(`Couldn't open "${id}": ${err.message}`);
+    }
+  };
+
+  // Put the active tab on the server as a new document and link it
+  const publishTabToServer = async () => {
+    const tab = tabsRef.current.find(t => t.id === activeTabIdRef.current);
+    if (!tab || tab.server) return;
+    try {
+      const created = await createServerDoc(serverSettingsRef.current, tab.name, getTabSaveData(tab));
+      setTabs(prev => prev.map(t => (t.id === tab.id
+        ? { ...t, server: { id: created.id, revision: created.revision, synced: tab.diagrams, syncedName: tab.name, conflict: null } }
+        : t)));
+      setAutosave(true);
+      setServerDocs(await listServerDocs(serverSettingsRef.current));
+    } catch (err) {
+      alert(`Couldn't save to the server: ${err.message}`);
+    }
+  };
+
+  const unlinkServerTab = (tabId) => {
+    setTabs(prev => prev.map(t => (t.id === tabId ? { ...t, server: null } : t)));
+  };
+
+  const refreshServerDocs = async () => {
+    setServerDocs(prev => (Array.isArray(prev) ? prev : { pending: true }));
+    try {
+      setServerDocs(await listServerDocs(serverSettingsRef.current));
+    } catch (err) {
+      setServerDocs({ error: err.message });
+    }
+  };
+
+  // A change made somewhere else
+  const onServerEvent = async (evt) => {
+    if (showServerDialogRef.current) refreshServerDocs();
+    const tab = tabsRef.current.find(t => t.server?.id === evt.id);
+    if (!tab) return;
+    if (evt.deleted) {
+      unlinkServerTab(tab.id);
+      alert(`"${tab.name}" was deleted on the server. The tab stays open, no longer linked.`);
+      return;
+    }
+    if (evt.revision && evt.revision === tab.server.revision) return; // our own save
+    if (tabHasServerChanges(tab)) {
+      markServerConflict(tab.id, evt.revision);
+      return;
+    }
+    try {
+      await reloadServerTab(tab.id, { onlyIfUnchanged: true });
+    } catch (err) {
+      console.warn('Server update failed:', err);
+    }
+  };
+  const onServerEventRef = useRef(onServerEvent);
+  onServerEventRef.current = onServerEvent;
+
+  // After (re)connecting, catch up on anything missed while disconnected
+  const resyncServerTabs = async () => {
+    const linked = tabsRef.current.filter(t => t.server);
+    if (!linked.length) return;
+    try {
+      const docs = await listServerDocs(serverSettingsRef.current);
+      linked.forEach(t => {
+        const d = docs.find(x => x.id === t.server.id);
+        onServerEventRef.current(d ? { id: d.id, revision: d.revision } : { id: t.server.id, deleted: true });
+      });
+    } catch { /* still unreachable - the stream will retry */ }
+  };
+
+  const serverLinked = tabs.some(t => t.server);
+  useEffect(() => {
+    if (!serverSettings.enabled || (!serverLinked && !showServerDialog)) {
+      setServerLive('off');
+      return undefined;
+    }
+    return subscribeServerEvents(
+      serverSettingsRef.current,
+      (evt) => onServerEventRef.current(evt),
+      (state) => {
+        setServerLive(state);
+        if (state === 'live') resyncServerTabs();
+      }
+    );
+  }, [serverSettings.enabled, serverSettings.url, serverSettings.token, serverLinked, showServerDialog]);
 
   // Project = every open tab in a single file
   const getProjectData = () => ({
@@ -1596,10 +1838,13 @@ export default function Nodex() {
     return loaded.map((t, i) => ({ uid: uids[i], diagrams: remapLinkTabs(t.diagrams, uidMap) }));
   };
 
-  const loadFileData = (data, fileName, fileHandle = null) => {
+  // `server` links the new tab to a document on the Nodex server:
+  // { id, revision }
+  const loadFileData = (data, fileName, fileHandle = null, server = null) => {
     // Project file: restore all tabs
     if (Array.isArray(data.tabs)) {
       const loaded = data.tabs.filter(t => t && t.diagrams);
+      loaded.forEach(t => bumpIdsPast(maxIdIn(t.diagrams)));
       const replacing = isPristineWorkspace(tabsRef.current);
       const fixed = assignLoadedUids(loaded, replacing);
       const newTabs = loaded
@@ -1629,7 +1874,12 @@ export default function Nodex() {
     if (data.diagrams) {
       const name = data.name || fileName?.replace('.json', '') || 'Imported';
       const [fixed] = assignLoadedUids([data], false);
-      addTab(name, fixed.diagrams, fileHandle, fixed.uid);
+      bumpIdsPast(maxIdIn(fixed.diagrams));
+      addTab(name, fixed.diagrams, fileHandle, fixed.uid, server ? {
+        // `synced` is the exact diagrams object last saved to / loaded from
+        // the server: anything else means local changes
+        server: { ...server, synced: fixed.diagrams, syncedName: name, conflict: null }
+      } : null);
       // Update path after tab is created
       setTimeout(() => {
         setCurrentPath(data.currentPath || ['root']);
@@ -4024,6 +4274,24 @@ export default function Nodex() {
             <Clock size={16} />
             <span>Auto</span>
           </button>
+          <button
+            onClick={() => { setShowServerDialog(true); if (serverSettings.enabled) refreshServerDocs(); }}
+            className={`p-2 rounded transition-colors text-xs flex items-center gap-1 ${
+              serverSettings.enabled ? 'hover:bg-slate-700 text-slate-200' : 'hover:bg-slate-700 text-slate-400'
+            }`}
+            title={!serverSettings.enabled
+              ? 'Nodex server - off (optional: share diagrams with MCP clients and other editors)'
+              : serverLive === 'live' ? 'Nodex server - connected, changes arrive live'
+              : serverLive === 'error' ? 'Nodex server - can’t reach it, retrying'
+              : 'Nodex server'}
+          >
+            <Cloud size={16} />
+            {serverSettings.enabled && serverLive !== 'off' && (
+              <span className={`w-1.5 h-1.5 rounded-full ${
+                serverLive === 'live' ? 'bg-sky-400' : serverLive === 'error' ? 'bg-red-400' : 'bg-slate-400'
+              }`} />
+            )}
+          </button>
           <input
             ref={fileInputRef}
             type="file"
@@ -4298,14 +4566,17 @@ export default function Nodex() {
           >
             <span
               className="max-w-32 truncate"
-              title={tab.fileHandle ? `Linked to ${tab.fileHandle.name}` : tab.name}
+              title={tab.server
+                ? (tab.server.conflict ? `Changed on the server and here - save to choose (${tab.server.id})` : `On the Nodex server: ${tab.server.id}`)
+                : tab.fileHandle ? `Linked to ${tab.fileHandle.name}` : tab.name}
               onDoubleClick={(e) => {
                 e.stopPropagation();
                 const newName = prompt('Rename tab:', tab.name);
                 if (newName) renameTab(tab.id, newName);
               }}
             >
-              {tab.fileHandle && <span className="text-emerald-400 mr-1">●</span>}
+              {tab.server && <span className={`${tab.server.conflict ? 'text-amber-400' : 'text-sky-400'} mr-1`}>●</span>}
+              {!tab.server && tab.fileHandle && <span className="text-emerald-400 mr-1">●</span>}
               {tab.name}
             </span>
             {compactLayout && tab.id === activeTabId && (
@@ -6804,6 +7075,118 @@ export default function Nodex() {
 
 
       {/* Monitoring settings */}
+      {showServerDialog && (() => {
+        const st = serverSettings;
+        const set = (patch) => { setServerSettings({ ...st, ...patch }); setServerHealthState(null); };
+        const activeLinked = activeTab.server;
+        const inputCls = 'w-full px-3 py-2 bg-slate-700 rounded border border-slate-600 font-mono text-sm focus:border-sky-500 focus:outline-none';
+        const mcpUrl = `${(st.url || '').replace(/\/+$/, '')}/mcp`;
+        return (
+          <div className="nx-modal-backdrop fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50" onMouseDown={() => setShowServerDialog(false)}>
+            <div className="nx-dialog bg-slate-800 rounded-lg p-6 w-full max-w-lg max-h-[90vh] overflow-y-auto scrollbar-thin" onMouseDown={(e) => e.stopPropagation()}>
+              <div className="flex items-center justify-between mb-1">
+                <h2 className="text-xl font-bold flex items-center gap-2">
+                  <Cloud size={20} className="text-sky-400" />
+                  Nodex server
+                </h2>
+                <button onClick={() => setShowServerDialog(false)} className="text-slate-400 hover:text-white">
+                  <X size={22} />
+                </button>
+              </div>
+              <p className="text-xs text-slate-400 mb-4">
+                Optional. Keep diagrams on a Nodex server so MCP clients (Claude Code, Claude Desktop) and other editors can work on them while you watch. Until you turn this on, nothing is sent anywhere. These settings stay in this browser.
+              </p>
+
+              <label className="flex items-center gap-2 mb-4 cursor-pointer">
+                <input type="checkbox" checked={st.enabled} onChange={(e) => set({ enabled: e.target.checked })} />
+                <span className="text-sm font-medium">Use a Nodex server</span>
+              </label>
+
+              {st.enabled && (
+                <div className="space-y-3 mb-4">
+                  <div>
+                    <label className="block text-sm font-medium mb-1">Server URL</label>
+                    <input type="text" value={st.url} onChange={(e) => set({ url: e.target.value })} spellCheck={false} className={inputCls} />
+                  </div>
+                  <div>
+                    <label className="block text-sm font-medium mb-1">Token <span className="text-slate-500 font-normal">(NODEX_SERVER_TOKEN)</span></label>
+                    <input type="password" value={st.token} onChange={(e) => set({ token: e.target.value })} autoComplete="off" className={inputCls} />
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <button
+                      onClick={async () => {
+                        setServerHealthState({ pending: true });
+                        const h = await serverHealth(serverSettingsRef.current);
+                        setServerHealthState(h);
+                        if (h.ok) refreshServerDocs();
+                      }}
+                      className="px-3 py-1.5 rounded text-sm bg-slate-700 hover:bg-slate-600"
+                    >
+                      Test connection
+                    </button>
+                    {serverHealthState?.pending && <span className="text-xs text-slate-400">Connecting…</span>}
+                    {serverHealthState && !serverHealthState.pending && (serverHealthState.ok
+                      ? <span className="text-xs text-sky-400">● Connected · v{serverHealthState.version} · {serverHealthState.documents} document{serverHealthState.documents === 1 ? '' : 's'}</span>
+                      : <span className="text-xs text-red-400">● {serverHealthState.error}</span>)}
+                  </div>
+
+                  <div className="pt-2">
+                    <div className="flex items-center justify-between mb-1">
+                      <span className="text-sm font-medium">Documents</span>
+                      <button onClick={refreshServerDocs} className="text-xs text-slate-400 hover:text-white flex items-center gap-1">
+                        <RotateCcw size={12} /> Refresh
+                      </button>
+                    </div>
+                    <div className="rounded bg-slate-900/70 max-h-56 overflow-y-auto scrollbar-thin">
+                      {serverDocs == null || serverDocs.pending ? (
+                        <p className="px-3 py-2 text-xs text-slate-400">{serverDocs?.pending ? 'Loading…' : 'Test the connection to list documents.'}</p>
+                      ) : serverDocs.error ? (
+                        <p className="px-3 py-2 text-xs text-red-400">{serverDocs.error}</p>
+                      ) : serverDocs.length === 0 ? (
+                        <p className="px-3 py-2 text-xs text-slate-400">No documents yet. Save a tab to the server, or let an MCP client create one.</p>
+                      ) : serverDocs.map(d => {
+                        const openTab = tabs.find(t => t.server?.id === d.id);
+                        return (
+                          <div key={d.id} onClick={() => openServerDoc(d.id)} className="flex items-center gap-2 px-3 py-1.5 hover:bg-slate-700 cursor-pointer">
+                            <FileText size={14} className="text-slate-400 shrink-0" />
+                            <div className="flex-1 min-w-0">
+                              <p className="text-sm truncate">{d.name}</p>
+                              <p className="text-xs text-slate-400">{d.id} · {d.nodes} node{d.nodes === 1 ? '' : 's'} · {timeAgo(Date.parse(d.updatedAt))}</p>
+                            </div>
+                            <span className="text-xs text-sky-400 shrink-0">{openTab ? 'Open' : ''}</span>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  <div className="flex items-center gap-2">
+                    {activeLinked ? (
+                      <>
+                        <span className="text-xs text-slate-300 flex-1">This tab is linked to <code className="px-1 bg-slate-900 rounded">{activeLinked.id}</code>{activeLinked.conflict ? ' - changed on both sides, save to choose' : ''}</span>
+                        <button onClick={() => unlinkServerTab(activeTab.id)} className="px-3 py-1.5 rounded text-sm bg-slate-700 hover:bg-slate-600">Unlink</button>
+                      </>
+                    ) : (
+                      <button onClick={publishTabToServer} className="px-3 py-1.5 rounded text-sm bg-sky-700 hover:bg-sky-600">
+                        Save this tab to the server
+                      </button>
+                    )}
+                  </div>
+
+                  <div className="p-3 rounded bg-slate-900/70 text-xs text-slate-300 space-y-1">
+                    <p className="font-medium text-slate-200">Run the server</p>
+                    <p><code className="px-1 bg-slate-800 rounded">NODEX_SERVER_TOKEN=… npm run server</code> (localhost:7071, diagrams in ./data)</p>
+                    <p>Or with Docker: <code className="px-1 bg-slate-800 rounded">docker compose --profile server up -d</code></p>
+                    <p className="font-medium text-slate-200 pt-1">Connect an MCP client</p>
+                    <p className="break-all"><code className="px-1 bg-slate-800 rounded">claude mcp add --transport http nodex {mcpUrl} --header "Authorization: Bearer &lt;token&gt;"</code></p>
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        );
+      })()}
+
       {showMonitorSettings && (() => {
         const st = monitorSettings;
         const set = (patch) => setMonitorSettings({ ...st, ...patch });
